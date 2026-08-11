@@ -5,6 +5,7 @@ use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
 };
+use crate::storage::connection::{Connection, OpenFlags, open_with_flags};
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
@@ -19,8 +20,6 @@ use crate::sync::{
 use crate::util::id::{normalize_prefix, parse_id};
 use crate::validation::{CommentValidator, ISSUE_LABEL_MAX_COUNT, IssueValidator, LabelValidator};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use fsqlite::Connection;
-use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use sha2::{Digest, Sha256};
@@ -28987,7 +28986,7 @@ mod tests {
     fn test_diag_data_visibility() {
         use fsqlite_types::value::SqliteValue;
         // Simplest possible reproduction
-        let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
         conn.execute("CREATE TABLE t (k TEXT, v TEXT)").unwrap();
         conn.execute_with_params(
             "INSERT INTO t VALUES (?, ?)",
@@ -29091,7 +29090,7 @@ mod tests {
     fn test_diag_root_page_visibility() {
         use fsqlite_types::value::SqliteValue;
         // Create full beads schema and check which root pages are accessible
-        let conn = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
 
         // Apply schema step by step, checking after each table
         let tables = vec![(
@@ -29242,7 +29241,7 @@ mod tests {
 
         // Also try: incrementally create indexes and check count(*) after each
         eprintln!("[ROOT-DIAG] --- Incremental index creation with count check ---");
-        let conn2 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn2 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
         conn2
             .execute("CREATE TABLE t (a TEXT, b TEXT, c TEXT, d TEXT, e TEXT)")
             .unwrap();
@@ -29274,7 +29273,7 @@ mod tests {
 
         // Test multi-insert with explicit transactions
         eprintln!("[ROOT-DIAG] --- Multi-insert test ---");
-        let conn3 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn3 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
         conn3
             .execute("CREATE TABLE ev (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)")
             .unwrap();
@@ -29316,7 +29315,7 @@ mod tests {
         }
 
         // Also test without explicit transactions (autocommit)
-        let conn4 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn4 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
         conn4
             .execute("CREATE TABLE ev2 (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)")
             .unwrap();
@@ -29357,7 +29356,7 @@ mod tests {
 
         // Test events-like table with indexes and WHERE+ORDER BY
         eprintln!("[ROOT-DIAG] --- Events-like test ---");
-        let conn5 = fsqlite::Connection::open(":memory:".to_string()).unwrap();
+        let conn5 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
         conn5
             .execute("CREATE TABLE issues2 (id TEXT PRIMARY KEY, title TEXT)")
             .unwrap();

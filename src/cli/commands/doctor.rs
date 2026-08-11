@@ -13,6 +13,7 @@ use crate::error::{BeadsError, Result};
 use crate::health::{AnomalyClass, ReliabilityAuditRecord, WorkspaceClassification};
 use crate::output::OutputContext;
 use crate::storage::SqliteStorage;
+use crate::storage::connection::Connection;
 use crate::storage::sqlite::PendingSyncMergeInspection;
 #[cfg(test)]
 use crate::sync::METADATA_SYNC_MERGE_PENDING_LEGACY;
@@ -27,7 +28,7 @@ use crate::sync::{
     validate_sync_path, validate_sync_path_with_external,
 };
 use chrono::{NaiveDate, Utc};
-use fsqlite::{Connection, Row};
+use fsqlite::Row;
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
@@ -13477,9 +13478,9 @@ mod tests {
     use crate::health::{AnomalyClass, WorkspaceHealth};
     use crate::model::{Issue, IssueType, Priority, Status};
     use crate::storage::SqliteStorage;
+    use crate::storage::connection::Connection;
     use assert_cmd::Command as AssertCommand;
     use chrono::Utc;
-    use fsqlite::Connection;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;

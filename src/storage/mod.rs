@@ -8,10 +8,12 @@
 //!
 //! # Submodules
 //!
+//! - [`connection`] - Synchronous bridge over fsqlite 0.2's async connection
 //! - [`events`] - Audit event storage (insertion, retrieval)
 //! - [`schema`] - Database schema definitions
 //! - [`sqlite`] - Main `SQLite` storage implementation
 
+pub mod connection;
 pub mod events;
 pub mod schema;
 pub mod sqlite;

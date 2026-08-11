@@ -17,8 +17,8 @@ use crate::config::{
 };
 use crate::error::{BeadsError, Result};
 use crate::output::OutputContext;
+use crate::storage::connection::Connection;
 use crate::util::id::normalize_configured_prefix;
-use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 use rich_rust::prelude::*;
 use serde_json::json;

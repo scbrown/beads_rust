@@ -1,6 +1,6 @@
 [package]
 name = "beads_rust"
-version = "0.2.22"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 autobenches = false
@@ -42,21 +42,27 @@ clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.1.18"
-fsqlite-types = "0.1.18"
-fsqlite-error = "0.1.18"
-fsqlite-core = "0.1.18"
-fsqlite-func = "0.1.18"
-fsqlite-vdbe = "0.1.18"
-fsqlite-vfs = "0.1.18"
-fsqlite-pager = "0.1.18"
-fsqlite-parser = "0.1.18"
-fsqlite-planner = "0.1.18"
-fsqlite-wal = "0.1.18"
-fsqlite-btree = "0.1.18"
-fsqlite-ast = "0.1.18"
-fsqlite-mvcc = "0.1.18"
-fsqlite-observability = "0.1.18"
+fsqlite = "0.2"
+fsqlite-types = "0.2"
+fsqlite-error = "0.2"
+fsqlite-core = "0.2"
+fsqlite-func = "0.2"
+fsqlite-vdbe = "0.2"
+fsqlite-vfs = "0.2"
+fsqlite-pager = "0.2"
+fsqlite-parser = "0.2"
+fsqlite-planner = "0.2"
+fsqlite-wal = "0.2"
+fsqlite-btree = "0.2"
+fsqlite-ast = "0.2"
+fsqlite-mvcc = "0.2"
+fsqlite-observability = "0.2"
+# Current-thread runtime that drives fsqlite 0.2's async (!Send) futures to
+# completion behind the synchronous `storage::connection::Connection` bridge.
+# Pinned =0.4.3 to match the fsqlite family's asupersync requirement exactly
+# (single asupersync in the graph). default-features = false mirrors fsqlite's
+# own dependency spec.
+asupersync = { version = "=0.4.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
@@ -176,19 +182,38 @@ self_update = [
     "self_update/compression-zip-deflate",
 ]
 
-# NOTE: no `[patch.crates-io]` here.
+# TEMPORARY — REMOVE BEFORE PUBLISH.
 #
-# All dependencies — fsqlite 0.1.3+, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.3.1+ — are published on crates.io, so this crate
-# resolves everything from the registry out of the box.  That makes
-# `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
-# work without requiring sibling `frankensqlite` or `fastmcp_rust`
-# checkouts (issue #250 bug 1).
+# The fsqlite family is being migrated to the asupersync 0.4.3 line, released
+# as fsqlite 0.3.0 from /data/projects/frankensqlite (master). That release is
+# not on crates.io yet, and the local checkout's crate versions still read
+# 0.2.1, so for the migration gates we:
+#   1. keep the `fsqlite* = "0.2"` requirements above, and
+#   2. patch every fsqlite* crate in the graph to the local checkout below.
 #
-# Local co-development: contributors who want to hack on frankensqlite
-# or fastmcp_rust alongside beads_rust can add a workspace-level
-# `.cargo/config.toml` with their own `[patch.crates-io]` table.  See
-# `scripts/dev-local-frankensqlite.toml` for a ready-to-copy template.
+# AT PUBLISH TIME: flip every `fsqlite*` requirement above to "0.3" and DELETE
+# this entire `[patch.crates-io]` block, restoring the registry-only resolve
+# contract (`cargo install --locked` must work without sibling checkouts —
+# issue #250 bug 1).
+[patch.crates-io]
+fsqlite = { path = "/data/projects/frankensqlite/crates/fsqlite" }
+fsqlite-types = { path = "/data/projects/frankensqlite/crates/fsqlite-types" }
+fsqlite-error = { path = "/data/projects/frankensqlite/crates/fsqlite-error" }
+fsqlite-core = { path = "/data/projects/frankensqlite/crates/fsqlite-core" }
+fsqlite-func = { path = "/data/projects/frankensqlite/crates/fsqlite-func" }
+fsqlite-vdbe = { path = "/data/projects/frankensqlite/crates/fsqlite-vdbe" }
+fsqlite-vfs = { path = "/data/projects/frankensqlite/crates/fsqlite-vfs" }
+fsqlite-pager = { path = "/data/projects/frankensqlite/crates/fsqlite-pager" }
+fsqlite-parser = { path = "/data/projects/frankensqlite/crates/fsqlite-parser" }
+fsqlite-planner = { path = "/data/projects/frankensqlite/crates/fsqlite-planner" }
+fsqlite-wal = { path = "/data/projects/frankensqlite/crates/fsqlite-wal" }
+fsqlite-btree = { path = "/data/projects/frankensqlite/crates/fsqlite-btree" }
+fsqlite-ast = { path = "/data/projects/frankensqlite/crates/fsqlite-ast" }
+fsqlite-mvcc = { path = "/data/projects/frankensqlite/crates/fsqlite-mvcc" }
+fsqlite-observability = { path = "/data/projects/frankensqlite/crates/fsqlite-observability" }
+fsqlite-ext-json = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-json" }
+fsqlite-ext-fts5 = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-fts5" }
+fsqlite-ext-rtree = { path = "/data/projects/frankensqlite/crates/fsqlite-ext-rtree" }
 
 [lints.rust]
 # Deny (not forbid): `sync::db_inode_lock` carries the crate's single

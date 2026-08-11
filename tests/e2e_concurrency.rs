@@ -10,8 +10,8 @@
 mod common;
 
 use assert_cmd::Command;
+use beads_rust::storage::connection::Connection;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
-use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};

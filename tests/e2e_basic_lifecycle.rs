@@ -3,6 +3,8 @@ mod common;
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
 #[cfg(target_os = "linux")]
+use beads_rust::storage::connection::Connection;
+#[cfg(target_os = "linux")]
 use beads_rust::sync::{blocking_jsonl_family_write_lock_with_timeout, blocking_write_lock};
 use chrono::Utc;
 use common::cli::{
@@ -10,8 +12,6 @@ use common::cli::{
     run_br_smoke_at_root_with_env,
 };
 use common::isolated_workspace_failure_fixture;
-#[cfg(target_os = "linux")]
-use fsqlite::Connection;
 #[cfg(target_os = "linux")]
 use fsqlite_types::SqliteValue;
 use serde_json::Value;

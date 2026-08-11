@@ -609,9 +609,9 @@ mod tests {
     use crate::error::BeadsError;
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
+    use crate::storage::connection::Connection;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
-    use fsqlite::Connection;
     use fsqlite_error::FrankenError;
     use std::fs;
     use std::path::Path;

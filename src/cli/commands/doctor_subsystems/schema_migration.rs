@@ -25,9 +25,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::storage::connection::{Connection, OpenFlags, open_with_flags};
 use chrono::Utc;
-use fsqlite::Connection;
-use fsqlite::compat::{OpenFlags, open_with_flags};
 use fsqlite_types::SqliteValue;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

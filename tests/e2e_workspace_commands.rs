@@ -5,8 +5,8 @@
 
 mod common;
 
+use beads_rust::storage::connection::Connection;
 use common::cli::{BrWorkspace, extract_json_payload, parse_list_issues, run_br, run_br_with_env};
-use fsqlite::Connection;
 use serde_json::Value;
 use std::fs;
 

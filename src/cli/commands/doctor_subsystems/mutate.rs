@@ -895,7 +895,7 @@ fn run_db_exec(
     affected_tables: &[String],
     affected_predicate: Option<&str>,
 ) -> Result<Vec<DbSnapshotArtifact>, BeadsError> {
-    use fsqlite::Connection;
+    use crate::storage::connection::Connection;
 
     // Pre-flight identifier validation so we fail fast before opening
     // the DB connection. Mirrors the protection on the SELECT path.
@@ -989,7 +989,7 @@ pub(crate) struct DbSnapshotArtifact {
 }
 
 fn snapshot_db_table(
-    conn: &fsqlite::Connection,
+    conn: &crate::storage::connection::Connection,
     backups_db: &Path,
     table: &str,
     affected_predicate: Option<&str>,
@@ -1110,7 +1110,7 @@ fn validate_identifier(ident: &str) -> Result<(), BeadsError> {
 /// Resolve the column-name vector for `table` via `PRAGMA
 /// table_info`. Returns an error if the table does not exist.
 fn collect_column_names(
-    conn: &fsqlite::Connection,
+    conn: &crate::storage::connection::Connection,
     table: &str,
 ) -> Result<Vec<String>, BeadsError> {
     use fsqlite_types::value::SqliteValue;
@@ -1175,7 +1175,7 @@ fn run_db_migrate(
     from: u32,
     to: u32,
 ) -> Result<Option<()>, BeadsError> {
-    use fsqlite::Connection;
+    use crate::storage::connection::Connection;
     use fsqlite_types::value::SqliteValue;
 
     if to <= from {
@@ -1508,7 +1508,7 @@ where
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use fsqlite::Connection;
+    use crate::storage::connection::Connection;
     use std::io::BufRead;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;

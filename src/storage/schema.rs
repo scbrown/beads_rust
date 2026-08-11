@@ -1,7 +1,7 @@
 //! Database schema definitions and migration logic.
 
+use crate::storage::connection::Connection;
 use chrono::Utc;
-use fsqlite::Connection;
 use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
@@ -2650,7 +2650,7 @@ fn row_bool(row: &fsqlite::Row, index: usize) -> bool {
 mod tests {
     use super::*;
     use crate::error::BeadsError;
-    use fsqlite::Connection;
+    use crate::storage::connection::Connection;
     use std::collections::HashSet;
     use tempfile::TempDir;
 

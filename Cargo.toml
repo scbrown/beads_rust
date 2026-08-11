@@ -42,21 +42,21 @@ clap_complete = { version = "4.6.7", features = ["unstable-dynamic"] }
 
 # Database (pure-Rust SQLite with concurrent writer support)
 # NOTE: transitive fsqlite workspace deps listed explicitly so rch syncs them
-fsqlite = "0.2"
-fsqlite-types = "0.2"
-fsqlite-error = "0.2"
-fsqlite-core = "0.2"
-fsqlite-func = "0.2"
-fsqlite-vdbe = "0.2"
-fsqlite-vfs = "0.2"
-fsqlite-pager = "0.2"
-fsqlite-parser = "0.2"
-fsqlite-planner = "0.2"
-fsqlite-wal = "0.2"
-fsqlite-btree = "0.2"
-fsqlite-ast = "0.2"
-fsqlite-mvcc = "0.2"
-fsqlite-observability = "0.2"
+fsqlite = "0.3"
+fsqlite-types = "0.3"
+fsqlite-error = "0.3"
+fsqlite-core = "0.3"
+fsqlite-func = "0.3"
+fsqlite-vdbe = "0.3"
+fsqlite-vfs = "0.3"
+fsqlite-pager = "0.3"
+fsqlite-parser = "0.3"
+fsqlite-planner = "0.3"
+fsqlite-wal = "0.3"
+fsqlite-btree = "0.3"
+fsqlite-ast = "0.3"
+fsqlite-mvcc = "0.3"
+fsqlite-observability = "0.3"
 # Current-thread runtime that drives fsqlite 0.2's async (!Send) futures to
 # completion behind the synchronous `storage::connection::Connection` bridge.
 # Pinned =0.4.3 to match the fsqlite family's asupersync requirement exactly
@@ -185,16 +185,15 @@ self_update = [
 # TEMPORARY — REMOVE BEFORE PUBLISH.
 #
 # The fsqlite family is being migrated to the asupersync 0.4.3 line, released
-# as fsqlite 0.3.0 from /data/projects/frankensqlite (master). That release is
-# not on crates.io yet, and the local checkout's crate versions still read
-# 0.2.1, so for the migration gates we:
-#   1. keep the `fsqlite* = "0.2"` requirements above, and
-#   2. patch every fsqlite* crate in the graph to the local checkout below.
+# as fsqlite 0.3.0 from /data/projects/frankensqlite (master, already bumped to
+# 0.3.0 in the checkout). That release is not on crates.io yet, so for the
+# migration gates every fsqlite* crate in the graph is patched to the local
+# checkout below (the `fsqlite* = "0.3"` requirements above already match).
 #
-# AT PUBLISH TIME: flip every `fsqlite*` requirement above to "0.3" and DELETE
-# this entire `[patch.crates-io]` block, restoring the registry-only resolve
-# contract (`cargo install --locked` must work without sibling checkouts —
-# issue #250 bug 1).
+# AT PUBLISH TIME (once fsqlite 0.3.0 is on crates.io): DELETE this entire
+# `[patch.crates-io]` block, restoring the registry-only resolve contract
+# (`cargo install --locked` must work without sibling checkouts — issue #250
+# bug 1).
 [patch.crates-io]
 fsqlite = { path = "/data/projects/frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "/data/projects/frankensqlite/crates/fsqlite-types" }

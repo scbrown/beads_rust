@@ -36,9 +36,9 @@
 mod common;
 
 use beads_rust::coordination::{AgentMailAgentSnapshot, AgentMailReservationSnapshot};
+use beads_rust::franken_sync::Connection;
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
-use beads_rust::storage::connection::Connection;
 use beads_rust::util::hex_encode;
 use chrono::Utc;
 use common::binary_discovery::discover_binaries;

@@ -7,9 +7,8 @@
 //!
 //! Events are local DB only - never exported to JSONL.
 
-use crate::storage::connection::Connection;
+use crate::franken_sync::{Connection, Row};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use fsqlite::Row;
 use fsqlite_types::SqliteValue;
 
 use crate::error::{BeadsError, Result};
@@ -525,7 +524,7 @@ pub fn init_events_table(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::connection::Connection;
+    use crate::franken_sync::Connection;
     use crate::storage::schema::execute_batch;
 
     fn setup_test_db() -> Connection {

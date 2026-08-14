@@ -15,6 +15,192 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.3.0 -- 2026-08-14 (Release)
+
+Storage-engine generation upgrade: FrankenSQLite 0.1.18 → 0.3.1 with the
+asupersync 0.4.3 runtime, plus the accumulated test/lint debt cleanup from
+the doctor/sync workstream merge (GitHub #409) and a set of verified bug
+fixes. Version moves to 0.3.0 because fsqlite types are part of br's public
+library API (`BeadsError::Database(FrankenError)`, storage signatures), and
+swapping the fsqlite major line through that surface is a breaking change
+for library consumers. CLI behavior is compatible apart from the fixes
+below.
+
+### FrankenSQLite 0.3.1 + asupersync 0.4.3 (storage engine generation)
+
+- fsqlite 0.2.0 made the engine API `async` end to end and 0.3.0 moved its
+  runtime family to asupersync 0.4.3. br's storage layer stays fully
+  synchronous through the new `src/franken_sync.rs` facade: a thread-local
+  current-thread asupersync runtime drives each `!Send` engine future to
+  completion on the calling thread (`Runtime::block_on`), taken out of its
+  slot while polling so reentrant SQL builds a fresh runtime instead of
+  re-entering the same one. The facade adds a bounded `BusyRecovery` retry
+  (fsqlite 0.2+ open-recovery windows fail fast where 0.1.x waited) and a
+  stale-schema `prepare()` refresh retry (cross-connection DDL visibility).
+- The engine upgrade brings the fsqlite 0.3.x correctness wave to br
+  workspaces, including the allocator page-aliasing, committed-freelist
+  resurrection, and concurrent-writer EOF-growth fixes behind the B-tree /
+  freelist corruption classes reported in GitHub #426 and #428, and the
+  concurrent-open `BusyRecovery` retry fix behind multi-agent open storms.
+- New direct dependency `asupersync = "=0.4.3"` (default-features off),
+  matching the fsqlite family requirement exactly. The optional `mcp`
+  feature still carries fastmcp-rust 0.3.2's independent asupersync 0.3.x
+  line until FastMCP republishes on 0.4.x; the two coexist as distinct
+  crates.
+
+### Engine-upgrade adaptations in the storage layer
+
+- The doctor's SQLite file-family audits now cover fsqlite 0.2+'s
+  parallel-WAL durability-certificate sidecars (`-wal-cert`,
+  `-wal-cert-head`) alongside the classic and namespace sidecars, so legacy
+  repair audits account for the whole on-disk family.
+- Writable connections, including explicit read-write compatibility opens,
+  select the engine's serialized mode at open
+  (`PRAGMA fsqlite.concurrent_mode = OFF`), matching br's existing workspace
+  write-lock serialization (#243). This avoids a concurrent-mode
+  `BusySnapshot` self-conflict when a legacy schema migration copies from a
+  table and drops that source in the same transaction, while preserving the
+  migration's original crash-atomic copy/drop/rename boundary.
+- Missing-database JSONL recovery quarantines the complete orphaned fsqlite
+  0.3 sidecar family (`-wal-cert`, `-wal-cert-head`, `-fsqlite-ns-gate`, and
+  `-fsqlite-ns-use`) into verified `.br_recovery` backups before initializing
+  the replacement database, preserving the old bytes without letting stale
+  engine state block or contaminate the rebuild.
+- The sync bridge retries `BusySnapshot` on self-contained autocommit
+  statements (the statement is the whole transaction, so retrying it is
+  exactly the engine contract's "retry the whole transaction"), in addition
+  to the existing bounded `BusyRecovery` retry.
+
+### Missing database no longer deadlocks recovery (GitHub #414, #420, #409 cluster A)
+
+- A missing `beads.db` cannot contain a pending sync-merge receipt, but the
+  startup gate treated the *inability to inspect* it as a fail-closed
+  refusal — so a JSONL-only checkout (or a deleted database) was locked out
+  of `br init`, `br sync --import-only --rebuild`, `br doctor --repair`, and
+  every no-db-then-import flow, and a stray ancestor `.beads/` without a
+  database blocked `br init` for every directory beneath it. Startup now
+  classifies a definitively-absent database as "no pending merge": the
+  advisory inspection treats NotFound as absent, and the mutation gate binds
+  the absent inode under the held database-family authority so the
+  subsequent writable open can initialize or rebuild without an unchecked
+  replacement window. (Equivalent fix independently proposed in PR #422 —
+  thanks!)
+
+### `br list --status` rejects unknown values (GitHub #418)
+
+- `br list --status all` is now the same meta-value `br lint` accepts (no
+  status filter), and an unrecognized status value is a validation error
+  naming the built-in vocabulary instead of silently matching zero issues
+  with exit code 0. Custom statuses stay first-class: a value declared in
+  `.beads/policy.yaml` (`workflow.statuses`) or present on at least one
+  issue in the database passes validation.
+
+### `br blocked` rich output keeps line breaks (PR #421)
+
+- Prepared rich `Text` records in the blocked renderer went through a path
+  that dropped each Text's line ending, collapsing headers, issue rows, and
+  detail rows onto one line in rich mode. They now render through
+  `print_text`, which honors the ending. (Diagnosis matches PR #421 —
+  thanks!)
+
+### Routed mutations no longer self-deadlock on the target write lock
+
+- Routed `update`, `close`, `defer`, `undefer`, `delete`, and `reopen`
+  against an external workspace (`.beads/routes.jsonl`) acquired the
+  target's database-family write lock but never marked it as held before
+  the storage open tried to take the same `.beads/.write.lock` from a
+  second descriptor in the same process — flock-style locks conflict
+  across descriptors, so every routed mutation hung until the 30s lock
+  timeout. They now mark the held lock the same way `comments`, `dep`,
+  `label`, and the read-side routed commands always did.
+
+### Read-only fast open restored (with its migration barrier intact)
+
+- Read-only commands that waive auto-import and auto-flush
+  (`--no-auto-import --no-auto-flush list/show/ready/...`) again bypass the
+  startup writer-lock queue and open the current-schema database read-only,
+  re-landing the fast-open contract from 1b75961a that the #412 rescue
+  snapshot (251b501b) had reverted — a held `.write.lock` no longer blocks
+  the whole read matrix, and `sync --reconcile --dry-run` proceeds under
+  lock contention as documented.
+- The conservative path's implicit-migration barrier moved with it: a
+  fast-open miss on an existing database now re-runs the pending-merge and
+  schema-version inspection under the database-family authority it acquires
+  for the writable fallback, so a stale-schema database still refuses into
+  the reviewed `br doctor migrate-schema plan` workflow (and a pending sync
+  merge still refuses writable recovery) instead of silently auto-migrating.
+
+### `br serve` no longer deadlocks against its own startup lock
+
+- The MCP server acquired the database-family write lock at startup (for
+  the pending-merge mutation gate and a preopened storage context), then
+  `run_serve` and every per-request mutation handler tried to take the same
+  flock through fresh descriptors in the same process — so `br serve` hung
+  before ever reaching the stdio transport, and SIGINT could not shut it
+  down. Serve now skips the storage preopen entirely, releases the gate
+  authority (and its marked `Arc` clones) once the pending-merge verdict is
+  final, and the server plus its handlers manage locking per request as
+  designed. Combined with cancel-context wiring through
+  `run_transport_returning_with_cx`, SIGINT/SIGTERM now terminate `br
+  serve` promptly.
+
+### Flush anchor publication is fail-closed again
+
+- `br sync` flush certified an export and cleared dirty state even when
+  publishing the `beads.base.jsonl` merge anchor failed, leaving `sync
+  --status` reporting "In sync" while the three-way-merge ancestor was
+  stale. The anchor is published before export finalization again and a
+  publication failure is a hard error naming the anchor path; dirty state
+  stays set so a plain retry flush converges.
+
+### CI supply-chain inventory refreshed
+
+- The merged actions-group bump (#406) updated workflow SHA pins without
+  refreshing `.github/action-pins.jsonl` / `action-pin-upstreams.jsonl`;
+  the inventory now records the same upstream-verified identities
+  (actions/checkout v7.0.1, dtolnay/rust-toolchain default-branch head
+  2026-07-16, taiki-e/install-action v2.85.5, actions/setup-go v7.0.0,
+  softprops/action-gh-release v3.0.2), each SHA re-verified against its
+  upstream tag before recording.
+
+### Test and lint debt paid down (GitHub #409)
+
+- Startup-gate cluster A is fixed in code (above); stale schema-version
+  literals now assert against `CURRENT_SCHEMA_VERSION`; the stranded
+  additive-reconciliation test drives the real `br create` surface instead
+  of an unimplemented `--id` flag; drifted message assertions accept the
+  current write-lock refusal contract.
+- `cargo clippy --all-targets -- -D warnings` is green again: ~100
+  pedantic/nursery findings in the merged workstream code were fixed
+  individually (used-underscore renames, by-ref parameters, heap-allocating
+  the 1 MiB / 64 KiB stack buffers, boxing the large
+  `PendingSyncMergeInspection::Valid` variant, `let...else` rewrites,
+  merged match arms, `trailing_zeros` bit tests), with documented targeted
+  allows where a change would break cross-file contracts. The 2026-08
+  nightly's new `assert_is_empty` style lint joined the crate's stylistic
+  allow-list.
+
+### Dependencies
+
+- clap 4.6.6, clap_complete 4.6.9, schemars 1.2.2, similar 3.1.2,
+  toml =1.1.4 (dev), plus lockfile refreshes (thiserror 2.0.20,
+  libc 0.2.189, once_cell 1.21.4, regex 1.13.1, flate2 1.1.9, lru 0.18.2
+  for RUSTSEC-2026-0253). Supersedes Dependabot PR #425.
+
+### Validation
+
+- Full `cargo test --all-features --no-fail-fast` on the release tree:
+  21,490 passed, 0 failed (doctests included), up from 21,415 passed /
+  70 failed at the start of the migration wave.
+- `cargo clippy --all-targets --all-features -- -D warnings` clean
+  (pedantic + nursery at deny); `cargo fmt --check` clean.
+- Repo `.beads` database migrated v15 → v17 through the reviewed
+  `doctor migrate-schema` plan/apply workflow (rehearsed on an isolated
+  copy first; receipts under `.beads/.br_recovery/schema-migrations/`,
+  post-apply integrity verified with both engines).
+
+---
+
 ## v0.2.22 -- 2026-08-06 (Release)
 
 Windows companion fix to v0.2.21 (GitHub #412 follow-up).

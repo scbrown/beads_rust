@@ -1,6 +1,6 @@
 //! CLI definitions and entry point.
 
-use crate::storage::connection::Connection;
+use crate::franken_sync::Connection;
 use clap::builder::StyledStr;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};

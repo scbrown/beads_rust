@@ -470,7 +470,7 @@ pub(super) fn external_project_db_paths_after_auto_import_if_needed(
 }
 
 pub(super) struct RoutedWorkspaceWriteLock {
-    _lock: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
+    lock: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
     beads_dir: Option<PathBuf>,
 }
 
@@ -478,13 +478,13 @@ impl RoutedWorkspaceWriteLock {
     #[must_use]
     pub(super) const fn local() -> Self {
         Self {
-            _lock: None,
+            lock: None,
             beads_dir: None,
         }
     }
 
     pub(super) fn mark_cli_write_lock_held(&self, cli: &mut crate::config::CliOverrides) {
-        if let (Some(beads_dir), Some(lock)) = (&self.beads_dir, &self._lock) {
+        if let (Some(beads_dir), Some(lock)) = (&self.beads_dir, &self.lock) {
             cli.mark_database_family_lock_held(beads_dir, lock);
         }
     }
@@ -513,7 +513,7 @@ pub(super) fn acquire_routed_workspace_write_lock(
             ))
         })?;
     Ok(RoutedWorkspaceWriteLock {
-        _lock: Some(Arc::new(lock)),
+        lock: Some(Arc::new(lock)),
         beads_dir: Some(beads_dir.to_path_buf()),
     })
 }
@@ -607,9 +607,9 @@ mod tests {
     };
     use crate::config::{CliOverrides, OpenStorageResult, open_storage_with_cli};
     use crate::error::BeadsError;
+    use crate::franken_sync::Connection;
     use crate::model::Issue;
     use crate::storage::SqliteStorage;
-    use crate::storage::connection::Connection;
     use crate::sync::{ExportConfig, export_to_jsonl_with_policy};
     use chrono::Utc;
     use fsqlite_error::FrankenError;

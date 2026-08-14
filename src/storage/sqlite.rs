@@ -2,10 +2,11 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
+use crate::franken_sync::Connection;
+use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
 };
-use crate::storage::connection::{Connection, OpenFlags, open_with_flags};
 use crate::storage::events::get_events;
 use crate::storage::schema::CURRENT_SCHEMA_VERSION;
 use crate::storage::schema::{
@@ -1196,7 +1197,7 @@ const KNOWN_METADATA_DEFAULTS: [(&str, &str); 7] = [
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingSyncMergeInspection {
     Absent,
-    Valid(SyncMergePendingReceipt),
+    Valid(Box<SyncMergePendingReceipt>),
     Legacy {
         metadata_key: String,
         row_count: usize,
@@ -1235,6 +1236,7 @@ impl PendingSyncMergeInspection {
 /// `NULL`, rather than going through `get_metadata()`. That prevents a
 /// duplicate, null, empty, legacy, or malformed receipt from being mistaken
 /// for the safe `Absent` state.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn classify_pending_sync_merge_rows(
     current_rows: &[Option<String>],
     legacy_rows: &[Option<String>],
@@ -1344,7 +1346,7 @@ pub(crate) fn classify_pending_sync_merge_rows(
                     .to_string(),
         };
     }
-    PendingSyncMergeInspection::Valid(receipt)
+    PendingSyncMergeInspection::Valid(Box::new(receipt))
 }
 
 /// SQLite-based storage backend.
@@ -2795,7 +2797,7 @@ impl SqliteStorage {
                             Ok(_) => Err(original_error),
                             Err(rollback_error) => Err(Self::rollback_failure_error(
                                 original_error,
-                                rollback_error,
+                                &rollback_error,
                                 "read-transaction COMMIT error",
                             )),
                         }
@@ -2806,7 +2808,7 @@ impl SqliteStorage {
                 Ok(_) => Err(original_error),
                 Err(rollback_error) => Err(Self::rollback_failure_error(
                     original_error,
-                    rollback_error,
+                    &rollback_error,
                     "read-transaction body error",
                 )),
             },
@@ -2815,7 +2817,7 @@ impl SqliteStorage {
 
     fn rollback_failure_error(
         original_error: BeadsError,
-        rollback_error: FrankenError,
+        rollback_error: &FrankenError,
         cause: &str,
     ) -> BeadsError {
         BeadsError::WithContext {
@@ -2834,7 +2836,7 @@ impl SqliteStorage {
         match rollback_result {
             Ok(_) => original_error,
             Err(rollback_error) => {
-                Self::rollback_failure_error(original_error, rollback_error, cause)
+                Self::rollback_failure_error(original_error, &rollback_error, cause)
             }
         }
     }
@@ -8534,6 +8536,23 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn count_default_visible_statuses(&self) -> Result<Vec<(String, usize)>> {
         self.count_default_visible_text_groups("status", "status")
+    }
+
+    /// Every status value currently present in the issues table, including
+    /// custom workflow statuses and terminal states.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    pub fn distinct_statuses(&self) -> Result<Vec<String>> {
+        let rows = self
+            .conn
+            .query("SELECT DISTINCT status FROM issues ORDER BY status")?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text))
+            .map(str::to_string)
+            .collect())
     }
 
     /// Count default-visible issues grouped by issue type.
@@ -15546,13 +15565,13 @@ fn finish_issue_mutation_write_probe(
             BeadsError::Config(
                 "issue write probe succeeded but its rollback cleanup failed".to_string(),
             ),
-            rollback_err,
+            &rollback_err,
             "successful issue write probe",
         )),
         (Err(probe_err), Ok(_)) => Err(BeadsError::Database(probe_err)),
         (Err(probe_err), Err(rollback_err)) => Err(SqliteStorage::rollback_failure_error(
             BeadsError::Database(probe_err),
-            rollback_err,
+            &rollback_err,
             "issue write probe error",
         )),
     }
@@ -15622,7 +15641,7 @@ fn heal_namespace_sidecar_modes(db_path: &Path) -> Result<()> {
                 continue;
             }
             let mode = metadata.permissions().mode();
-            if mode & 0o077 == 0 {
+            if mode.trailing_zeros() >= 6 {
                 continue;
             }
 
@@ -17654,6 +17673,7 @@ impl SqliteStorage {
     /// # Errors
     ///
     /// Returns an error if validation or any database operation fails.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn apply_sync_merge_atomically(
         &mut self,
         kept: &[Issue],
@@ -17906,7 +17926,7 @@ impl SqliteStorage {
                 if !was_terminal {
                     storage.insert_sync_merge_event_in_tx(
                         &tombstone.id,
-                        EventType::Deleted,
+                        &EventType::Deleted,
                         actor,
                         Some("Deleted issue: merge deletion"),
                         &created_at,
@@ -17949,7 +17969,7 @@ impl SqliteStorage {
                 )?;
                 storage.insert_sync_merge_event_in_tx(
                     issue_id,
-                    EventType::Commented,
+                    &EventType::Commented,
                     actor,
                     Some(note),
                     &created_at,
@@ -18009,7 +18029,7 @@ impl SqliteStorage {
     fn insert_sync_merge_event_in_tx(
         &self,
         issue_id: &str,
-        event_type: EventType,
+        event_type: &EventType,
         actor: &str,
         comment: Option<&str>,
         created_at: &str,
@@ -18112,7 +18132,9 @@ impl SqliteStorage {
     /// Inspect pending-sync-merge state on an existing current-schema database
     /// while a caller-owned database-family authority prevents replacement.
     ///
-    /// Missing databases, stale/future schemas, route mismatches, open errors,
+    /// A definitively missing file or a file that cannot possibly be SQLite
+    /// cannot contain a pending receipt and is classified `Absent`. Valid
+    /// SQLite files with stale/future schemas, route mismatches, open errors,
     /// query errors, and receipt validation failures all fail closed. The
     /// read-only storage carries the caller's authority, so
     /// `with_read_transaction` verifies it before the transaction, immediately
@@ -18130,16 +18152,20 @@ impl SqliteStorage {
             });
         }
         if authority.bind_database_inode_for_mutation()? {
-            return Err(BeadsError::SyncConflict {
-                message:
-                    "Pending sync-merge state is unknown because the authorized database is missing"
-                        .to_string(),
-            });
+            authority.verify_database_authority()?;
+            return Ok(PendingSyncMergeInspection::Absent);
         }
         authority.verify_database_authority()?;
-        let mut storage = if let Some(storage) = Self::open_current_read_only(path)? {
-            storage
-        } else {
+        let mut header = [0_u8; 16];
+        let is_sqlite = std::fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut header))
+            .is_ok()
+            && &header == b"SQLite format 3\0";
+        authority.verify_database_authority()?;
+        if !is_sqlite {
+            return Ok(PendingSyncMergeInspection::Absent);
+        }
+        let Some(mut storage) = Self::open_current_read_only(path)? else {
             let found = effective_database_user_version(path)?;
             return match found {
                 Some(found) => Err(BeadsError::SchemaMismatch {
@@ -18161,7 +18187,7 @@ impl SqliteStorage {
     pub(crate) fn pending_sync_merge_receipt(&self) -> Result<Option<SyncMergePendingReceipt>> {
         match self.inspect_pending_sync_merge()? {
             PendingSyncMergeInspection::Absent => Ok(None),
-            PendingSyncMergeInspection::Valid(receipt) => Ok(Some(receipt)),
+            PendingSyncMergeInspection::Valid(receipt) => Ok(Some(*receipt)),
             pending @ (PendingSyncMergeInspection::Legacy { .. }
             | PendingSyncMergeInspection::Malformed { .. }) => Err(BeadsError::SyncConflict {
                 message: format!(
@@ -18250,18 +18276,19 @@ impl SqliteStorage {
         expected: &SyncMergePendingReceipt,
     ) -> Result<()> {
         expected.validate()?;
-        let terminal_raw_sha256 = match (expected.phase, expected.jsonl_after.as_ref()) {
-            (
-                crate::sync::SyncMergePendingPhase::ExportFinalized,
-                Some(crate::sync::JsonlSourceStateWitness::Present { raw_sha256, .. }),
-            ) => raw_sha256,
-            _ => {
-                return Err(BeadsError::SyncConflict {
-                    message:
-                        "Pending sync merge receipt may be cleared only after exact export finalization"
-                            .to_string(),
-                });
-            }
+        let (
+            crate::sync::SyncMergePendingPhase::ExportFinalized,
+            Some(crate::sync::JsonlSourceStateWitness::Present {
+                raw_sha256: terminal_raw_sha256,
+                ..
+            }),
+        ) = (expected.phase, expected.jsonl_after.as_ref())
+        else {
+            return Err(BeadsError::SyncConflict {
+                message:
+                    "Pending sync merge receipt may be cleared only after exact export finalization"
+                        .to_string(),
+            });
         };
         if terminal_raw_sha256 != &expected.jsonl_after_raw_sha256 {
             return Err(BeadsError::SyncConflict {
@@ -18978,7 +19005,7 @@ mod tests {
         let canonical = serde_json::to_string(&receipt).unwrap();
         assert!(matches!(
             classify_pending_sync_merge_rows(&[Some(canonical)], &[]),
-            PendingSyncMergeInspection::Valid(observed) if observed == receipt
+            PendingSyncMergeInspection::Valid(observed) if *observed == receipt
         ));
 
         let pretty = serde_json::to_string_pretty(&receipt).unwrap();
@@ -19261,6 +19288,7 @@ mod tests {
     /// close routes through), before any row in the batch is mutated. An
     /// explicit `--bypass-policy` reason still gets through.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn forbidden_workflow_transition_is_rejected_for_whole_batch_before_mutation() {
         let mut transitions = std::collections::BTreeMap::new();
         transitions.insert("open".to_string(), vec!["in_progress".to_string()]);
@@ -28986,7 +29014,7 @@ mod tests {
     fn test_diag_data_visibility() {
         use fsqlite_types::value::SqliteValue;
         // Simplest possible reproduction
-        let conn = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
+        let conn = crate::franken_sync::Connection::open(":memory:".to_string()).unwrap();
         conn.execute("CREATE TABLE t (k TEXT, v TEXT)").unwrap();
         conn.execute_with_params(
             "INSERT INTO t VALUES (?, ?)",
@@ -29090,7 +29118,7 @@ mod tests {
     fn test_diag_root_page_visibility() {
         use fsqlite_types::value::SqliteValue;
         // Create full beads schema and check which root pages are accessible
-        let conn = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
+        let conn = crate::franken_sync::Connection::open(":memory:".to_string()).unwrap();
 
         // Apply schema step by step, checking after each table
         let tables = vec![(
@@ -29241,7 +29269,7 @@ mod tests {
 
         // Also try: incrementally create indexes and check count(*) after each
         eprintln!("[ROOT-DIAG] --- Incremental index creation with count check ---");
-        let conn2 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
+        let conn2 = crate::franken_sync::Connection::open(":memory:".to_string()).unwrap();
         conn2
             .execute("CREATE TABLE t (a TEXT, b TEXT, c TEXT, d TEXT, e TEXT)")
             .unwrap();
@@ -29273,7 +29301,7 @@ mod tests {
 
         // Test multi-insert with explicit transactions
         eprintln!("[ROOT-DIAG] --- Multi-insert test ---");
-        let conn3 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
+        let conn3 = crate::franken_sync::Connection::open(":memory:".to_string()).unwrap();
         conn3
             .execute("CREATE TABLE ev (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)")
             .unwrap();
@@ -29315,7 +29343,7 @@ mod tests {
         }
 
         // Also test without explicit transactions (autocommit)
-        let conn4 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
+        let conn4 = crate::franken_sync::Connection::open(":memory:".to_string()).unwrap();
         conn4
             .execute("CREATE TABLE ev2 (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT)")
             .unwrap();
@@ -29356,7 +29384,7 @@ mod tests {
 
         // Test events-like table with indexes and WHERE+ORDER BY
         eprintln!("[ROOT-DIAG] --- Events-like test ---");
-        let conn5 = crate::storage::connection::Connection::open(":memory:".to_string()).unwrap();
+        let conn5 = crate::franken_sync::Connection::open(":memory:".to_string()).unwrap();
         conn5
             .execute("CREATE TABLE issues2 (id TEXT PRIMARY KEY, title TEXT)")
             .unwrap();
@@ -33201,6 +33229,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_transaction_commits_rows_relations_notes_and_operational_state_together() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 7, 0, 0).unwrap();
@@ -33456,6 +33485,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_pending_receipt_roundtrips_and_rejects_full_envelope_tampering() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 0, 0).unwrap();
@@ -33537,7 +33567,7 @@ mod tests {
         let mut tampered_state_digest = receipt.clone();
         tampered_state_digest.state_sha256 = "60".repeat(32);
 
-        for (field, tampered) in [
+        for (field, tampered) in vec![
             ("schema_version", unsupported_schema),
             ("intent.schema_version", tampered_intent_schema),
             ("intent", tampered_intent),
@@ -33549,7 +33579,9 @@ mod tests {
             ("jsonl_after_issue_count", tampered_count),
             ("receipt_id", tampered_identity),
             ("state_sha256", tampered_state_digest),
-        ] {
+        ]
+        .into_boxed_slice()
+        {
             storage
                 .set_metadata(
                     METADATA_SYNC_MERGE_PENDING,
@@ -33719,6 +33751,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_pending_receipt_cas_rejects_stale_backward_and_immutable_changes() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 30, 0).unwrap();
@@ -33889,6 +33922,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn sync_merge_pending_receipt_clear_requires_exact_terminal_value() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 27, 8, 45, 0).unwrap();

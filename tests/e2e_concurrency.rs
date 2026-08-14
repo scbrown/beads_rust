@@ -10,7 +10,7 @@
 mod common;
 
 use assert_cmd::Command;
-use beads_rust::storage::connection::Connection;
+use beads_rust::franken_sync::Connection;
 use common::dataset_registry::{DatasetRegistry, IsolatedDataset, KnownDataset};
 use fsqlite_types::SqliteValue;
 use std::ffi::OsStr;
@@ -561,7 +561,9 @@ fn e2e_mutating_command_fails_when_write_lock_path_unusable() {
     );
     let combined = format!("{}{}", create.stdout, create.stderr);
     assert!(
-        combined.contains("Failed to open write lock") && combined.contains(".write.lock"),
+        (combined.contains("Refusing unsafe workspace write lock path")
+            || combined.contains("Failed to open write lock"))
+            && combined.contains(".write.lock"),
         "error should explain the unusable write lock path: {combined}"
     );
 
@@ -640,6 +642,7 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
 #[test]
 #[cfg(unix)]
 #[allow(clippy::incompatible_msrv)]
+#[allow(clippy::too_many_lines)]
 fn e2e_doctor_reports_live_write_lock_without_mutating_workspace() {
     use std::os::unix::fs::MetadataExt;
 
@@ -1210,6 +1213,9 @@ fn e2e_parallel_read_only_commands_serialize_without_busy_on_drop() {
 
     let isolated =
         IsolatedDataset::from_dataset(KnownDataset::BeadsRust).expect("copy beads_rust dataset");
+    isolated
+        .migrate_to_current_schema()
+        .expect("migrate isolated beads_rust dataset");
     let root = isolated.root.clone();
 
     let create = run_br_in_dir(
@@ -1462,7 +1468,20 @@ fn e2e_mixed_read_write_concurrency() {
         let handle = thread::spawn(move || {
             barrier_clone.wait();
             let start = Instant::now();
-            let result = run_br_in_dir(&root_clone, ["--lock-timeout", "500", "list", "--json"]);
+            // This reader deliberately opts out of both startup mutations, so
+            // it exercises the current-schema read-only connection instead of
+            // competing with writers for the workspace authority.
+            let result = run_br_in_dir(
+                &root_clone,
+                [
+                    "--no-auto-import",
+                    "--no-auto-flush",
+                    "--lock-timeout",
+                    "500",
+                    "list",
+                    "--json",
+                ],
+            );
             let elapsed = start.elapsed();
             ("reader", i, result, elapsed)
         });
@@ -1503,9 +1522,10 @@ fn e2e_mixed_read_write_concurrency() {
     let reader_successes = assert_only_success_or_contention("reader", &reader_results);
     let writer_successes = assert_only_success_or_contention("writer", &writer_results);
 
-    assert!(
-        reader_successes > 0,
-        "expected at least one successful reader under mixed contention"
+    assert_eq!(
+        reader_successes,
+        reader_results.len(),
+        "read-only fast-open readers must all bypass mixed writer contention"
     );
     assert!(
         writer_successes > 0,

@@ -1,9 +1,9 @@
 mod common;
 
+#[cfg(target_os = "linux")]
+use beads_rust::franken_sync::Connection;
 use beads_rust::model::{Comment, Dependency, DependencyType, Issue, IssueType, Priority, Status};
 use beads_rust::storage::SqliteStorage;
-#[cfg(target_os = "linux")]
-use beads_rust::storage::connection::Connection;
 #[cfg(target_os = "linux")]
 use beads_rust::sync::{blocking_jsonl_family_write_lock_with_timeout, blocking_write_lock};
 use chrono::Utc;
@@ -759,11 +759,38 @@ fn json_stdout_write_failure_exits_with_io_error() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
     let _log =
         common::test_log("e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths");
     let fixture = isolated_workspace_failure_fixture("metadata_custom_paths")
         .expect("metadata_custom_paths fixture");
+    let staged_legacy_db =
+        match common::dataset_registry::migrate_workspace_to_current_schema(&fixture.root) {
+            Ok(()) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {
+                // The checked-in fixture's custom.db predates the reviewed
+                // schema-migration floor (header user_version 4; reviewed plans
+                // exist only for sources 13..=16), so no in-place upgrade path
+                // exists for it. Under the current startup contract an
+                // exactly-missing database beside a live JSONL export is no
+                // longer a fail-closed pending-merge refusal: it auto-rebuilds
+                // at the current schema (commit 23cd3659). Stage the legacy
+                // database aside inside this isolated copy — preserving its
+                // bytes for inspection — so the smoke exercises that supported
+                // JSONL-only path while still proving env-sensitive custom
+                // paths are honored.
+                let legacy_db = fixture.root.join(".beads").join("custom.db");
+                let staged = fixture
+                    .root
+                    .join(".beads")
+                    .join("custom.db.pre-reviewed-schema.bak");
+                fs::rename(&legacy_db, &staged)
+                    .expect("stage pre-floor custom.db aside for JSONL-only rebuild");
+                true
+            }
+            Err(error) => panic!("migrate metadata_custom_paths fixture: {error}"),
+        };
 
     let runner_root = fixture.root.join("ambient-env-smoke");
     fs::create_dir_all(&runner_root).expect("create smoke runner root");
@@ -781,6 +808,23 @@ fn e2e_non_hermetic_smoke_existing_workspace_preserves_env_sensitive_paths() {
             ("BR_OUTPUT_FORMAT".to_string(), "json".to_string()),
         ]
     };
+
+    if staged_legacy_db {
+        // `info` reads the database without recovery, so give the JSONL-only
+        // workspace one storage-opening command to auto-rebuild custom.db at
+        // the current schema before the smoke assertions run against it.
+        let rebuild_cmd = run_br_smoke_at_root_with_env(
+            &runner_root,
+            ["sync", "--status"],
+            smoke_env(),
+            "non_hermetic_rebuild_current_schema_from_jsonl",
+        );
+        assert!(
+            rebuild_cmd.status.success(),
+            "JSONL-only auto-rebuild smoke failed: {}",
+            rebuild_cmd.stderr
+        );
+    }
 
     let where_cmd = run_br_smoke_at_root_with_env(
         &runner_root,
@@ -1440,6 +1484,7 @@ fn e2e_sync_force_jsonl_merge_does_not_resurrect_local_tombstone() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
     let _log = common::test_log("e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff");
     let workspace = BrWorkspace::new();
@@ -1611,9 +1656,12 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
             .split(|byte| *byte == b'\n')
             .filter(|line| !line.is_empty())
             .count(),
-        committed_receipt["jsonl_after_issue_count"]
-            .as_u64()
-            .expect("receipt issue count") as usize
+        usize::try_from(
+            committed_receipt["jsonl_after_issue_count"]
+                .as_u64()
+                .expect("receipt issue count"),
+        )
+        .expect("receipt issue count fits usize")
     );
     let reviewed_digest = Sha256::digest(&receipt_reviewed_bytes);
     assert_eq!(
@@ -1667,6 +1715,7 @@ fn e2e_sync_merge_resume_reuses_receipt_tombstone_cutoff() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses() {
     let _log = common::test_log(
         "e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses",
@@ -1945,6 +1994,7 @@ fn e2e_pending_merge_gate_refuses_file_only_mutations_without_changing_witnesses
 
 #[cfg(target_os = "linux")]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human() {
     let _log = common::test_log(
         "e2e_sync_merge_capacity_warning_survives_receipt_resume_and_renders_human",
@@ -2798,6 +2848,7 @@ fn e2e_sync_status_json() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() {
     let workspace = BrWorkspace::new();
     let init = run_br(&workspace, ["init"], "init_additive_reconciliation");
@@ -2805,38 +2856,28 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
 
     let create = run_br(
         &workspace,
-        [
-            "create",
-            "Database audit seed",
-            "--id",
-            "bd-db-seed",
-            "--no-auto-flush",
-        ],
+        ["create", "Database audit seed", "--no-auto-flush"],
         "create_additive_database_seed",
     );
     assert_br_success(&create, "create additive database seed");
+    let database_seed_id = parse_created_id(&create.stdout);
     let create_db_only = run_br(
         &workspace,
-        [
-            "create",
-            "Database-only preserved row",
-            "--id",
-            "bd-db-only",
-            "--no-auto-flush",
-        ],
+        ["create", "Database-only preserved row", "--no-auto-flush"],
         "create_additive_database_only_row",
     );
     assert_br_success(
         &create_db_only,
         "create additive database-only preserved row",
     );
+    let database_only_id = parse_created_id(&create_db_only.stdout);
 
     let beads_dir = workspace.root.join(".beads");
     let db_path = beads_dir.join("beads.db");
     let jsonl_path = beads_dir.join("issues.jsonl");
     let storage = SqliteStorage::open(&db_path).expect("open additive database before plan");
     let database_seed = storage
-        .get_issue("bd-db-seed")
+        .get_issue(&database_seed_id)
         .expect("read database seed")
         .expect("database seed exists");
     let events_before = storage.get_all_events(0).expect("read events before plan");
@@ -3024,14 +3065,14 @@ fn e2e_sync_additive_reconciliation_is_read_only_then_lossless_and_idempotent() 
     );
     assert!(
         storage
-            .get_issue("bd-db-seed")
+            .get_issue(&database_seed_id)
             .expect("read preserved database seed")
             .is_some(),
         "pre-existing database issue must be preserved"
     );
     assert!(
         storage
-            .get_issue("bd-db-only")
+            .get_issue(&database_only_id)
             .expect("read database-only issue")
             .is_some(),
         "database-only issue must be preserved"

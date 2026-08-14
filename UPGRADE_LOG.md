@@ -4,23 +4,23 @@
 
 ## Summary
 
-- **Updated:** fsqlite family (15 crates) 0.1.18 → 0.3.1; new direct `asupersync =0.4.3`; FastMCP's asupersync line 0.3.9 → 0.3.10; 11 minor/patch lockfile bumps | **Skipped:** 2 (with reasons) | **Failed:** 0
+- **Updated:** fsqlite family (15 crates) 0.1.18 → 0.3.1; new direct `asupersync =0.4.4`; FastMCP's asupersync line 0.3.9 → 0.3.10; 11 minor/patch lockfile bumps | **Skipped:** 2 (with reasons) | **Failed:** 0
 
 ## Discovery
 
 - Manifest: `Cargo.toml`; lock file: `Cargo.lock`.
-- crates.io max stable at time of upgrade: `fsqlite* = 0.3.1` (all 15 pinned members published), `asupersync = 0.4.3`, `fastmcp-rust = 0.3.2` (unchanged; still on the asupersync 0.3.x line).
+- crates.io max stable at completion: `fsqlite* = 0.3.1` (all 15 pinned members published), `asupersync = 0.4.4`, `fastmcp-rust = 0.3.2` (unchanged; still on the asupersync 0.3.x line).
 - All other direct dependencies were already at latest stable or covered by existing caret ranges; only lockfile refreshes were needed (supersedes Dependabot PR #425).
 
 ## Updates
 
-### fsqlite stack: 0.1.18/0.1.19 → 0.3.1 (with asupersync 0.4.3)
+### fsqlite stack: 0.1.18/0.1.19 → 0.3.1 (with asupersync 0.4.4)
 
 - **Breaking (upstream 0.2.0):** the entire engine API became `async fn` with `!Send` futures (`Connection::open`, `execute*`, `query*`, `prepare`, `close*`, `compat::open_with_flags`).
 - **Breaking (upstream 0.3.0):** the runtime family moved from asupersync 0.3.10 to `>=0.4.3,<0.5`; 0.3.x and 0.4.x asupersync types are non-interchangeable.
 - **Migration:** added `src/franken_sync.rs`, a synchronous facade that drives every engine future to completion on the calling thread via a thread-local current-thread `asupersync` Runtime (`Runtime::block_on`; the proven cass/sqlmodel bridge pattern). The runtime is taken out of its slot while polling so reentrant SQL builds a fresh runtime instead of re-entering `block_on`. The facade carries a bounded `BusyRecovery` retry (restores 0.1.x observable behavior around fsqlite 0.2+ ns-lifecycle recovery windows) and a stale-schema `prepare()`-refresh retry (fsqlite 0.2.1+ cross-connection DDL visibility). All `Connection`/`Row` imports across storage, sync, config, doctor subsystems, CLI, and integration tests moved to `crate::franken_sync::` / `beads_rust::franken_sync::`; `Row`, `SqliteValue`, and `FrankenError` re-export unchanged. Every writable open, including the explicit read-write compatibility path used by reconciliation, selects serialized engine mode to match br's workspace write lock. Missing-database recovery now quarantines all orphaned fsqlite 0.3 sidecars into verified backups before rebuilding from JSONL. `Drop` drives a best-effort close so writes through a dropped connection stay visible to later opens (#270 contract).
-- **asupersync:** new direct dependency `asupersync = { version = "=0.4.3", default-features = false }`, exactly matching the fsqlite family requirement so one runtime version serves the whole default graph.
-- **mcp feature caveat:** published `fastmcp-rust 0.3.2` still requires `asupersync ^0.3.4`, so `--features mcp` builds carry both asupersync 0.3.x and 0.4.3 (they are distinct crates under Cargo's 0.x rules and coexist). This resolves to a single 0.4.3 line once fastmcp republishes against 0.4.x.
+- **asupersync:** new direct dependency `asupersync = { version = "=0.4.4", default-features = false }` (initially =0.4.3; bumped same day when upstream published 0.4.4), matching the fsqlite family requirement so one runtime version serves the whole default graph. The 0.4.4 cancellation-contract refinement (spawned-task results surviving cancel acknowledgement) does not affect br's `block_on` bridge, which spawns no tasks.
+- **mcp feature caveat:** published `fastmcp-rust 0.3.2` still requires `asupersync ^0.3.4`, so `--features mcp` builds carry both asupersync 0.3.x and 0.4.4 (they are distinct crates under Cargo's 0.x rules and coexist). This resolves to a single 0.4.4 line once fastmcp republishes against 0.4.x.
 - **Engine-fix relevance:** fsqlite 0.3.0/0.3.1 fix the allocator page-aliasing, committed-freelist resurrection, and concurrent-writer EOF-growth corruption classes plus concurrent-open `BusyRecovery` fail-fasts — the classes behind beads_rust issues #426 and #428 and the concurrent-open regression that blocked the earlier (abandoned) `harmonize/vlsf2` migration attempt.
 - **Tests:** see Validation below.
 

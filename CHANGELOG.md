@@ -15,6 +15,54 @@ This changelog is organized by capability rather than diff order. Each version s
 
 ---
 
+## v0.3.1 -- 2026-08-14 (Release)
+
+Same-day follow-up to v0.3.0: asupersync moved to 0.4.4, the lockfile was
+refreshed to latest-compatible across the graph, and two load-sensitive
+release-gate tests were repaired.
+
+### Dependencies
+
+- asupersync 0.4.3 → 0.4.4 (with its franken-kernel/evidence/decision
+  family). Upstream 0.4.x preserves the 0.4.3 public API; the notable 0.4.4
+  change (spawned-task results surviving cancellation acknowledgement) does
+  not affect br's block_on bridge, which spawns no tasks.
+- Pinned the Rust toolchain to `nightly-2026-08-13` so local, RCH, and
+  cross-platform release builds use the same compiler, rustfmt, and Clippy
+  lint inventory instead of resolving a host-dependent floating nightly.
+- Full `cargo update` lockfile refresh: ~45 transitive crates to latest
+  compatible (aho-corasick 1.1.5, aws-lc-rs 1.18, blake3 1.8.6, cc 1.4.3,
+  futures 0.3.34 family, http 1.5, icu 2.3 family, and others). Direct
+  dependencies were already at latest stable (sha2 0.11, rand 0.10,
+  signal-hook 0.4.4, similar 3.1.2); the deliberate holdouts remain
+  self_update (pre-release pin), cap-primitives (=4.0.2 by design), and
+  fastmcp-rust's own asupersync 0.3.10 line (awaiting its 0.4.x republish).
+
+### Fixed
+
+- v0.3.0's `darwin_amd64` release asset (and its `darwin_x86_64` alias)
+  contained an arm64 binary: the local-release pipeline built the Intel slot
+  on an Apple Silicon host without forcing `--target x86_64-apple-darwin`,
+  so Intel Macs downloaded a binary that cannot run. The v0.3.0 assets were
+  rebuilt from the same tag and replaced in place (checksums regenerated,
+  Rosetta-verified), and the release pipeline now pins the cross target for
+  the darwin/amd64 slot. v0.2.22 and earlier were unaffected (CI built them
+  with explicit targets).
+- The installer's `/tmp/br-install.lock` now honors `TMPDIR` (POSIX
+  convention), and the installer test suite plants its deliberately stale
+  lock inside a per-test TMPDIR — parallel installer tests could previously
+  race each other's recovery of the shared planted lock.
+- The concurrent `sync --flush-only` failure-injection scenario now drains
+  both subprocesses simultaneously. Previously, inherited verbose dependency
+  tracing could fill the lock holder's captured stderr while the harness was
+  synchronously waiting on the losing child, creating a test-only pipe/lock
+  deadlock. The repair was verified with a live GDB backtrace and 50 repeated
+  contention runs.
+- The sync-merge receipt boundary scenario now asserts its actual semantic
+  precondition (`receipt cutoff < tombstone expiry`) instead of requiring an
+  arbitrary five seconds of unused headroom, removing load-sensitive false
+  failures without weakening the post-expiry replay proof.
+
 ## v0.3.0 -- 2026-08-14 (Release)
 
 Storage-engine generation upgrade: FrankenSQLite 0.1.18 → 0.3.1 with the

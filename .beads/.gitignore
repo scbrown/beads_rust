@@ -40,6 +40,11 @@ sync_base.jsonl
 # Local history backups
 .br_history/
 
+# Local recovery backups (schema-migration receipts, pre-repair copies)
+# — same lifecycle as .br_history/, written by recovery paths and
+# per-machine only
+.br_recovery/
+
 # bv (beads viewer) lock file
 .bv.lock
 
@@ -48,3 +53,9 @@ sync_base.jsonl
 # contributors to accidentally commit upstream issue databases.
 # The JSONL files (issues.jsonl, interactions.jsonl) and config files
 # are tracked by git by default since no pattern above ignores them.
+
+# br fsqlite-ns VFS sidecars — per-machine runtime state, like -wal/-shm.
+# Covers beads.db-fsqlite-ns-{gate,use} and vacuum copies named
+# .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
+*-fsqlite-ns-gate
+*-fsqlite-ns-use

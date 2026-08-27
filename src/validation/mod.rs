@@ -457,7 +457,7 @@ impl LabelValidator {
     /// Returns a `ValidationError` if the imported label exceeds the length
     /// bound or contains a NUL byte.
     pub fn validate_imported(label: &str) -> Result<(), ValidationError> {
-        if label.chars().count() > 50 {
+        if label.len() > 50 {
             return Err(ValidationError::new("label", "exceeds 50 characters"));
         }
 

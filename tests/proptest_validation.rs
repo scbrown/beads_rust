@@ -386,6 +386,17 @@ proptest! {
         prop_assert!(LabelValidator::validate_imported(&label).is_err());
     }
 
+    /// Property: Imports retain the existing 50-byte storage bound for UTF-8 labels.
+    #[test]
+    fn imported_multibyte_label_over_50_bytes_fails(len in 26usize..50usize) {
+        init_test_logging();
+        let label = "é".repeat(len);
+
+        prop_assert!(label.chars().count() <= 50);
+        prop_assert!(label.len() > 50);
+        prop_assert!(LabelValidator::validate_imported(&label).is_err());
+    }
+
     /// Property: Empty label fails validation
     #[test]
     fn empty_label_fails(_dummy in 0..1u8) {

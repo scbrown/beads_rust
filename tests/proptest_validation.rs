@@ -361,6 +361,31 @@ proptest! {
         prop_assert!(result.is_err(), "Label with space should fail: '{label}'");
     }
 
+    /// Property: Legacy tracker label punctuation is preserved on import.
+    #[test]
+    fn imported_legacy_label_passes(
+        prefix in "[a-z]{1,10}",
+        separator in prop::sample::select(vec!['.', ' ', '/']),
+        suffix in "[a-z]{1,10}",
+    ) {
+        init_test_logging();
+        let label = format!("{prefix}{separator}{suffix}");
+        info!("proptest_imported_legacy_label: label={label}");
+
+        prop_assert!(
+            LabelValidator::validate_imported(&label).is_ok(),
+            "Legacy label should remain importable: {label:?}"
+        );
+    }
+
+    /// Property: Imported labels remain bounded even when their character set is broad.
+    #[test]
+    fn imported_label_over_50_chars_fails(label in ".{51,100}") {
+        init_test_logging();
+
+        prop_assert!(LabelValidator::validate_imported(&label).is_err());
+    }
+
     /// Property: Empty label fails validation
     #[test]
     fn empty_label_fails(_dummy in 0..1u8) {

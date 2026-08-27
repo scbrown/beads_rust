@@ -18553,7 +18553,7 @@ impl SqliteStorage {
         labels: &[String],
     ) -> Result<()> {
         let unique_labels = unique_label_refs(labels);
-        validate_storage_label_refs(&unique_labels)?;
+        validate_imported_storage_label_refs(&unique_labels)?;
 
         // Remove existing labels
         self.conn.execute_with_params(
@@ -18566,7 +18566,7 @@ impl SqliteStorage {
 
     fn insert_labels_for_import(&self, issue_id: &str, labels: &[String]) -> Result<()> {
         let unique_labels = unique_label_refs(labels);
-        validate_storage_label_refs(&unique_labels)?;
+        validate_imported_storage_label_refs(&unique_labels)?;
 
         self.insert_label_refs_for_import(issue_id, &unique_labels)
     }
@@ -19815,6 +19815,11 @@ fn validate_storage_label(label: &str) -> Result<()> {
     LabelValidator::validate(label).map_err(|error| BeadsError::validation("label", error.message))
 }
 
+fn validate_imported_storage_label(label: &str) -> Result<()> {
+    LabelValidator::validate_imported(label)
+        .map_err(|error| BeadsError::validation("label", error.message))
+}
+
 fn validate_storage_labels(labels: &[String]) -> Result<()> {
     if labels.len() > ISSUE_LABEL_MAX_COUNT {
         return Err(label_count_error());
@@ -19827,13 +19832,13 @@ fn validate_storage_labels(labels: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn validate_storage_label_refs(labels: &[&String]) -> Result<()> {
+fn validate_imported_storage_label_refs(labels: &[&String]) -> Result<()> {
     if labels.len() > ISSUE_LABEL_MAX_COUNT {
         return Err(label_count_error());
     }
 
     for label in labels {
-        validate_storage_label(label.as_str())?;
+        validate_imported_storage_label(label.as_str())?;
     }
 
     Ok(())
@@ -25248,7 +25253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_labels_for_import_validates_before_replacing_existing_labels() {
+    fn test_sync_labels_for_import_preserves_legacy_labels() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let t1 = Utc.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
 
@@ -25266,13 +25271,20 @@ mod tests {
             .add_label("bd-l-import-invalid", "stable", "tester")
             .unwrap();
 
-        let err = storage
-            .sync_labels_for_import("bd-l-import-invalid", &["bad label".to_string()])
-            .expect_err("invalid import labels must fail before deleting old labels");
-        assert!(err.to_string().contains("invalid characters"));
+        let legacy_labels = vec![
+            "release.1".to_string(),
+            "bad label".to_string(),
+            "sys/stat".to_string(),
+            String::new(),
+        ];
+        storage
+            .sync_labels_for_import("bd-l-import-invalid", &legacy_labels)
+            .expect("legacy import labels must be preserved");
+        let mut expected_legacy_labels = legacy_labels.clone();
+        expected_legacy_labels.sort();
         assert_eq!(
             storage.get_labels("bd-l-import-invalid").unwrap(),
-            vec!["stable".to_string()]
+            expected_legacy_labels
         );
 
         let too_many = (0..=ISSUE_LABEL_MAX_COUNT)
@@ -25284,7 +25296,12 @@ mod tests {
         assert!(err.to_string().contains("exceeds 64 labels"));
         assert_eq!(
             storage.get_labels("bd-l-import-invalid").unwrap(),
-            vec!["stable".to_string()]
+            vec![
+                String::new(),
+                "bad label".to_string(),
+                "release.1".to_string(),
+                "sys/stat".to_string(),
+            ]
         );
 
         storage

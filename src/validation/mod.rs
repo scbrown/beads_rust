@@ -114,6 +114,32 @@ impl IssueValidator {
             Err(errors)
         }
     }
+
+    /// Validate an issue loaded from an external tracker snapshot.
+    ///
+    /// Imported labels are preserved verbatim for migration compatibility.
+    /// Interactive writes continue to use [`Self::validate`] and its stricter
+    /// label character contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Vec<ValidationError>` if any issue invariant or import-safe
+    /// label bound is violated.
+    pub fn validate_imported(issue: &Issue) -> Result<(), Vec<ValidationError>> {
+        let mut issue_without_labels = issue.clone();
+        issue_without_labels.labels.clear();
+
+        let mut errors = Self::validate(&issue_without_labels)
+            .err()
+            .unwrap_or_default();
+        validate_imported_issue_labels(issue, &mut errors);
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 }
 
 fn validate_issue_text_fields(issue: &Issue, errors: &mut Vec<ValidationError>) {
@@ -248,6 +274,24 @@ fn validate_issue_labels(issue: &Issue, errors: &mut Vec<ValidationError>) {
 
     for (idx, label) in issue.labels.iter().enumerate() {
         if let Err(err) = LabelValidator::validate(label) {
+            errors.push(ValidationError::new(
+                "labels",
+                format!("label at index {idx}: {}", err.message),
+            ));
+        }
+    }
+}
+
+fn validate_imported_issue_labels(issue: &Issue, errors: &mut Vec<ValidationError>) {
+    if issue.labels.len() > ISSUE_LABEL_MAX_COUNT {
+        errors.push(ValidationError::new(
+            "labels",
+            format!("exceeds {ISSUE_LABEL_MAX_COUNT} labels"),
+        ));
+    }
+
+    for (idx, label) in issue.labels.iter().enumerate() {
+        if let Err(err) = LabelValidator::validate_imported(label) {
             errors.push(ValidationError::new(
                 "labels",
                 format!("label at index {idx}: {}", err.message),
@@ -397,6 +441,28 @@ impl LabelValidator {
                 "label",
                 "invalid characters (only alphanumeric, hyphen, underscore, colon allowed)",
             ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate a label originating in another tracker.
+    ///
+    /// Legacy imports preserve their label strings exactly, including empty
+    /// labels and characters that interactive `br` writes do not accept.
+    /// Length and NUL bounds still protect storage and output consumers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ValidationError` if the imported label exceeds the length
+    /// bound or contains a NUL byte.
+    pub fn validate_imported(label: &str) -> Result<(), ValidationError> {
+        if label.chars().count() > 50 {
+            return Err(ValidationError::new("label", "exceeds 50 characters"));
+        }
+
+        if label.contains('\0') {
+            return Err(ValidationError::new("label", "cannot contain NUL bytes"));
         }
 
         Ok(())
@@ -1001,6 +1067,30 @@ mod tests {
     fn label_validation_rejects_path_style_labels() {
         let err = LabelValidator::validate("sys/stat").unwrap_err();
         assert_eq!(err.field, "label");
+    }
+
+    #[test]
+    fn imported_label_validation_preserves_legacy_values() {
+        for label in ["release.1", "needs review", "sys/stat", ""] {
+            assert!(
+                LabelValidator::validate_imported(label).is_ok(),
+                "legacy label should be importable: {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn imported_issue_validation_preserves_legacy_labels() {
+        let mut issue = base_issue();
+        issue.labels = vec![
+            "release.1".to_string(),
+            "needs review".to_string(),
+            "sys/stat".to_string(),
+            String::new(),
+        ];
+
+        assert!(IssueValidator::validate_imported(&issue).is_ok());
+        assert!(IssueValidator::validate(&issue).is_err());
     }
 
     #[test]

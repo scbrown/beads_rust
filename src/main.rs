@@ -737,6 +737,7 @@ fn main() {
             }
         }
         Commands::Capabilities(args) => commands::capabilities::execute(&args, &output_ctx),
+        Commands::Hooks { command } => commands::hooks::execute(&command, cli.actor.as_deref()),
         Commands::Stale(args) => storage_result.as_ref().map_or_else(
             || commands::stale::execute(&args, &overrides, &output_ctx),
             |res| commands::stale::execute_with_storage(&args, &output_ctx, &res.storage),
@@ -1670,6 +1671,7 @@ const fn should_auto_import(cmd: &Commands) -> bool {
         | Commands::Orphans(_)
         | Commands::Config { .. }
         | Commands::History(_)
+        | Commands::Hooks { .. }
         | Commands::Agents(_) => false,
 
         #[cfg(feature = "mcp")]

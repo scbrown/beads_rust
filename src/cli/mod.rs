@@ -833,6 +833,12 @@ pub enum Commands {
     /// Manage local history backups
     History(HistoryArgs),
 
+    /// Execute Git hook integrations
+    Hooks {
+        #[command(subcommand)]
+        command: HookCommands,
+    },
+
     /// Show diagnostic metadata about the workspace
     Info(InfoArgs),
 
@@ -2314,6 +2320,34 @@ pub struct CommentsArgs {
 pub enum CommentCommands {
     Add(CommentAddArgs),
     List(CommentListArgs),
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookCommands {
+    /// Execute one supported Git hook
+    Run {
+        #[command(subcommand)]
+        command: HookRunCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HookRunCommands {
+    /// Append an Executed-By trailer when an actor is available
+    #[command(name = "prepare-commit-msg")]
+    PrepareCommitMsg(PrepareCommitMsgArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct PrepareCommitMsgArgs {
+    /// Commit message file supplied by Git
+    pub message_file: PathBuf,
+
+    /// Commit source supplied by Git (for example, "merge")
+    pub source: Option<String>,
+
+    /// Commit object name supplied by Git for amend/reuse flows
+    pub commit_object: Option<String>,
 }
 
 #[derive(Args, Debug)]

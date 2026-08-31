@@ -13633,8 +13633,41 @@ fn stream_import_actions_in_tx(
 /// Materialize legacy schema defaults that are written even when older JSONL
 /// records omit the corresponding optional fields.
 pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
-    issue.source_repo.get_or_insert_with(|| ".".to_string());
+    for value in [
+        &mut issue.description,
+        &mut issue.design,
+        &mut issue.acceptance_criteria,
+        &mut issue.notes,
+        &mut issue.assignee,
+        &mut issue.owner,
+        &mut issue.created_by,
+        &mut issue.close_reason,
+        &mut issue.closed_by_session,
+        &mut issue.source_system,
+        &mut issue.deleted_by,
+        &mut issue.delete_reason,
+        &mut issue.original_type,
+        &mut issue.sender,
+        &mut issue.source_repo_path,
+        &mut issue.agent_context,
+    ] {
+        if value.as_deref() == Some("") {
+            *value = None;
+        }
+    }
+    if issue.source_repo.as_deref() == Some("") {
+        issue.source_repo = None;
+    } else {
+        issue.source_repo.get_or_insert_with(|| ".".to_string());
+    }
     issue.original_size.get_or_insert(0);
+    for dependency in &mut issue.dependencies {
+        dependency
+            .created_by
+            .get_or_insert_with(|| "import".to_string());
+        dependency.metadata.get_or_insert_with(|| "{}".to_string());
+        dependency.thread_id.get_or_insert_with(String::new);
+    }
 }
 
 /// Compare every persisted import field while retaining the order-independent
@@ -20299,6 +20332,77 @@ mod tests {
         assert_eq!(deduplicated, 1);
         assert_eq!(issue.comments.len(), 2);
         assert_eq!(issue.comments[1], conflicting);
+    }
+
+    #[test]
+    fn test_import_canonicalizes_persisted_legacy_defaults_before_semantic_verification() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let target = make_test_issue("bd-default-target", "Dependency target");
+        let mut issue = make_test_issue("bd-default-source", "Legacy defaults");
+        issue.description = Some(String::new());
+        issue.design = Some(String::new());
+        issue.acceptance_criteria = Some(String::new());
+        issue.notes = Some(String::new());
+        issue.assignee = Some(String::new());
+        issue.owner = Some(String::new());
+        issue.created_by = Some(String::new());
+        issue.close_reason = Some(String::new());
+        issue.closed_by_session = Some(String::new());
+        issue.source_system = Some(String::new());
+        issue.source_repo = Some(String::new());
+        issue.source_repo_path = Some(String::new());
+        issue.agent_context = Some(String::new());
+        issue.deleted_by = Some(String::new());
+        issue.delete_reason = Some(String::new());
+        issue.original_type = Some(String::new());
+        issue.sender = Some(String::new());
+        issue.dependencies.push(crate::model::Dependency {
+            issue_id: issue.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: crate::model::DependencyType::Blocks,
+            created_at: issue.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&target).unwrap(),
+                serde_json::to_string(&issue).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("persisted legacy defaults must survive strict semantic verification");
+        assert_eq!(result.created_count, 2);
+
+        let imported = storage
+            .get_issues_for_export(std::slice::from_ref(&issue.id))
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(imported.notes, None);
+        assert_eq!(imported.assignee, None);
+        assert_eq!(imported.source_repo, None);
+        assert_eq!(imported.source_repo_path, None);
+        assert_eq!(imported.agent_context, None);
+        assert_eq!(imported.dependencies.len(), 1);
+        assert_eq!(
+            imported.dependencies[0].created_by.as_deref(),
+            Some("import")
+        );
+        assert_eq!(imported.dependencies[0].metadata.as_deref(), Some("{}"));
+        assert_eq!(imported.dependencies[0].thread_id.as_deref(), Some(""));
     }
 
     #[test]

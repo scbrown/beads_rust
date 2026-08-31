@@ -1811,7 +1811,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub notes_contains: Option<String>,
 
-    /// Include closed issues (default excludes closed)
+    /// Include closed issues (ephemeral rows remain visible but are not exported)
     #[arg(long, short = 'a')]
     pub all: bool,
 

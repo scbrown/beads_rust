@@ -13,9 +13,10 @@ pub mod path;
 pub mod witness;
 
 pub use path::{
-    ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, is_sync_path_allowed,
-    require_safe_sync_overwrite_path, require_valid_sync_path, validate_no_git_path,
-    validate_sync_path, validate_sync_path_with_external, validate_temp_file_path,
+    ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, canonical_source_repo_path,
+    is_sync_path_allowed, require_safe_sync_overwrite_path, require_valid_sync_path,
+    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
+    validate_temp_file_path,
 };
 pub(crate) use path::{
     JsonlSourceSnapshot, PinnedJsonlName, authority_paths_equivalent,
@@ -1332,6 +1333,177 @@ fn jsonl_write_authority_path(jsonl_path: &Path) -> Result<PathBuf> {
     update_sync_path_digest(&mut hasher, &canonical_key);
     let digest = hex_encode(&hasher.finalize());
     Ok(parent.join(format!(".br-jsonl-write-{}.lock", &digest[..24])))
+}
+
+fn database_opener_lease_path(database_path: &Path) -> Result<PathBuf> {
+    let canonical_key = canonical_database_authority_key(database_path)?;
+    let parent = canonical_key.parent().ok_or_else(|| {
+        BeadsError::Config(format!(
+            "Canonical database path {} has no parent for opener lease",
+            database_path_descriptor(&canonical_key)
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"beads-rust-database-openers-v1\0");
+    update_sync_path_digest(&mut hasher, &canonical_key);
+    let digest = hex_encode(&hasher.finalize());
+    Ok(parent.join(format!(".br-db-openers-{}.lock", &digest[..24])))
+}
+
+/// Upper bound on waiting for a peer's exclusive (checkpointing) hold of the
+/// opener lease. A checkpoint is short; a longer wait means the lease is
+/// degraded and the caller proceeds without it rather than hanging br.
+const OPENER_LEASE_WAIT_MS: u64 = 5_000;
+
+/// Open a dedicated lock sidecar (create if missing) without following
+/// symlinks or admitting special files.
+fn open_lock_sidecar(path: &Path, role: &str) -> Result<File> {
+    if let Ok(metadata) = fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.is_file())
+    {
+        return Err(BeadsError::Config(format!(
+            "Refusing unsafe {role} path {}: expected a regular file, not a symlink or special file",
+            path.display()
+        )));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    options.open(path).map_err(|error| {
+        BeadsError::Config(format!(
+            "Failed to open {role} at {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Shared lease held by every br process that has a persistent database open.
+///
+/// FrankenSQLite's multi-process WAL checkpoint does not yet register against
+/// the read snapshots of peer processes (FrankenSQLite #399/#385): a
+/// `wal_checkpoint(TRUNCATE)` — and, after enough rounds, even PASSIVE — run
+/// by one short-lived `br` process while another has the database open is the
+/// interleaving behind the page-aliasing corruption in GitHub #457/#460/#461.
+/// The same discriminator shows concurrent processes that never checkpoint
+/// stay clean. br therefore checkpoints only while it can prove it is the sole
+/// opener: every opener holds this lease shared for the lifetime of its
+/// storage handle, and a checkpoint first upgrades to the exclusive hold.
+/// While that exclusive hold lasts, new openers wait, so no process starts
+/// reading a WAL that is about to be reset.
+///
+/// The lease is advisory and never blocks br from working: if it cannot be
+/// registered within [`OPENER_LEASE_WAIT_MS`] it degrades to "peers unknown",
+/// which simply disables checkpointing for that handle.
+#[derive(Debug)]
+pub struct DatabaseOpenerLease {
+    path: PathBuf,
+    shared: Option<File>,
+}
+
+impl DatabaseOpenerLease {
+    /// Register this process as an opener of `database_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the lease sidecar path cannot be derived or
+    /// is unsafe (symlink / special file); lock contention degrades instead.
+    #[allow(clippy::incompatible_msrv)]
+    pub fn register(database_path: &Path) -> Result<Self> {
+        let path = database_opener_lease_path(database_path)?;
+        let shared = Self::acquire_shared(&path)?;
+        Ok(Self { path, shared })
+    }
+
+    /// Whether this handle currently holds its shared registration.
+    #[must_use]
+    pub fn is_registered(&self) -> bool {
+        self.shared.is_some()
+    }
+
+    #[allow(clippy::incompatible_msrv)]
+    fn acquire_shared(path: &Path) -> Result<Option<File>> {
+        let file = open_lock_sidecar(path, "database opener lease")?;
+        let started = Instant::now();
+        let timeout = Duration::from_millis(OPENER_LEASE_WAIT_MS);
+        loop {
+            match file.try_lock_shared() {
+                Ok(()) => return Ok(Some(file)),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(error)) => {
+                    tracing::warn!(
+                        error = %error,
+                        lease = %path.display(),
+                        "database opener lease unavailable; checkpoints are disabled for this handle"
+                    );
+                    return Ok(None);
+                }
+            }
+            if started.elapsed() >= timeout {
+                tracing::warn!(
+                    lease = %path.display(),
+                    "a peer held the database opener lease exclusively for too long; proceeding unregistered with checkpoints disabled"
+                );
+                return Ok(None);
+            }
+            thread::sleep(WRITE_LOCK_POLL_INTERVAL);
+        }
+    }
+
+    /// Try to become the sole opener.
+    ///
+    /// Returns the exclusive hold when no other process has the database
+    /// open. Returns `None` — with the shared registration restored — when a
+    /// peer is present or the lease is degraded. Callers must hand the hold
+    /// back through [`Self::release_exclusive`] once the checkpoint is done.
+    #[allow(clippy::incompatible_msrv)]
+    pub fn try_exclusive(&mut self) -> Option<File> {
+        // Whole-file locks are per open file description, so this handle's
+        // own shared registration must be released before probing.
+        self.shared.take()?;
+        let exclusive = match open_lock_sidecar(&self.path, "database opener lease") {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(error = %error, "database opener lease reopen failed");
+                self.restore_shared();
+                return None;
+            }
+        };
+        match exclusive.try_lock() {
+            Ok(()) => Some(exclusive),
+            Err(TryLockError::WouldBlock) => {
+                drop(exclusive);
+                self.restore_shared();
+                None
+            }
+            Err(TryLockError::Error(error)) => {
+                tracing::warn!(error = %error, "database opener lease exclusive probe failed");
+                drop(exclusive);
+                self.restore_shared();
+                None
+            }
+        }
+    }
+
+    /// Return an exclusive hold obtained from [`Self::try_exclusive`] and
+    /// re-register this handle as an ordinary shared opener.
+    pub fn release_exclusive(&mut self, exclusive: File) {
+        drop(exclusive);
+        self.restore_shared();
+    }
+
+    fn restore_shared(&mut self) {
+        match Self::acquire_shared(&self.path) {
+            Ok(shared) => self.shared = shared,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "database opener lease could not be re-registered; checkpoints stay disabled"
+                );
+                self.shared = None;
+            }
+        }
+    }
 }
 
 /// Acquire the stable JSONL-family authority honored by no-DB sessions.
@@ -3064,6 +3236,9 @@ pub struct ImportResult {
     pub dependencies_imported: usize,
     /// Number of comment rows imported from JSONL for applied issue records.
     pub comments_imported: usize,
+    /// Byte-identical repeated comment objects removed while normalizing the
+    /// JSONL source. Conflicting duplicate IDs remain a hard validation error.
+    pub exact_duplicate_comments_deduplicated: usize,
     /// Number of export-hash rows recorded for the imported JSONL snapshot.
     pub export_hashes_recorded: usize,
     /// Number of blocked-cache rows rebuilt after import.
@@ -3073,6 +3248,11 @@ pub struct ImportResult {
     /// Old-id -> new-id receipt for `--rename-prefix` rewrites (empty when
     /// the flag was off or no id needed renaming).
     pub prefix_renames: Vec<ImportPrefixRename>,
+    /// Complete semantic post-state expected for every issue row written by
+    /// this import. Fresh-family rebuilds verify these witnesses after all
+    /// VACUUM/REINDEX/compaction work so a storage-engine field shift cannot
+    /// pass merely because table counts still match.
+    pub(crate) applied_issues: Vec<Issue>,
 }
 
 /// Versioned receipt schema for lossless additive JSONL reconciliation.
@@ -3729,7 +3909,7 @@ impl SyncMergePendingReceipt {
         }
         if !matches!(
             self.intent.resolution.as_str(),
-            "manual" | "force-db" | "force-jsonl" | "force-newer"
+            "manual" | "force-db" | "force-jsonl" | "force-newer" | "source-repo-path-migration"
         ) {
             return Err(BeadsError::SyncConflict {
                 message: format!(
@@ -4833,6 +5013,13 @@ fn additive_sha256(value: &impl Serialize, context: &str) -> Result<String> {
 
 fn canonicalize_additive_issue(issue: &mut Issue) {
     issue.content_hash = None;
+    // GitHub #474: the close-policy bypass audit fields are a DB-backed audit
+    // trail projected into the export for off-machine review. They are not
+    // part of the synced issue payload, and hydration paths differ in whether
+    // they attach them — never let them create false scalar conflicts.
+    issue.bypassed_policy = None;
+    issue.bypass_reason = None;
+    issue.policy_gates_fired = None;
     issue.labels.sort_unstable();
     issue.dependencies.sort_by(|left, right| {
         left.issue_id
@@ -8917,6 +9104,7 @@ pub(crate) struct JsonlIssueValidationFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct JsonlIssueValidationSummary {
     pub record_count: usize,
+    pub exportable_record_count: usize,
     pub invalid_count: usize,
     pub failures: Vec<JsonlIssueValidationFailure>,
 }
@@ -8971,6 +9159,8 @@ fn validate_jsonl_issue_records_from_reader(
                             .collect::<Vec<_>>()
                             .join(", "),
                     );
+                } else if !issue.ephemeral && !issue.id.contains("-wisp-") {
+                    summary.exportable_record_count += 1;
                 }
             }
             Err(err) => summary.push_failure(line_num + 1, err.to_string()),
@@ -8990,6 +9180,168 @@ pub(crate) fn validate_jsonl_snapshot_issue_records(
     source: &JsonlSourceSnapshot,
 ) -> Result<JsonlIssueValidationSummary> {
     validate_jsonl_issue_records_from_reader(source.reader())
+}
+
+/// One source record explicitly rejected by JSONL salvage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JsonlSalvageRejectedRecord {
+    pub line: usize,
+    pub error: String,
+}
+
+/// Durable receipt for an operator-authorized malformed-record salvage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct JsonlSalvageReceipt {
+    pub original_raw_sha256: String,
+    pub recovered_raw_sha256: String,
+    pub valid_records: usize,
+    pub rejected_records: Vec<JsonlSalvageRejectedRecord>,
+    pub backup_path: String,
+    pub publication_atomicity: String,
+    /// Exportable database records not certified by the recovered JSONL.
+    /// These rows are preserved by the additive import and require a later
+    /// full export to restore DB/JSONL coverage.
+    pub database_records_requiring_export: usize,
+    /// Whether this salvage armed `needs_flush` for those preserved rows.
+    pub needs_flush_set: bool,
+}
+
+pub(crate) struct JsonlSalvageResult {
+    pub source: Arc<JsonlSourceSnapshot>,
+    pub receipt: JsonlSalvageReceipt,
+}
+
+fn classify_jsonl_salvage_record(
+    line: &[u8],
+    seen_ids: &mut HashSet<String>,
+) -> Option<std::result::Result<(), String>> {
+    let trimmed = line.trim_ascii();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut issue = match serde_json::from_slice::<Issue>(trimmed) {
+        Ok(issue) => issue,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    normalize_issue(&mut issue);
+    if let Err(errors) = IssueValidator::validate(&issue) {
+        return Some(Err(errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")));
+    }
+    if !seen_ids.insert(issue.id.clone()) {
+        return Some(Err(format!("Duplicate issue id '{}'", issue.id)));
+    }
+    Some(Ok(()))
+}
+
+/// Remove invalid issue records from one immutable JSONL generation, retain an
+/// exact non-rotating backup, and conditionally publish the validated result.
+/// Blank lines are retained and merge-conflict markers remain a hard failure.
+///
+/// Returns `Ok(None)` when every nonblank record is already valid.
+pub(crate) fn salvage_invalid_jsonl_records_under_authority(
+    source: &JsonlSourceSnapshot,
+    output_path: &Path,
+    beads_dir: &Path,
+    allow_external_jsonl: bool,
+    jsonl_authority: &JsonlFamilyWriteLock,
+) -> Result<Option<JsonlSalvageResult>> {
+    validate_sync_path_with_external(output_path, beads_dir, allow_external_jsonl)?;
+    verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
+    ensure_no_conflict_markers_snapshot(source)?;
+
+    let export_config = ExportConfig {
+        beads_dir: Some(beads_dir.to_path_buf()),
+        allow_external_jsonl,
+        ..ExportConfig::default()
+    };
+    let (temp_path, pinned_temp, temp_file) =
+        create_full_export_temp_file_under_authority(output_path, &export_config, jsonl_authority)?;
+    let temp_guard = TempFileGuard::new_retained(temp_path.clone());
+    let mut writer = BufWriter::new(temp_file);
+    let mut reader = source.reader();
+    let mut line = Vec::with_capacity(4096);
+    let mut line_number = 0;
+    let mut valid_records = 0;
+    let mut rejected_records = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_number += 1;
+
+        match classify_jsonl_salvage_record(&line, &mut seen_ids) {
+            None => writer.write_all(&line)?,
+            Some(Ok(())) => {
+                writer.write_all(&line)?;
+                valid_records += 1;
+            }
+            Some(Err(error)) => rejected_records.push(JsonlSalvageRejectedRecord {
+                line: line_number,
+                error,
+            }),
+        }
+    }
+
+    if rejected_records.is_empty() {
+        return Ok(None);
+    }
+    if valid_records == 0 {
+        return Err(BeadsError::Config(
+            "Refusing JSONL salvage because no valid issue records would remain".to_string(),
+        ));
+    }
+
+    writer.flush()?;
+    writer
+        .into_inner()
+        .map_err(|error| BeadsError::Io(error.into_error()))?
+        .sync_all()?;
+
+    let staged_source = pinned_temp.capture()?;
+    let staged_validation = validate_jsonl_snapshot_issue_records(&staged_source)?;
+    if staged_validation.invalid_count != 0 || staged_validation.record_count != valid_records {
+        return Err(BeadsError::SyncConflict {
+            message: "Staged JSONL salvage did not reproduce the validated survivor set"
+                .to_string(),
+        });
+    }
+
+    let backup_path = history::backup_before_jsonl_salvage(beads_dir, output_path, source)?;
+    verify_jsonl_source_snapshot_current(source, jsonl_authority)?;
+    let recovered_raw_sha256 = staged_source.raw_sha256().to_string();
+    let publication = publish_staged_jsonl_conditionally(
+        &temp_path,
+        temp_guard,
+        output_path,
+        &staged_source,
+        &source.state_witness(),
+        staged_source.content_sha256(),
+        jsonl_authority,
+        None,
+    )?;
+
+    Ok(Some(JsonlSalvageResult {
+        source: publication.source,
+        receipt: JsonlSalvageReceipt {
+            original_raw_sha256: source.raw_sha256().to_string(),
+            recovered_raw_sha256,
+            valid_records,
+            rejected_records,
+            backup_path: backup_path.to_string_lossy().into_owned(),
+            publication_atomicity: publication.atomicity.as_str().to_string(),
+            database_records_requiring_export: 0,
+            needs_flush_set: false,
+        },
+    }))
 }
 
 /// Run preflight checks for export operation.
@@ -9711,6 +10063,8 @@ pub(crate) fn ensure_no_conflict_markers_snapshot(source: &JsonlSourceSnapshot) 
 #[derive(Deserialize)]
 struct PartialId {
     id: String,
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 /// Analyze JSONL to get line count and unique issue IDs efficiently.
@@ -9725,15 +10079,17 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         Err(e) => return Err(BeadsError::Io(e)),
     };
     path::validate_jsonl_fd_metadata(&file, path)?;
-    analyze_jsonl_from_reader(path, BufReader::new(file))
+    let (count, ids, _) = analyze_jsonl_from_reader(path, BufReader::new(file))?;
+    Ok((count, ids))
 }
 
 fn analyze_jsonl_from_reader(
     display_path: &Path,
     mut reader: impl BufRead,
-) -> Result<(usize, HashSet<String>)> {
+) -> Result<(usize, HashSet<String>, HashSet<String>)> {
     let mut count = 0;
     let mut ids = HashSet::new();
+    let mut exportable_ids = HashSet::new();
     let mut line_buf = String::new();
     let mut line_num = 0;
 
@@ -9761,15 +10117,25 @@ fn analyze_jsonl_from_reader(
                 line_num
             )));
         }
+        if !partial.ephemeral && !partial.id.contains("-wisp-") {
+            exportable_ids.insert(partial.id);
+        }
         count += 1;
     }
 
-    Ok((count, ids))
+    Ok((count, ids, exportable_ids))
 }
 
 pub(crate) fn analyze_jsonl_snapshot(
     source: &JsonlSourceSnapshot,
 ) -> Result<(usize, HashSet<String>)> {
+    let (count, ids, _) = analyze_jsonl_from_reader(source.display_path(), source.reader())?;
+    Ok((count, ids))
+}
+
+fn analyze_jsonl_snapshot_for_export(
+    source: &JsonlSourceSnapshot,
+) -> Result<(usize, HashSet<String>, HashSet<String>)> {
     analyze_jsonl_from_reader(source.display_path(), source.reader())
 }
 
@@ -9993,6 +10359,8 @@ fn hydrate_export_issue_batch(
         comments_map.as_ref(),
         ctx,
     );
+
+    storage.attach_close_bypass_audit_for_export(&mut issues)?;
 
     Ok(issues)
 }
@@ -10528,7 +10896,8 @@ fn export_to_jsonl_with_policy_expected_authority(
     if !config.force
         && let Some(previous_source) = previous_source
     {
-        let (jsonl_count, jsonl_ids) = analyze_jsonl_snapshot(previous_source)?;
+        let (jsonl_count, jsonl_ids, exportable_jsonl_ids) =
+            analyze_jsonl_snapshot_for_export(previous_source)?;
         // IDs the operator intentionally hard-deleted (purged) are expected
         // to disappear from the JSONL on the next export; they are not data
         // loss (#405).
@@ -10548,9 +10917,9 @@ fn export_to_jsonl_with_policy_expected_authority(
         }
 
         // Check 2: prevent exporting stale database that would lose issues
-        if !jsonl_ids.is_empty() {
+        if !exportable_jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = export_ids.iter().cloned().collect();
-            let missing: Vec<_> = jsonl_ids
+            let missing: Vec<_> = exportable_jsonl_ids
                 .difference(&db_ids)
                 .filter(|id| !purged_ids.contains(id.as_str()))
                 .collect();
@@ -10570,7 +10939,7 @@ fn export_to_jsonl_with_policy_expected_authority(
                     "Refusing to export stale database that would lose issues.\n\
                      Database has {} issues, JSONL has {} unique issues.\n\
                      Export would lose {} issue(s): {}{}\n\
-                     Hint: Run import first, or use --force to override.",
+                     Hint: Run `br sync --import-only` first, or use --force to override.",
                     export_ids.len(),
                     jsonl_ids.len(),
                     missing_list.len(),
@@ -12583,7 +12952,7 @@ fn determine_action(
 /// - Recomputes `content_hash`
 /// - Sets ephemeral=true if ID contains "-wisp-"
 /// - Applies defaults and repairs `closed_at` invariant
-fn normalize_issue(issue: &mut Issue) {
+fn normalize_issue(issue: &mut Issue) -> usize {
     use crate::util::content_hash;
 
     // Deduplicate labels
@@ -12632,6 +13001,22 @@ fn normalize_issue(issue: &mut Issue) {
                 .collect();
         }
     }
+
+    // A damaged comments tree has historically exported the same comment
+    // object more than once. Re-importing that recovery artifact should be
+    // lossless: collapse only byte-for-byte semantic duplicates while leaving
+    // same-ID/different-payload pairs for the strict validator to reject.
+    let comments_before = issue.comments.len();
+    if comments_before > 1 {
+        let mut unique = Vec::with_capacity(comments_before);
+        for comment in issue.comments.drain(..) {
+            if !unique.contains(&comment) {
+                unique.push(comment);
+            }
+        }
+        issue.comments = unique;
+    }
+    let exact_duplicate_comments_deduplicated = comments_before - issue.comments.len();
 
     // Normalize legacy Go-beads (bd) terminal status aliases that survived
     // JSONL import as `Status::Custom(_)`. Leaving them unmapped is
@@ -12684,6 +13069,7 @@ fn normalize_issue(issue: &mut Issue) {
     // Recompute after all import repairs so the stored row hash matches the
     // canonical issue state used by collision detection and export hashes.
     issue.content_hash = Some(content_hash(issue));
+    exact_duplicate_comments_deduplicated
 }
 
 #[derive(Debug)]
@@ -12708,11 +13094,17 @@ struct ImportMetadataMaps {
     id_by_hash: HashMap<String, String>,
 }
 
-fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue> {
+#[derive(Debug, Default)]
+struct ImportCollisionPlan {
+    renames: HashMap<String, String>,
+    comment_owner_ids_to_replace: Vec<String>,
+}
+
+fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<(Issue, usize)> {
     let mut issue: Issue = serde_json::from_str(trimmed)
         .map_err(|e| BeadsError::Config(format!("Invalid JSON at line {line_num}: {e}")))?;
 
-    normalize_issue(&mut issue);
+    let exact_duplicate_comments_deduplicated = normalize_issue(&mut issue);
 
     if let Err(errors) = IssueValidator::validate_imported(&issue) {
         let details = errors
@@ -12726,12 +13118,12 @@ fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<Issue
         )));
     }
 
-    Ok(issue)
+    Ok((issue, exact_duplicate_comments_deduplicated))
 }
 
 fn for_each_jsonl_import_issue(
     source: &JsonlSourceSnapshot,
-    mut handle_issue: impl FnMut(usize, Issue) -> Result<()>,
+    mut handle_issue: impl FnMut(usize, Issue, usize) -> Result<()>,
 ) -> Result<()> {
     let mut reader = source.reader();
     let mut line = String::new();
@@ -12741,8 +13133,9 @@ fn for_each_jsonl_import_issue(
         line_num += 1;
         let trimmed = line.trim();
         if !trimmed.is_empty() {
-            let issue = parse_normalized_import_issue(trimmed, line_num)?;
-            handle_issue(line_num, issue)?;
+            let (issue, exact_duplicate_comments_deduplicated) =
+                parse_normalized_import_issue(trimmed, line_num)?;
+            handle_issue(line_num, issue, exact_duplicate_comments_deduplicated)?;
         }
         line.clear();
     }
@@ -12757,8 +13150,9 @@ fn collect_import_validation_plan(
 ) -> Result<ImportValidationPlan> {
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
+    let mut positive_comment_owners = HashMap::<i64, (String, usize)>::new();
 
-    for_each_jsonl_import_issue(source, |line_num, issue| {
+    for_each_jsonl_import_issue(source, |line_num, issue, _| {
         let prefix_mismatch = !config.skip_prefix_validation
             && expected_prefix.is_some_and(|prefix| {
                 !id_matches_expected_prefix(&issue.id, prefix)
@@ -12781,6 +13175,25 @@ fn collect_import_validation_plan(
                 source.display_path().display(),
                 line_num
             )));
+        }
+
+        for comment in &issue.comments {
+            if comment.id <= 0 {
+                continue;
+            }
+            if let Some((first_issue_id, first_line_num)) =
+                positive_comment_owners.insert(comment.id, (issue.id.clone(), line_num))
+            {
+                return Err(BeadsError::Config(format!(
+                    "Duplicate positive comment id '{}' in {}: issue '{}' at line {} conflicts with issue '{}' at line {}",
+                    comment.id,
+                    source.display_path().display(),
+                    first_issue_id,
+                    first_line_num,
+                    issue.id,
+                    line_num
+                )));
+            }
         }
 
         if prefix_mismatch {
@@ -12998,13 +13411,14 @@ fn scan_import_collision_renames(
     metadata: &ImportMetadataMaps,
     result: &mut ImportResult,
     record_count: usize,
-) -> Result<HashMap<String, String>> {
+) -> Result<ImportCollisionPlan> {
     let mut seen_external_refs = HashSet::new();
     let mut renames = HashMap::new();
+    let mut comment_owner_ids_to_replace = BTreeSet::new();
     let progress =
         create_progress_bar(record_count as u64, "Scanning issues", config.show_progress);
 
-    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
+    for_each_jsonl_import_issue(source, |_line_num, mut issue, _| {
         apply_prefix_renames(&mut issue, prefix_renames);
 
         if issue.ephemeral {
@@ -13023,7 +13437,7 @@ fn scan_import_collision_renames(
             &metadata.meta_by_id,
             &computed_hash,
         );
-        let _action = determine_action(
+        let action = determine_action(
             &collision,
             &issue,
             &metadata.meta_by_id,
@@ -13035,7 +13449,13 @@ fn scan_import_collision_renames(
         };
 
         if target_id != issue.id {
-            renames.insert(issue.id.clone(), target_id);
+            renames.insert(issue.id.clone(), target_id.clone());
+        }
+        if matches!(
+            action,
+            CollisionAction::Insert | CollisionAction::Update { .. }
+        ) {
+            comment_owner_ids_to_replace.insert(target_id);
         }
 
         progress.inc(1);
@@ -13043,7 +13463,10 @@ fn scan_import_collision_renames(
     })?;
 
     progress.finish_with_message("Scan complete");
-    Ok(renames)
+    Ok(ImportCollisionPlan {
+        renames,
+        comment_owner_ids_to_replace: comment_owner_ids_to_replace.into_iter().collect(),
+    })
 }
 
 fn apply_collision_renames(issue: &mut Issue, renames: &HashMap<String, String>) {
@@ -13107,6 +13530,9 @@ fn skipped_import_matches_stored_issue(
     if expected.id != target_id {
         expected.id = target_id.to_string();
     }
+    // GitHub #468: hydrated storage carries persisted defaults for fields a
+    // sparse legacy record omits; certify the skip against that form.
+    canonicalize_persisted_issue_defaults(&mut expected);
 
     normalize_issue_for_export(&mut stored);
     normalize_issue_for_export(&mut expected);
@@ -13141,6 +13567,7 @@ fn stream_import_actions_in_tx(
     config: &ImportConfig,
     prefix_renames: &HashMap<String, String>,
     collision_renames: &HashMap<String, String>,
+    comment_owner_ids_to_replace: &[String],
     metadata: &ImportMetadataMaps,
     base_result: &ImportResult,
     progress: &indicatif::ProgressBar,
@@ -13154,65 +13581,76 @@ fn stream_import_actions_in_tx(
 
     progress.set_position(0);
     storage.clear_all_export_hashes_in_tx()?;
+    // Comment IDs are globally unique. Release every comment row owned by an
+    // issue this transaction will replace before replaying any individual
+    // issue, so authoritative IDs can move between those issues without the
+    // result depending on JSONL line order. The enclosing transaction restores
+    // all rows if a later action or semantic verification fails.
+    storage.delete_comments_for_import_issue_ids_in_tx(comment_owner_ids_to_replace)?;
 
-    for_each_jsonl_import_issue(source, |_line_num, mut issue| {
-        apply_prefix_renames(&mut issue, prefix_renames);
+    for_each_jsonl_import_issue(
+        source,
+        |_line_num, mut issue, exact_duplicate_comments_deduplicated| {
+            tx_result.exact_duplicate_comments_deduplicated +=
+                exact_duplicate_comments_deduplicated;
+            apply_prefix_renames(&mut issue, prefix_renames);
 
-        if issue.ephemeral {
-            progress.inc(1);
-            return Ok(());
-        }
-
-        handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
-
-        let computed_hash = crate::util::content_hash(&issue);
-        let collision = detect_collision(
-            &issue,
-            &metadata.id_by_ext_ref,
-            &metadata.id_by_hash,
-            &metadata.meta_by_id,
-            &computed_hash,
-        );
-        let action = determine_action(
-            &collision,
-            &issue,
-            &metadata.meta_by_id,
-            config.force_upsert,
-        )?;
-        let target_id = match &collision {
-            CollisionResult::Match { existing_id, .. } => existing_id.clone(),
-            CollisionResult::NewIssue => issue.id.clone(),
-        };
-
-        apply_collision_renames(&mut issue, collision_renames);
-        process_import_action(
-            storage,
-            &action,
-            &issue,
-            &mut tx_result,
-            fresh_relation_tables_proven_empty,
-        )?;
-
-        if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
-            storage,
-            &action,
-            &target_id,
-            &issue,
-            &computed_hash,
-        )? {
-            export_hash_ids.insert(export_id.clone());
-            export_hash_batch.push((export_id, export_hash));
-            if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
-                storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
-                export_hash_batch.clear();
+            if issue.ephemeral {
+                progress.inc(1);
+                return Ok(());
             }
-        } else {
-            uncertified_local_wins += 1;
-        }
 
-        progress.inc(1);
-        Ok(())
-    })?;
+            handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
+
+            let computed_hash = crate::util::content_hash(&issue);
+            let collision = detect_collision(
+                &issue,
+                &metadata.id_by_ext_ref,
+                &metadata.id_by_hash,
+                &metadata.meta_by_id,
+                &computed_hash,
+            );
+            let action = determine_action(
+                &collision,
+                &issue,
+                &metadata.meta_by_id,
+                config.force_upsert,
+            )?;
+            let target_id = match &collision {
+                CollisionResult::Match { existing_id, .. } => existing_id.clone(),
+                CollisionResult::NewIssue => issue.id.clone(),
+            };
+
+            apply_collision_renames(&mut issue, collision_renames);
+            process_import_action(
+                storage,
+                &action,
+                &issue,
+                &mut tx_result,
+                fresh_relation_tables_proven_empty,
+            )?;
+
+            if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+                storage,
+                &action,
+                &target_id,
+                &issue,
+                &computed_hash,
+            )? {
+                export_hash_ids.insert(export_id.clone());
+                export_hash_batch.push((export_id, export_hash));
+                if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
+                    storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
+                    export_hash_batch.clear();
+                }
+            } else {
+                uncertified_local_wins += 1;
+            }
+
+            progress.inc(1);
+            Ok(())
+        },
+    )?;
 
     if !export_hash_batch.is_empty() {
         storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
@@ -13237,8 +13675,82 @@ fn stream_import_actions_in_tx(
 
     tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
     tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+    verify_applied_import_issue_semantics(storage, &tx_result.applied_issues)?;
 
     Ok(tx_result)
+}
+
+/// Materialize legacy schema defaults that are written even when older JSONL
+/// records omit the corresponding optional fields.
+pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
+    issue.source_repo.get_or_insert_with(|| ".".to_string());
+    issue.original_size.get_or_insert(0);
+    // GitHub #468: legacy JSONL may omit dependency `created_by`, `metadata`,
+    // and `thread_id`. The import writer and SQLite schema persist those as
+    // "import", "{}", and "" — the same defaults
+    // `canonicalize_additive_issue_for_storage` documents — so strict
+    // verification must compare the sparse source against its hydrated form
+    // instead of rejecting a lossless first import (or refusing to certify
+    // an equal-timestamp second import as a no-op).
+    for dependency in &mut issue.dependencies {
+        dependency
+            .created_by
+            .get_or_insert_with(|| "import".to_string());
+        dependency.metadata.get_or_insert_with(|| "{}".to_string());
+        dependency.thread_id.get_or_insert_with(String::new);
+    }
+}
+
+/// Compare every persisted import field while retaining the order-independent
+/// relation semantics used by normal sync comparisons.
+pub(crate) fn persisted_import_issue_equals(actual: &Issue, expected: &Issue) -> bool {
+    actual.sync_equals(expected)
+        && actual.content_hash == expected.content_hash
+        && actual.created_at == expected.created_at
+        && actual.updated_at == expected.updated_at
+        && actual.agent_context == expected.agent_context
+}
+
+fn verify_applied_import_issue_semantics(
+    storage: &SqliteStorage,
+    expected_issues: &[Issue],
+) -> Result<()> {
+    if expected_issues.is_empty() {
+        return Ok(());
+    }
+
+    let ids = expected_issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let actual_by_id = storage
+        .get_issues_for_export(&ids)?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+
+    for expected in expected_issues {
+        let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
+            BeadsError::SyncConflict {
+                message: format!(
+                    "Import semantic verification failed: issue {} was written but is not addressable by its JSONL id; rolling back the import",
+                    expected.id
+                ),
+            }
+        })?;
+        let mut persisted_expected = expected.clone();
+        canonicalize_persisted_issue_defaults(&mut persisted_expected);
+        if !persisted_import_issue_equals(actual, &persisted_expected) {
+            return Err(BeadsError::SyncConflict {
+                message: format!(
+                    "Import semantic verification failed: issue {} does not match its normalized JSONL payload; rolling back the import",
+                    expected.id
+                ),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Import issues from a JSONL file.
@@ -13360,7 +13872,7 @@ fn import_from_jsonl_snapshot_impl(
     let metadata = load_import_metadata_maps(storage)?;
 
     // Phase 1: Scan and Resolve IDs
-    let collision_renames = scan_import_collision_renames(
+    let collision_plan = scan_import_collision_renames(
         source,
         config,
         &prefix_renames,
@@ -13408,7 +13920,8 @@ fn import_from_jsonl_snapshot_impl(
             source,
             config,
             &prefix_renames,
-            &collision_renames,
+            &collision_plan.renames,
+            &collision_plan.comment_owner_ids_to_replace,
             &metadata,
             &result,
             &progress,
@@ -13477,6 +13990,7 @@ fn process_import_action(
             result.imported_count += 1;
             result.created_count += 1;
             record_imported_relation_counts(result, issue);
+            result.applied_issues.push(issue.clone());
         }
         CollisionAction::Update { existing_id } => {
             // When updating by external_ref or content_hash, the incoming issue may have
@@ -13484,11 +13998,13 @@ fn process_import_action(
             if existing_id == &issue.id {
                 storage.upsert_issue_for_import_in_tx(issue)?;
                 sync_issue_relations(storage, issue)?;
+                result.applied_issues.push(issue.clone());
             } else {
                 let mut updated_issue = issue.clone();
                 updated_issue.id.clone_from(existing_id);
                 storage.upsert_issue_for_import_in_tx(&updated_issue)?;
                 sync_issue_relations(storage, &updated_issue)?;
+                result.applied_issues.push(updated_issue);
             }
             result.imported_count += 1;
             result.updated_count += 1;
@@ -13791,7 +14307,7 @@ where
     let mut record_count = 0usize;
     let mut ephemeral_skipped = 0usize;
 
-    for_each_jsonl_import_issue(source, |line_num, mut issue| {
+    for_each_jsonl_import_issue(source, |line_num, mut issue, _| {
         record_count += 1;
         if issue.ephemeral {
             ephemeral_skipped += 1;
@@ -15309,6 +15825,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15976,6 +16495,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -19272,6 +19794,63 @@ mod tests {
     }
 
     #[test]
+    fn test_stale_database_guard_ignores_jsonl_ephemeral_and_wisp_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        let regular = make_test_issue("bd-regular", "Regular issue");
+        let mut ephemeral = make_test_issue("bd-ephemeral", "Ephemeral issue");
+        ephemeral.ephemeral = true;
+        let wisp = make_test_issue("bd-wisp-session", "Legacy wisp");
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&regular).unwrap(),
+            serde_json::to_string(&ephemeral).unwrap(),
+            serde_json::to_string(&wisp).unwrap()
+        );
+        fs::write(&output_path, content).unwrap();
+        storage.create_issue(&regular, "test").unwrap();
+
+        let result = export_to_jsonl(&storage, &output_path, &ExportConfig::default()).unwrap();
+
+        assert_eq!(result.exported_ids, vec![regular.id.clone()]);
+        let (_, exported_ids) = analyze_jsonl(&output_path).unwrap();
+        assert_eq!(exported_ids, HashSet::from([regular.id]));
+    }
+
+    #[test]
+    fn test_stale_database_guard_still_rejects_real_loss_beside_ephemeral_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        let regular = make_test_issue("bd-regular", "Regular issue");
+        let missing = make_test_issue("bd-missing", "Missing regular issue");
+        let mut ephemeral = make_test_issue("bd-ephemeral", "Ephemeral issue");
+        ephemeral.ephemeral = true;
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&regular).unwrap(),
+            serde_json::to_string(&missing).unwrap(),
+            serde_json::to_string(&ephemeral).unwrap()
+        );
+        fs::write(&output_path, content).unwrap();
+        storage.create_issue(&regular, "test").unwrap();
+
+        let err = export_to_jsonl(&storage, &output_path, &ExportConfig::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("bd-missing"), "unexpected error: {err}");
+        assert!(!err.contains("bd-ephemeral"), "unexpected error: {err}");
+        assert!(
+            err.contains("br sync --import-only"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_stale_database_guard_with_force_succeeds() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -19826,6 +20405,406 @@ mod tests {
 
         // Issue ID containing "-wisp-" should be marked ephemeral
         assert!(issue.ephemeral);
+    }
+
+    #[test]
+    fn test_normalize_issue_deduplicates_only_identical_comments() {
+        let mut issue = make_test_issue("bd-comment-dedupe", "Comment recovery");
+        let comment = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "reporter".to_string(),
+            body: "recovery evidence".to_string(),
+            created_at: issue.created_at,
+        };
+        let mut conflicting = comment.clone();
+        conflicting.body = "different evidence".to_string();
+        issue.comments = vec![comment.clone(), comment, conflicting.clone()];
+
+        let deduplicated = normalize_issue(&mut issue);
+
+        assert_eq!(deduplicated, 1);
+        assert_eq!(issue.comments.len(), 2);
+        assert_eq!(issue.comments[1], conflicting);
+    }
+
+    #[test]
+    fn test_import_recovers_identical_duplicate_comments_with_receipt_count() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let mut issue = make_test_issue("bd-comment-recovery", "Comment recovery");
+        let comment = crate::model::Comment {
+            id: 42,
+            issue_id: issue.id.clone(),
+            author: "reporter".to_string(),
+            body: "recovery evidence".to_string(),
+            created_at: issue.created_at,
+        };
+        issue.comments = vec![comment.clone(), comment];
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        assert_eq!(result.exact_duplicate_comments_deduplicated, 1);
+        assert_eq!(result.comments_imported, 1);
+        assert_eq!(storage.get_comments(&issue.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_import_rejects_cross_issue_duplicate_positive_comment_ids_before_mutation() {
+        fn assert_rejected(second_body: &str, reverse_lines: bool) {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let sentinel = make_test_issue("bd-comment-sentinel", "Existing state");
+            storage.create_issue(&sentinel, "tester").unwrap();
+            let sentinel_comment = storage
+                .add_comment(&sentinel.id, "keeper", "must remain unchanged")
+                .unwrap();
+
+            let temp_dir = TempDir::new().unwrap();
+            let jsonl_path = temp_dir.path().join("issues.jsonl");
+            let mut first = make_test_issue("bd-comment-duplicate-a", "First owner");
+            let mut second = make_test_issue("bd-comment-duplicate-b", "Second owner");
+            first.comments.push(crate::model::Comment {
+                id: 3_560,
+                issue_id: first.id.clone(),
+                author: "alice".to_string(),
+                body: "shared identity".to_string(),
+                created_at: first.created_at,
+            });
+            second.comments.push(crate::model::Comment {
+                id: 3_560,
+                issue_id: second.id.clone(),
+                author: "alice".to_string(),
+                body: second_body.to_string(),
+                created_at: first.created_at,
+            });
+            let issues = if reverse_lines {
+                [&second, &first]
+            } else {
+                [&first, &second]
+            };
+            fs::write(
+                &jsonl_path,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(issues[0]).unwrap(),
+                    serde_json::to_string(issues[1]).unwrap()
+                ),
+            )
+            .unwrap();
+
+            let err = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .expect_err("cross-issue positive comment identities must be globally unique");
+            let message = err.to_string();
+            assert!(message.contains("Duplicate positive comment id '3560'"));
+            assert!(message.contains("bd-comment-duplicate-a"));
+            assert!(message.contains("bd-comment-duplicate-b"));
+            assert!(message.contains("line 1"));
+            assert!(message.contains("line 2"));
+
+            assert!(
+                storage
+                    .get_issue("bd-comment-duplicate-a")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .get_issue("bd-comment-duplicate-b")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                storage.get_comments(&sentinel.id).unwrap(),
+                vec![sentinel_comment],
+                "preflight rejection must not mutate existing comments"
+            );
+        }
+
+        for reverse_lines in [false, true] {
+            assert_rejected("different payload", reverse_lines);
+            assert_rejected("shared identity", reverse_lines);
+        }
+    }
+
+    #[test]
+    fn test_import_repairs_cross_issue_comment_id_swap_before_semantic_verification() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let existing_a = make_test_issue("bd-comment-owner-a", "First owner");
+        let existing_b = make_test_issue("bd-comment-owner-b", "Second owner");
+        storage.create_issue(&existing_a, "tester").unwrap();
+        storage.create_issue(&existing_b, "tester").unwrap();
+        let stale_b_comment = storage
+            .add_comment(&existing_b.id, "bob", "comment from B")
+            .unwrap();
+
+        // Two divergent JSONL lineages independently used stale_b_comment.id.
+        // The merged JSONL kept that id for A and renumbered B, while the
+        // ignored local database still assigns the old id to B. A appears
+        // first in JSONL, so per-issue replacement used to AUTO-reallocate A
+        // before B released the authoritative id and then fail the semantic
+        // verifier because neither persisted id matched JSONL.
+        let mut incoming_a = existing_a.clone();
+        incoming_a.updated_at += chrono::Duration::minutes(1);
+        incoming_a.comments = vec![crate::model::Comment {
+            id: stale_b_comment.id,
+            issue_id: incoming_a.id.clone(),
+            author: "alice".to_string(),
+            body: "comment from A".to_string(),
+            created_at: incoming_a.updated_at,
+        }];
+
+        let mut incoming_b = existing_b.clone();
+        incoming_b.updated_at += chrono::Duration::minutes(1);
+        incoming_b.comments = vec![crate::model::Comment {
+            id: stale_b_comment.id + 1,
+            issue_id: incoming_b.id.clone(),
+            author: stale_b_comment.author.clone(),
+            body: stale_b_comment.body.clone(),
+            created_at: stale_b_comment.created_at,
+        }];
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&incoming_a).unwrap(),
+                serde_json::to_string(&incoming_b).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("cross-issue comment ownership must converge to JSONL");
+        assert_eq!(result.updated_count, 2);
+
+        let comments_a = storage.get_comments(&incoming_a.id).unwrap();
+        let comments_b = storage.get_comments(&incoming_b.id).unwrap();
+        assert_eq!(comments_a, incoming_a.comments);
+        assert_eq!(comments_b, incoming_b.comments);
+
+        let second = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("the converged import must be a true no-op");
+        assert_eq!(second.created_count, 0);
+        assert_eq!(second.updated_count, 0);
+        assert_eq!(storage.get_comments(&incoming_a.id).unwrap(), comments_a);
+        assert_eq!(storage.get_comments(&incoming_b.id).unwrap(), comments_b);
+    }
+
+    #[test]
+    fn test_import_comment_owner_preclear_preserves_skipped_issue() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let incoming_skipped = make_test_issue("bd-comment-skip", "Local winner");
+        let mut existing_skipped = incoming_skipped.clone();
+        existing_skipped.updated_at += chrono::Duration::minutes(2);
+        storage.create_issue(&existing_skipped, "tester").unwrap();
+        let local_comment = storage
+            .add_comment(&existing_skipped.id, "local", "must survive")
+            .unwrap();
+
+        let existing_updated = make_test_issue("bd-comment-update", "Applied update");
+        storage.create_issue(&existing_updated, "tester").unwrap();
+        storage
+            .add_comment(&existing_updated.id, "local", "must be replaced")
+            .unwrap();
+        let mut incoming_updated = existing_updated.clone();
+        incoming_updated.updated_at += chrono::Duration::minutes(1);
+
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&incoming_skipped).unwrap(),
+                serde_json::to_string(&incoming_updated).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+
+        assert_eq!(result.updated_count, 1);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(
+            storage.get_comments(&incoming_skipped.id).unwrap(),
+            vec![local_comment]
+        );
+        assert!(
+            storage
+                .get_comments(&incoming_updated.id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// GitHub #468: legacy JSONL dependencies omitting `created_by`,
+    /// `metadata`, and `thread_id` hydrate to the persisted defaults
+    /// ("import", "{}", ""). Strict verification must accept the first
+    /// lossless import and certify the second import as a true no-op, while
+    /// explicit non-default values stay byte-for-byte intact.
+    #[test]
+    fn test_import_accepts_omitted_dependency_persistence_defaults() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let target = make_test_issue("bd-dep-target", "Dependency target");
+        let explicit_target = make_test_issue("bd-dep-explicit", "Explicit target");
+        let mut dependent = make_test_issue("bd-dep-sparse", "Sparse dependent");
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: dependent.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: explicit_target.id.clone(),
+            dep_type: DependencyType::Related,
+            created_at: dependent.created_at,
+            created_by: Some("source-agent".to_string()),
+            metadata: Some(r#"{"origin":"explicit"}"#.to_string()),
+            thread_id: Some("thread-explicit".to_string()),
+        });
+        // The sparse dependency really serializes without the three fields.
+        let record = serde_json::to_value(&dependent).unwrap();
+        assert!(record["dependencies"][0].get("created_by").is_none());
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&target).unwrap(),
+                serde_json::to_string(&explicit_target).unwrap(),
+                serde_json::to_string(&dependent).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("sparse dependency defaults must import losslessly");
+        assert_eq!(result.created_count, 3);
+        verify_applied_import_issue_semantics(&storage, &result.applied_issues)
+            .expect("strict verification must accept persisted dependency defaults");
+
+        let stored = storage
+            .get_issue_for_export("bd-dep-sparse")
+            .unwrap()
+            .expect("dependent issue addressable");
+        let sparse = stored
+            .dependencies
+            .iter()
+            .find(|dep| dep.dep_type == DependencyType::Blocks)
+            .unwrap();
+        assert_eq!(sparse.created_by.as_deref(), Some("import"));
+        assert_eq!(sparse.metadata.as_deref(), Some("{}"));
+        assert_eq!(sparse.thread_id.as_deref(), Some(""));
+        let explicit = stored
+            .dependencies
+            .iter()
+            .find(|dep| dep.dep_type == DependencyType::Related)
+            .unwrap();
+        assert_eq!(explicit.created_by.as_deref(), Some("source-agent"));
+        assert_eq!(
+            explicit.metadata.as_deref(),
+            Some(r#"{"origin":"explicit"}"#)
+        );
+        assert_eq!(explicit.thread_id.as_deref(), Some("thread-explicit"));
+
+        let second = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("converged second import must succeed");
+        assert_eq!(second.created_count, 0);
+        assert_eq!(second.updated_count, 0);
+        assert_eq!(second.skipped_count, 3);
+        assert_ne!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true"),
+            "a certified no-op second import must not arm needs_flush"
+        );
+    }
+
+    #[test]
+    fn test_import_semantic_verifier_rejects_field_shift_with_equal_counts() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+        let issue = make_test_issue("bd-import-semantic", "Expected title");
+        fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .unwrap();
+        assert_eq!(result.applied_issues.len(), 1);
+
+        storage
+            .execute_raw(
+                "UPDATE issues SET updated_at = '2035-01-02T03:04:05Z' WHERE id = 'bd-import-semantic'",
+            )
+            .unwrap();
+        let err = verify_applied_import_issue_semantics(&storage, &result.applied_issues)
+            .expect_err("equal row counts must not hide a field shift");
+        assert!(
+            err.to_string()
+                .contains("does not match its normalized JSONL payload"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -22435,6 +23414,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -23222,5 +24204,90 @@ mod tests {
             Some(stable_hash.as_str()),
             "content hash excludes the id, so a pure id swap must not move it"
         );
+    }
+
+    /// GH #457/#460/#461 caller-side containment: the exclusive opener hold
+    /// is refused while a peer holds the shared lease, a refused probe leaves
+    /// the shared registration in place, and a released hold rejoins it.
+    #[test]
+    fn opener_lease_refuses_exclusive_while_a_peer_is_registered() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut first = DatabaseOpenerLease::register(&db_path).unwrap();
+        assert!(first.is_registered());
+        let second = DatabaseOpenerLease::register(&db_path).unwrap();
+        assert!(second.is_registered());
+
+        assert!(
+            first.try_exclusive().is_none(),
+            "a registered peer must veto the exclusive hold"
+        );
+        assert!(
+            first.is_registered(),
+            "a refused probe must restore the shared registration"
+        );
+
+        drop(second);
+        let hold = first
+            .try_exclusive()
+            .expect("the sole opener takes the exclusive hold");
+        assert!(!first.is_registered());
+        first.release_exclusive(hold);
+        assert!(first.is_registered());
+    }
+
+    /// A newcomer waits out an in-flight exclusive hold instead of opening a
+    /// database whose WAL is being reset, then registers once it is released.
+    #[test]
+    fn opener_lease_newcomer_waits_for_an_exclusive_hold_to_end() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut holder = DatabaseOpenerLease::register(&db_path).unwrap();
+        let hold = holder.try_exclusive().expect("sole opener");
+
+        let newcomer_path = db_path.clone();
+        let newcomer = thread::spawn(move || {
+            let started = Instant::now();
+            let lease = DatabaseOpenerLease::register(&newcomer_path).unwrap();
+            (lease.is_registered(), started.elapsed())
+        });
+        thread::sleep(Duration::from_millis(200));
+        holder.release_exclusive(hold);
+
+        let (registered, waited) = newcomer.join().unwrap();
+        assert!(
+            registered,
+            "newcomer must register after the hold is released"
+        );
+        assert!(
+            waited >= Duration::from_millis(150),
+            "newcomer must have waited for the exclusive hold, waited {waited:?}"
+        );
+        assert!(holder.is_registered());
+    }
+
+    /// `checkpoint_full` is vetoed while another handle has the same persistent
+    /// database open and runs again once that handle is gone.
+    #[test]
+    fn storage_checkpoint_is_skipped_while_a_peer_has_the_database_open() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        let mut writer = SqliteStorage::open(&db_path).unwrap();
+        let peer = SqliteStorage::open(&db_path).unwrap();
+
+        let error = writer
+            .checkpoint_full()
+            .expect_err("a peer opener must veto the checkpoint");
+        assert!(
+            error
+                .to_string()
+                .contains("another br process has the database open"),
+            "{error}"
+        );
+
+        drop(peer);
+        writer
+            .checkpoint_full()
+            .expect("the sole opener checkpoints normally");
     }
 }

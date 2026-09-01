@@ -163,6 +163,74 @@ fn setup_diverse_workspace() -> (BrWorkspace, Vec<String>) {
 // BASIC LISTING TESTS
 // =============================================================================
 
+/// GitHub #475: `br list --tree` groups dotted child IDs under their parent
+/// with box-drawing connectors so the hierarchy is visible at a glance.
+#[test]
+fn e2e_list_tree_output_groups_children_under_parents() {
+    let workspace = BrWorkspace::new();
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let epic = run_br(
+        &workspace,
+        ["create", "Epic parent", "-t", "epic", "-p", "1"],
+        "create_epic",
+    );
+    assert!(epic.status.success(), "create epic failed: {}", epic.stderr);
+    let epic_id = parse_created_id(&epic.stdout);
+
+    for title in ["child one", "child two"] {
+        let child = run_br(
+            &workspace,
+            [
+                "create", title, "-t", "task", "-p", "2", "--parent", &epic_id,
+            ],
+            "create_child",
+        );
+        assert!(
+            child.status.success(),
+            "create child failed: {}",
+            child.stderr
+        );
+    }
+    let solo = run_br(
+        &workspace,
+        ["create", "standalone", "-t", "task", "-p", "3"],
+        "create_solo",
+    );
+    assert!(solo.status.success(), "create solo failed: {}", solo.stderr);
+
+    let tree = run_br(&workspace, ["list", "--tree"], "list_tree");
+    assert!(tree.status.success(), "list --tree failed: {}", tree.stderr);
+    let lines: Vec<&str> = tree.stdout.lines().collect();
+    let epic_line = lines
+        .iter()
+        .position(|line| line.contains("Epic parent"))
+        .expect("epic must be listed");
+    assert!(
+        !lines[epic_line].starts_with("├──") && !lines[epic_line].starts_with("└──"),
+        "the parent renders at the top level: {:?}",
+        lines[epic_line]
+    );
+    assert!(
+        lines[epic_line + 1].starts_with("├── ") && lines[epic_line + 1].contains("child one"),
+        "first child nests under the parent with a mid connector: {:?}",
+        &lines[epic_line..]
+    );
+    assert!(
+        lines[epic_line + 2].starts_with("└── ") && lines[epic_line + 2].contains("child two"),
+        "last child uses the closing connector: {:?}",
+        &lines[epic_line..]
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("standalone")
+            && !line.starts_with("├──")
+            && !line.starts_with("└──")),
+        "an issue without a listed parent stays at the top level: {}",
+        tree.stdout
+    );
+}
+
 #[test]
 fn e2e_list_basic_text_output() {
     let _log = common::test_log("e2e_list_basic_text_output");
@@ -1155,5 +1223,57 @@ fn e2e_list_custom_type() {
     assert!(
         issues.is_empty(),
         "no issues should match custom type filter"
+    );
+}
+
+/// Regression for GitHub #463: text-mode `br list --limit N` with no other
+/// filter used an `INDEXED BY` hint the planner could refuse, so the command
+/// failed with "internal error: no query solution".
+#[test]
+fn e2e_list_limit_text_output_without_status_filter() {
+    let _log = common::test_log("e2e_list_limit_text_output_without_status_filter");
+    let (workspace, ids) = setup_diverse_workspace();
+
+    let list = run_br(&workspace, ["list", "--limit", "1"], "list_limit_text");
+    assert!(
+        list.status.success(),
+        "list --limit 1 failed: {}\n{}",
+        list.stderr,
+        list.stdout
+    );
+    let shown = ids.iter().filter(|id| list.stdout.contains(*id)).count();
+    assert_eq!(shown, 1, "expected exactly one issue row:\n{}", list.stdout);
+
+    let paged = run_br(
+        &workspace,
+        ["list", "--limit", "2", "--offset", "1"],
+        "list_limit_offset_text",
+    );
+    assert!(
+        paged.status.success(),
+        "list --limit 2 --offset 1 failed: {}",
+        paged.stderr
+    );
+    let shown = ids.iter().filter(|id| paged.stdout.contains(*id)).count();
+    assert_eq!(
+        shown, 2,
+        "expected exactly two issue rows:\n{}",
+        paged.stdout
+    );
+
+    let unlimited = run_br(&workspace, ["list"], "list_default_text");
+    assert!(
+        unlimited.status.success(),
+        "bare list failed: {}",
+        unlimited.stderr
+    );
+    let shown = ids
+        .iter()
+        .filter(|id| unlimited.stdout.contains(*id))
+        .count();
+    assert!(
+        shown > 2,
+        "bare list should show every visible issue:\n{}",
+        unlimited.stdout
     );
 }

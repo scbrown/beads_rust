@@ -86,6 +86,27 @@ struct DoctorRepairResult {
     preserved_dirty_issue_ids: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     verified_backups: Vec<config::RecoveryBackupVerification>,
+    /// Per-table counts of DB-only history rows carried across the JSONL
+    /// rebuild (GitHub #471). The JSONL export holds issue state only, so
+    /// events / gate results / close audit / capacity records must be
+    /// snapshotted from the pre-repair database and restored afterwards.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preserved_history: Vec<PreservedHistoryTableReport>,
+    /// Loud, human-readable warnings for history that could NOT be preserved
+    /// (e.g. a corrupt page made a table unreadable before the rebuild).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    history_preservation_warnings: Vec<String>,
+}
+
+/// One preserved history table's restore outcome (GitHub #471).
+#[derive(Debug, Clone, Serialize)]
+struct PreservedHistoryTableReport {
+    table: String,
+    /// Rows restored into the rebuilt database.
+    restored: usize,
+    /// Rows skipped because their issue no longer exists after the rebuild
+    /// (the JSONL is authoritative for issue membership).
+    skipped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -252,14 +273,7 @@ impl DoctorRepairSession {
     /// `fixer_id` may be a placeholder; callers update it via
     /// [`Self::with_fixer`] before each `mutate()` call.
     fn new(repo_root: &Path, dry_run: bool) -> Result<Self> {
-        let run = run_dir::create_run_dir(repo_root)?;
-        // Re-open the actions.jsonl in append mode under our own handle —
-        // create_run_dir already touches the file, but doesn't return a
-        // handle.
-        let actions_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&run.actions_file)?;
+        let (run, actions_file) = run_dir::create_repair_run_dir(repo_root)?;
         let mut capabilities = Capabilities::for_repo(repo_root);
         // Allow the root .gitignore explicitly. It lives at <repo_root>/
         // which is outside .beads/ and .doctor/.
@@ -2361,13 +2375,11 @@ fn inspect_database_sidecars(db_path: &Path) -> Result<SidecarInspection> {
     }
 
     if wal_kind.is_regular_file() && !shm_kind.exists() {
-        // frankensqlite manages the WAL index in process-local memory rather than in an SHM
-        // file, so a WAL without a sibling SHM is the normal operating state — not an error.
-        // Record the layout as informational so callers can observe it, but do not
-        // degrade an otherwise healthy workspace: doctor treats every warning as a
-        // failed health check. We also do not
-        // quarantine the WAL, because the WAL is valid and the database is accessible.
-        // The db.write_probe check validates liveness.
+        // FrankenSQLite keeps its WAL index in process-local memory, so a WAL
+        // with no `-shm` sidecar is the normal steady state, not a fault.
+        // Record the layout as informational; do not quarantine a valid WAL or
+        // degrade an otherwise healthy workspace. The integrity and
+        // rollback-only write probes below remain the authoritative gates.
         inspection.informational_findings.push(format!(
             "WAL sidecar exists without a matching SHM sidecar at {} (expected for frankensqlite)",
             PathBuf::from(format!("{}-wal", db_path.to_string_lossy())).display()
@@ -2972,6 +2984,19 @@ fn repair_database_from_jsonl_after_preflight(
     let (preserved_tombstones, preserved_dirty_issues) =
         preserved_state_for_doctor_rebuild(db_path, source);
 
+    // GitHub #471: snapshot every DB-only append-only/history table before
+    // the rebuild. The JSONL carries issue state only; without this the
+    // rebuild silently empties events, gate results, close/bypass audit
+    // records, and capacity state while reporting success.
+    let history_snapshot = snapshot_history_for_doctor_rebuild(db_path);
+    for warning in &history_snapshot.failures {
+        tracing::warn!(
+            db_path = %db_path.display(),
+            warning,
+            "doctor --repair could not snapshot part of the DB-only history before the JSONL rebuild; those rows will be lost"
+        );
+    }
+
     let recovery =
         if let Some(authority) = cli.database_family_write_authority_for(beads_dir, db_path) {
             config::repair_database_from_jsonl_snapshot_under_write_authority(
@@ -3002,6 +3027,30 @@ fn repair_database_from_jsonl_after_preflight(
     restore_tombstones_after_rebuild(&mut storage, &preserved_tombstones)?;
     restore_dirty_issues_after_rebuild(&mut storage, &preserved_dirty_issues)?;
 
+    // GitHub #471: reattach the DB-only history captured before the rebuild.
+    // A restore failure is downgraded to a loud warning rather than failing
+    // the whole repair: at this point the rebuilt database is already the
+    // best available state, and aborting would leave the workspace corrupt
+    // AND still lose the history.
+    let mut history_preservation_warnings = history_snapshot.failures.clone();
+    let preserved_history = match storage.restore_auxiliary_history_tables(&history_snapshot) {
+        Ok(report) => report
+            .into_iter()
+            .map(|(table, restored, skipped)| PreservedHistoryTableReport {
+                table,
+                restored,
+                skipped,
+            })
+            .collect(),
+        Err(err) => {
+            history_preservation_warnings.push(format!(
+                "could not restore the {} snapshotted history row(s) into the rebuilt database: {err}",
+                history_snapshot.row_count()
+            ));
+            Vec::new()
+        }
+    };
+
     let fk_violations_cleaned = cleanup_repair_missing_issue_references(&mut storage)?;
 
     Ok(DoctorRepairResult {
@@ -3015,7 +3064,32 @@ fn repair_database_from_jsonl_after_preflight(
             .map(|preserved| preserved.issue.id.clone())
             .collect(),
         verified_backups,
+        preserved_history,
+        history_preservation_warnings,
     })
+}
+
+/// Open the pre-repair database (best effort — it is usually corrupt when
+/// this runs) and snapshot every DB-only history table so the JSONL rebuild
+/// can carry them across (GitHub #471). An unopenable database yields an
+/// empty snapshot with a loud failure entry instead of aborting the repair.
+fn snapshot_history_for_doctor_rebuild(
+    db_path: &Path,
+) -> crate::storage::sqlite::AuxiliaryHistorySnapshot {
+    let mut snapshot = crate::storage::sqlite::AuxiliaryHistorySnapshot::default();
+    if !db_path.is_file() {
+        return snapshot;
+    }
+    match SqliteStorage::open(db_path) {
+        Ok(storage) => storage.snapshot_auxiliary_history_tables(),
+        Err(err) => {
+            snapshot.failures.push(format!(
+                "could not open the pre-repair database to preserve history tables ({}): {err}",
+                crate::storage::sqlite::AUXILIARY_HISTORY_TABLES.join(", ")
+            ));
+            snapshot
+        }
+    }
 }
 
 fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Result<usize> {
@@ -3042,6 +3116,9 @@ fn cleanup_repair_missing_issue_references(storage: &mut SqliteStorage) -> Resul
         ("close_metadata", "issue_id"),
         ("gate_result_history", "issue_id"),
         ("gate_results", "issue_id"),
+        ("capacity_exemption_history", "issue_id"),
+        ("capacity_exemptions", "issue_id"),
+        ("capacity_occupancy", "issue_id"),
     ];
     let mut cleaned = 0usize;
     let mut dependency_rows_cleaned = 0usize;
@@ -10797,9 +10874,13 @@ fn compute_db_jsonl_id_delta(conn: &Connection, jsonl_path: &Path) -> Result<IdD
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
             && let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
         {
-            // Apply the same wisp filter as the DB query so the
-            // comparison stays apples-to-apples.
-            if id.contains("-wisp-") {
+            // Apply the complete export filter used by the DB query so
+            // the comparison stays apples-to-apples.
+            let ephemeral = value
+                .get("ephemeral")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if ephemeral || id.contains("-wisp-") {
                 continue;
             }
             jsonl_ids.insert(id.to_string());
@@ -10830,10 +10911,11 @@ fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<JsonlCountS
             Some(format!("Parsed {} records", summary.record_count)),
             Some(serde_json::json!({
                 "path": path.display().to_string(),
-                "records": summary.record_count
+                "records": summary.record_count,
+                "exportable_records": summary.exportable_record_count
             })),
         );
-        Ok(JsonlCountState::Available(summary.record_count))
+        Ok(JsonlCountState::Available(summary.exportable_record_count))
     } else {
         let preview = summary.preview_messages();
         push_check(
@@ -12867,12 +12949,14 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // to legacy in-place writes or accidentally ignore --dry-run.
     let mut session: Option<DoctorRepairSession> = if args.repair {
         let repo_root = beads_dir.parent().unwrap_or(&beads_dir);
-        Some(DoctorRepairSession::new(repo_root, args.dry_run).map_err(|err| {
+        let mut session = DoctorRepairSession::new(repo_root, args.dry_run).map_err(|err| {
             BeadsError::Config(format!(
                 "Cannot run doctor --repair without a reversible repair session: failed to create doctor run directory ({err}). No repair writes were applied. Set {} to a writable directory if the workspace is read-only.",
                 run_dir::ENV_RUNS_DIR
             ))
-        })?)
+        })?;
+        authorize_selected_beads_dir(&mut session, &beads_dir);
+        Some(session)
     } else {
         None
     };
@@ -13829,6 +13913,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             "preserved_tombstones": repair_result.preserved_tombstones,
             "preserved_dirty_issues": repair_result.preserved_dirty_issues,
             "preserved_dirty_issue_ids": &repair_result.preserved_dirty_issue_ids,
+            "preserved_history": &repair_result.preserved_history,
+            "history_preservation_warnings": &repair_result.history_preservation_warnings,
             "verified_backups": &repair_result.verified_backups,
             "post_repair": post_repair.report,
             "verified": post_repair_verified,
@@ -13847,6 +13933,29 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
                 repair_result.preserved_dirty_issues
             ));
         }
+        if !repair_result.preserved_history.is_empty() {
+            let summary = repair_result
+                .preserved_history
+                .iter()
+                .map(|entry| {
+                    if entry.skipped > 0 {
+                        format!(
+                            "{} {} (+{} orphaned skipped)",
+                            entry.restored, entry.table, entry.skipped
+                        )
+                    } else {
+                        format!("{} {}", entry.restored, entry.table)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            ctx.info(&format!(
+                "Preserved DB-only history across the rebuild: {summary}"
+            ));
+        }
+        for warning in &repair_result.history_preservation_warnings {
+            ctx.warning(&format!("History NOT fully preserved: {warning}"));
+        }
         if let Some(reason) = verification_failure_reason.as_deref() {
             ctx.warning(reason);
         }
@@ -13861,6 +13970,27 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     Ok(())
+}
+
+/// Authorize the exact store selected after redirect resolution.
+///
+/// A routed workspace can resolve `.beads` to a sibling such as `_beads`,
+/// outside the repair session's default `<repo_root>/.beads` scope. Keep the
+/// grant narrow: the selected store itself, never its parent directory.
+fn authorize_selected_beads_dir(session: &mut DoctorRepairSession, beads_dir: &Path) {
+    if !session
+        .ctx
+        .capabilities
+        .write_scopes
+        .iter()
+        .any(|scope| scope == beads_dir)
+    {
+        session
+            .ctx
+            .capabilities
+            .write_scopes
+            .push(beads_dir.to_path_buf());
+    }
 }
 
 /// Build and emit the `br.doctor.triage.v1` envelope from a flat
@@ -13946,6 +14076,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15582,6 +15715,8 @@ mod tests {
             preserved_dirty_issues: 0,
             preserved_dirty_issue_ids: Vec::new(),
             verified_backups: Vec::new(),
+            preserved_history: Vec::new(),
+            history_preservation_warnings: Vec::new(),
         };
 
         let audit =
@@ -15656,6 +15791,8 @@ mod tests {
             preserved_dirty_issues: 0,
             preserved_dirty_issue_ids: Vec::new(),
             verified_backups: Vec::new(),
+            preserved_history: Vec::new(),
+            history_preservation_warnings: Vec::new(),
         };
         let mut session =
             DoctorRepairSession::new(temp.path(), /* dry_run = */ false).expect("session builds");
@@ -16202,6 +16339,36 @@ mod tests {
         assert!(
             actions.is_empty(),
             "identical anchor must be a no-op: {actions}"
+        );
+    }
+
+    #[test]
+    fn authorize_selected_beads_dir_adds_exact_redirect_target_once() {
+        let temp = TempDir::new().unwrap();
+        let selected = temp.path().join("_beads");
+        fs::create_dir_all(&selected).unwrap();
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        authorize_selected_beads_dir(&mut session, &selected);
+        authorize_selected_beads_dir(&mut session, &selected);
+
+        let selected_scopes = session
+            .ctx
+            .capabilities
+            .write_scopes
+            .iter()
+            .filter(|scope| *scope == &selected)
+            .count();
+        assert_eq!(selected_scopes, 1);
+        assert!(
+            !session
+                .ctx
+                .capabilities
+                .write_scopes
+                .iter()
+                .any(|scope| scope == temp.path()),
+            "redirect repair must not widen authority to the store parent"
         );
     }
 
@@ -20322,8 +20489,13 @@ mod tests {
     fn test_check_jsonl_returns_count_only_for_valid_records() -> Result<()> {
         let mut file = NamedTempFile::new().unwrap();
         let issue = sample_issue("bd-good01", "Good issue");
+        let mut ephemeral = sample_issue("bd-ephemeral", "Ephemeral issue");
+        ephemeral.ephemeral = true;
         let encoded = serde_json::to_string(&issue)?;
+        let ephemeral_encoded = serde_json::to_string(&ephemeral)?;
         std::io::Write::write_all(file.as_file_mut(), encoded.as_bytes())?;
+        std::io::Write::write_all(file.as_file_mut(), b"\n")?;
+        std::io::Write::write_all(file.as_file_mut(), ephemeral_encoded.as_bytes())?;
         std::io::Write::write_all(file.as_file_mut(), b"\n")?;
 
         let mut checks = Vec::new();
@@ -20332,6 +20504,9 @@ mod tests {
 
         let check = find_check(&checks, "jsonl.parse").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+        let details = check.details.as_ref().expect("parse details");
+        assert_eq!(details["records"], 2);
+        assert_eq!(details["exportable_records"], 1);
 
         Ok(())
     }
@@ -21862,6 +22037,9 @@ mod tests {
                 closed_at: None,
                 close_reason: None,
                 closed_by_session: None,
+                bypassed_policy: None,
+                bypass_reason: None,
+                policy_gates_fired: None,
                 due_at: None,
                 defer_until: None,
                 external_ref: None,
@@ -22178,6 +22356,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -25370,6 +25551,40 @@ version = "2026-05-11-abc123"
         assert!(
             delta.only_jsonl.is_empty(),
             "wisp ids must be filtered from the JSONL side too: {:?}",
+            delta.only_jsonl
+        );
+    }
+
+    #[test]
+    fn compute_db_jsonl_id_delta_skips_flagged_ephemeral_ids() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        insert_minimal_issue(&mut storage, "bd-a");
+        drop(storage);
+
+        let jsonl_path = tmp.path().join("issues.jsonl");
+        let regular = sample_issue("bd-a", "Regular");
+        let mut ephemeral = sample_issue("bd-ephemeral", "Ephemeral");
+        ephemeral.ephemeral = true;
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&regular).unwrap(),
+                serde_json::to_string(&ephemeral).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).unwrap();
+
+        assert_eq!(delta.both_count, 1);
+        assert!(delta.only_db.is_empty(), "{:?}", delta.only_db);
+        assert!(
+            delta.only_jsonl.is_empty(),
+            "flagged ephemeral ids must be filtered from the JSONL side too: {:?}",
             delta.only_jsonl
         );
     }

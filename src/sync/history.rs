@@ -17,6 +17,10 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
+/// Default logical-byte ceiling for ordinary `.br_history` backup pairs.
+/// Protected recovery evidence is excluded from automatic budget rotation.
+pub const DEFAULT_HISTORY_MAX_BYTES: u64 = 1_073_741_824;
+
 /// Configuration for history backups.
 #[derive(Debug, Clone)]
 pub struct HistoryConfig {
@@ -53,6 +57,13 @@ pub struct BackupEntry {
     pub size: u64,
     pub target_path: PathBuf,
     pub target_key: String,
+    /// Protected backups are explicit recovery evidence and never participate
+    /// in automatic age/count rotation.
+    pub protected: bool,
+    /// True only when the snapshot has a readable, valid metadata sidecar.
+    /// Global byte-budget pruning is intentionally limited to these verified
+    /// complete pairs so it cannot delete unclassifiable recovery evidence.
+    metadata_verified: bool,
 }
 
 struct BackupFileGuard {
@@ -143,12 +154,15 @@ impl BackupTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BackupMetadata {
     target: BackupTarget,
+    #[serde(default)]
+    protected: bool,
 }
 
 impl BackupMetadata {
     fn from_target_path(beads_dir: &Path, target_path: &Path) -> Self {
         Self {
             target: BackupTarget::from_target_path(beads_dir, target_path),
+            protected: false,
         }
     }
 }
@@ -336,7 +350,17 @@ fn read_backup_metadata(backup_path: &Path) -> Result<Option<BackupMetadata>> {
 }
 
 fn write_backup_metadata(beads_dir: &Path, target_path: &Path, backup_path: &Path) -> Result<()> {
-    let metadata = BackupMetadata::from_target_path(beads_dir, target_path);
+    write_backup_metadata_with_protection(beads_dir, target_path, backup_path, false)
+}
+
+fn write_backup_metadata_with_protection(
+    beads_dir: &Path,
+    target_path: &Path,
+    backup_path: &Path,
+    protected: bool,
+) -> Result<()> {
+    let mut metadata = BackupMetadata::from_target_path(beads_dir, target_path);
+    metadata.protected = protected;
     let contents = serde_json::to_vec(&metadata).map_err(|err| {
         BeadsError::Config(format!(
             "Failed to serialize history backup metadata for '{}': {err}",
@@ -392,15 +416,20 @@ fn backup_target_details(
     history_dir: &Path,
     backup_path: &Path,
     backup_name: &str,
-) -> (PathBuf, String) {
+) -> (PathBuf, String, bool, bool) {
     let Some(beads_dir) = history_dir.parent() else {
         let fallback = PathBuf::from(backup_name);
-        return (fallback, format!("orphan-history:{backup_name}"));
+        return (
+            fallback,
+            format!("orphan-history:{backup_name}"),
+            false,
+            false,
+        );
     };
 
     match read_backup_metadata(backup_path) {
         Ok(Some(metadata)) => match metadata.target.resolve_path(beads_dir) {
-            Ok(target_path) => (target_path, metadata.target.key()),
+            Ok(target_path) => (target_path, metadata.target.key(), metadata.protected, true),
             Err(err) => {
                 tracing::warn!(
                     backup = %backup_path.display(),
@@ -410,19 +439,21 @@ fn backup_target_details(
                 (
                     invalid_metadata_target_path(backup_name),
                     format!("invalid-metadata:{backup_name}"),
+                    false,
+                    false,
                 )
             }
         },
         Ok(None) => legacy_backup_target_path(beads_dir, backup_name).map_or_else(
             |_| {
                 let fallback = PathBuf::from(backup_name);
-                (fallback, format!("legacy-name:{backup_name}"))
+                (fallback, format!("legacy-name:{backup_name}"), false, false)
             },
             |target_path| {
                 let target_key = BackupMetadata::from_target_path(beads_dir, &target_path)
                     .target
                     .key();
-                (target_path, target_key)
+                (target_path, target_key, false, false)
             },
         ),
         Err(err) => {
@@ -434,6 +465,8 @@ fn backup_target_details(
             (
                 invalid_metadata_target_path(backup_name),
                 format!("invalid-metadata:{backup_name}"),
+                false,
+                false,
             )
         }
     }
@@ -566,6 +599,39 @@ pub(crate) fn backup_before_export_snapshot(
     Ok(())
 }
 
+/// Preserve the exact source generation before an operator-authorized JSONL
+/// salvage. Unlike ordinary export history, this backup is never throttled,
+/// deduplicated, or rotated: rejected source bytes must remain recoverable.
+///
+/// # Errors
+///
+/// Returns an error if the history directory, backup, metadata, or durability
+/// certificate cannot be created safely.
+pub(crate) fn backup_before_jsonl_salvage(
+    beads_dir: &Path,
+    target_path: &Path,
+    source: &JsonlSourceSnapshot,
+) -> Result<PathBuf> {
+    let history_dir = beads_dir.join(".br_history");
+    ensure_history_dir_path(&history_dir)?;
+
+    let target_stem = target_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("issues");
+    let salvage_stem = format!("{target_stem}.pre-salvage");
+    let (backup_path, mut backup_file) = create_backup_file(&history_dir, &salvage_stem)?;
+    let mut backup_guard = BackupFileGuard::new(backup_path.clone());
+
+    io::copy(&mut source.reader(), &mut backup_file).map_err(BeadsError::Io)?;
+    backup_file.sync_all().map_err(BeadsError::Io)?;
+    crate::util::sync_parent_directory(&backup_path).map_err(BeadsError::Io)?;
+    write_backup_metadata_with_protection(beads_dir, target_path, &backup_path, true)?;
+    backup_guard.persist();
+
+    Ok(backup_path)
+}
+
 /// Rotate history backups based on config limits.
 ///
 /// # Errors
@@ -574,7 +640,7 @@ pub(crate) fn backup_before_export_snapshot(
 fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) -> Result<()> {
     let mut backups: Vec<_> = list_backups(history_dir, None)?
         .into_iter()
-        .filter(|entry| entry.target_key == target_key)
+        .filter(|entry| entry.target_key == target_key && !entry.protected)
         .collect();
 
     if backups.is_empty() {
@@ -607,7 +673,86 @@ fn rotate_history(history_dir: &Path, config: &HistoryConfig, target_key: &str) 
         tracing::debug!("Pruned {} old backup(s) for {}", deleted_count, target_key);
     }
 
+    let max_bytes = std::env::var("BR_HISTORY_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_HISTORY_MAX_BYTES);
+    let byte_pruned = prune_history_to_byte_budget(history_dir, max_bytes, false)?;
+    if byte_pruned > 0 {
+        tracing::debug!(
+            byte_pruned,
+            max_bytes,
+            "Pruned ordinary history backup pairs to the global logical-byte budget"
+        );
+    }
+
     Ok(())
+}
+
+fn backup_pair_size(entry: &BackupEntry) -> Result<Option<u64>> {
+    if !entry.metadata_verified {
+        return Ok(None);
+    }
+
+    let metadata_path = backup_metadata_path(&entry.path);
+    let metadata_size = history_artifact_metadata(&metadata_path, "backup metadata")?
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: format!(
+                "History backup metadata disappeared before byte-budget pruning: {}",
+                metadata_path.display()
+            ),
+        })?
+        .len();
+    Ok(Some(entry.size.saturating_add(metadata_size)))
+}
+
+fn prune_history_to_byte_budget(
+    history_dir: &Path,
+    max_bytes: u64,
+    include_protected: bool,
+) -> Result<usize> {
+    let mut backups = Vec::new();
+    for entry in list_backups(history_dir, None)? {
+        if (!include_protected && entry.protected) || !entry.metadata_verified {
+            continue;
+        }
+        if let Some(pair_size) = backup_pair_size(&entry)? {
+            backups.push((entry, pair_size));
+        }
+    }
+    backups.sort_by(|(left, _), (right, _)| {
+        right
+            .timestamp
+            .cmp(&left.timestamp)
+            .then_with(|| right.path.cmp(&left.path))
+    });
+
+    let mut total_bytes = backups
+        .iter()
+        .fold(0_u64, |total, (_, size)| total.saturating_add(*size));
+    let mut deleted = 0usize;
+
+    // Always retain the globally newest pair, even if that single snapshot is
+    // larger than the configured budget. This leaves one usable restore point
+    // and makes the oversized-newest disposition explicit and deterministic.
+    while total_bytes > max_bytes && backups.len().saturating_sub(deleted) > 1 {
+        let index = backups.len() - 1 - deleted;
+        let (entry, pair_size) = &backups[index];
+        remove_backup_artifacts(&entry.path)?;
+        total_bytes = total_bytes.saturating_sub(*pair_size);
+        deleted += 1;
+    }
+
+    if total_bytes > max_bytes && !backups.is_empty() {
+        tracing::warn!(
+            total_bytes,
+            max_bytes,
+            newest = %backups[0].0.path.display(),
+            "Newest history backup pair alone exceeds the logical-byte budget; retaining it and pruning every older ordinary pair"
+        );
+    }
+
+    Ok(deleted)
 }
 
 /// List available backups sorted by date (newest first).
@@ -664,7 +809,8 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
                 continue;
             }
         };
-        let (target_path, target_key) = backup_target_details(history_dir, &path, name);
+        let (target_path, target_key, protected, metadata_verified) =
+            backup_target_details(history_dir, &path, name);
 
         backups.push(BackupEntry {
             path,
@@ -672,6 +818,8 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
             size: metadata.len(),
             target_path,
             target_key,
+            protected,
+            metadata_verified,
         });
     }
 
@@ -684,7 +832,7 @@ pub fn list_backups(history_dir: &Path, filter_prefix: Option<&str>) -> Result<V
 fn get_latest_backup(history_dir: &Path, target_key: &str) -> Result<Option<BackupEntry>> {
     Ok(list_backups(history_dir, None)?
         .into_iter()
-        .find(|entry| entry.target_key == target_key))
+        .find(|entry| entry.target_key == target_key && !entry.protected))
 }
 
 fn snapshot_and_file_are_identical(source: &JsonlSourceSnapshot, path: &Path) -> Result<bool> {
@@ -732,6 +880,7 @@ pub fn prune_backups(
     history_dir: &Path,
     keep: usize,
     older_than_days: Option<u32>,
+    max_bytes: Option<u64>,
 ) -> Result<usize> {
     let cutoff = older_than_days.map(|days| {
         let max_safe_days = 365_i64 * 1000;
@@ -766,6 +915,10 @@ pub fn prune_backups(
                 deleted_count += 1;
             }
         }
+    }
+
+    if let Some(max_bytes) = max_bytes {
+        deleted_count += prune_history_to_byte_budget(history_dir, max_bytes, true)?;
     }
 
     Ok(deleted_count)
@@ -840,6 +993,36 @@ mod tests {
                 .iter()
                 .any(|b| b.path.to_string_lossy().contains(&t3.to_string()))
         );
+    }
+
+    #[test]
+    fn protected_salvage_backup_is_excluded_from_rotation() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+        let target_path = beads_dir.join("issues.jsonl");
+        let timestamp = (Utc::now() - chrono::Duration::days(60))
+            .format("%Y%m%d_%H%M%S")
+            .to_string();
+        let backup_path = history_dir.join(format!("issues.pre-salvage.{timestamp}.jsonl"));
+        fs::write(&backup_path, b"malformed historical bytes\n").unwrap();
+        write_backup_metadata_with_protection(&beads_dir, &target_path, &backup_path, true)
+            .unwrap();
+
+        let config = HistoryConfig {
+            enabled: true,
+            max_count: 0,
+            max_age_days: 0,
+            min_interval_secs: 0,
+        };
+        let target_key = target_key_for_path(&beads_dir, &target_path);
+        rotate_history(&history_dir, &config, &target_key).unwrap();
+
+        let remaining = list_backups(&history_dir, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].protected);
+        assert_eq!(remaining[0].path, backup_path);
     }
 
     #[test]
@@ -1046,10 +1229,89 @@ mod tests {
         let metadata_path = backup_metadata_path(&backup.path);
         assert!(metadata_path.is_file());
 
-        let deleted = prune_backups(&history_dir, 0, None).unwrap();
+        let deleted = prune_backups(&history_dir, 0, None, None).unwrap();
         assert_eq!(deleted, 1);
         assert!(!backup.path.exists());
         assert!(!metadata_path.exists());
+    }
+
+    #[test]
+    fn test_byte_budget_prunes_oldest_pairs_globally_and_retains_oversized_newest() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let config = HistoryConfig {
+            min_interval_secs: 0,
+            ..HistoryConfig::default()
+        };
+        let issues = beads_dir.join("issues.jsonl");
+        let external = beads_dir.join("external.jsonl");
+
+        fs::write(&issues, vec![b'a'; 32]).unwrap();
+        backup_before_export(&beads_dir, &config, &issues).unwrap();
+        fs::write(&external, vec![b'b'; 64]).unwrap();
+        backup_before_export(&beads_dir, &config, &external).unwrap();
+        fs::write(&issues, vec![b'c'; 96]).unwrap();
+        backup_before_export(&beads_dir, &config, &issues).unwrap();
+
+        let before = list_backups(&history_dir, None).unwrap();
+        assert_eq!(before.len(), 3);
+        assert_eq!(
+            before
+                .iter()
+                .map(|entry| entry.target_key.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            2,
+            "fixture must span two target stems"
+        );
+        let newest_path = before[0].path.clone();
+        let newest_pair_size = backup_pair_size(&before[0]).unwrap().unwrap();
+        let removed = prune_history_to_byte_budget(&history_dir, newest_pair_size, false).unwrap();
+
+        assert_eq!(removed, 2);
+        let remaining = list_backups(&history_dir, None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].path, newest_path);
+        assert!(backup_metadata_path(&newest_path).is_file());
+
+        let removed_oversized = prune_history_to_byte_budget(&history_dir, 0, false).unwrap();
+        assert_eq!(removed_oversized, 0);
+        assert!(
+            newest_path.is_file(),
+            "newest oversized snapshot is retained"
+        );
+        assert!(
+            backup_metadata_path(&newest_path).is_file(),
+            "newest oversized metadata sidecar is retained"
+        );
+    }
+
+    #[test]
+    fn test_byte_budget_preserves_unclassifiable_incomplete_pairs() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        let history_dir = beads_dir.join(".br_history");
+        fs::create_dir_all(&history_dir).unwrap();
+        let target = beads_dir.join("issues.jsonl");
+        let config = HistoryConfig {
+            min_interval_secs: 0,
+            ..HistoryConfig::default()
+        };
+
+        let unclassifiable = history_dir.join("issues.20200101_000000.jsonl");
+        fs::write(&unclassifiable, b"preserve unclassifiable bytes\n").unwrap();
+        let invalid_metadata = backup_metadata_path(&unclassifiable);
+        fs::write(&invalid_metadata, b"{not-json").unwrap();
+
+        fs::write(&target, b"newest valid restore point\n").unwrap();
+        backup_before_export(&beads_dir, &config, &target).unwrap();
+
+        let removed = prune_history_to_byte_budget(&history_dir, 0, false).unwrap();
+        assert_eq!(removed, 0, "the sole verified pair must be retained");
+        assert!(unclassifiable.is_file());
+        assert!(invalid_metadata.is_file());
     }
 
     #[test]
@@ -1170,7 +1432,7 @@ mod tests {
         }
 
         // Keep 3
-        let deleted = prune_backups(history_dir, 3, None).unwrap();
+        let deleted = prune_backups(history_dir, 3, None, None).unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(list_backups(history_dir, None).unwrap().len(), 3);
 
@@ -1178,7 +1440,7 @@ mod tests {
         // Files remaining: 0, 1, 2 days old.
         // older_than 2 means delete anything older than 48h (effectively file 2)
         // file 1 (24h old) is kept.
-        let deleted_age = prune_backups(history_dir, 100, Some(2)).unwrap();
+        let deleted_age = prune_backups(history_dir, 100, Some(2), None).unwrap();
         assert_eq!(deleted_age, 1);
         assert_eq!(list_backups(history_dir, None).unwrap().len(), 2);
     }
@@ -1199,7 +1461,7 @@ mod tests {
             File::create(history_dir.join(format!("{stem}.{ts}.jsonl"))).unwrap();
         }
 
-        let deleted = prune_backups(history_dir, 1, None).unwrap();
+        let deleted = prune_backups(history_dir, 1, None, None).unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(list_backups(history_dir, Some("issues.")).unwrap().len(), 1);
         assert_eq!(
@@ -1262,7 +1524,7 @@ mod tests {
         fs::remove_file(backup_metadata_path(&backup_path)).unwrap();
         fs::create_dir(backup_metadata_path(&backup_path)).unwrap();
 
-        let err = prune_backups(&history_dir, 0, None).unwrap_err();
+        let err = prune_backups(&history_dir, 0, None, None).unwrap_err();
         assert!(
             matches!(&err, BeadsError::Config(_)),
             "unexpected error: {err:?}"

@@ -2615,6 +2615,27 @@ fn verify_rebuilt_database_postconditions(
     storage: &SqliteStorage,
     import_result: &ImportResult,
 ) -> Result<()> {
+    let integrity_messages =
+        storage
+            .integrity_check_messages()
+            .map_err(|source| BeadsError::WithContext {
+                context: "Post-recovery validation failed while running PRAGMA integrity_check"
+                    .to_string(),
+                source: Box::new(source),
+            })?;
+    if integrity_messages.len() != 1 || !integrity_messages[0].trim().eq_ignore_ascii_case("ok") {
+        let diagnostic = integrity_messages
+            .iter()
+            .take(8)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(BeadsError::Config(format!(
+            "post-recovery validation failed: rebuilt database did not pass PRAGMA integrity_check ({} diagnostic row(s): {diagnostic})",
+            integrity_messages.len()
+        )));
+    }
+
     let issue_count = storage
         .count_issues()
         .map_err(|source| BeadsError::WithContext {
@@ -2687,8 +2708,82 @@ fn verify_rebuilt_database_postconditions(
     )?;
     verify_blocked_cache_payloads(storage)?;
     verify_child_counters(storage, import_result.child_counter_entries)?;
+    verify_rebuilt_issue_semantics(storage, &import_result.applied_issues)?;
 
     Ok(())
+}
+
+fn verify_rebuilt_issue_semantics(
+    storage: &SqliteStorage,
+    expected_issues: &[crate::model::Issue],
+) -> Result<()> {
+    let expected_ids = expected_issues
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<Vec<_>>();
+    let actual_by_id = storage
+        .get_issues_for_export(&expected_ids)
+        .map_err(|source| BeadsError::WithContext {
+            context: "Post-recovery validation failed while reading imported issues".to_string(),
+            source: Box::new(source),
+        })?
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<HashMap<_, _>>();
+
+    for expected in expected_issues {
+        // These two legacy columns are NOT NULL in the on-disk schema and
+        // therefore materialize their historical defaults even when an older
+        // JSONL record omits them. Compare against that persisted canonical
+        // representation so the verifier remains strict without rejecting a
+        // lossless import solely because `None` round-trips as the schema
+        // default.
+        let mut persisted_expected = expected.clone();
+        crate::sync::canonicalize_persisted_issue_defaults(&mut persisted_expected);
+        let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
+                BeadsError::Config(format!(
+                    "post-recovery semantic validation failed: imported issue {} is not addressable by its JSONL id",
+                    expected.id
+                ))
+            })?;
+        if !crate::sync::persisted_import_issue_equals(actual, &persisted_expected) {
+            let differing_fields = sync_mismatch_field_names(actual, &persisted_expected);
+            return Err(BeadsError::Config(format!(
+                "post-recovery semantic validation failed: imported issue {} does not match its normalized JSONL payload (differing fields: {})",
+                expected.id,
+                differing_fields.join(", ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn sync_mismatch_field_names(
+    actual: &crate::model::Issue,
+    expected: &crate::model::Issue,
+) -> Vec<String> {
+    let content_hash_differs = actual.content_hash != expected.content_hash;
+    let Ok(serde_json::Value::Object(actual_fields)) = serde_json::to_value(actual) else {
+        return vec!["unknown".to_string()];
+    };
+    let Ok(serde_json::Value::Object(expected_fields)) = serde_json::to_value(expected) else {
+        return vec!["unknown".to_string()];
+    };
+    let mut fields = actual_fields
+        .keys()
+        .chain(expected_fields.keys())
+        .filter(|field| actual_fields.get(*field) != expected_fields.get(*field))
+        .cloned()
+        .collect::<Vec<_>>();
+    if content_hash_differs {
+        fields.push("content_hash".to_string());
+    }
+    fields.sort_unstable();
+    fields.dedup();
+    if fields.is_empty() {
+        fields.push("unknown".to_string());
+    }
+    fields
 }
 
 fn verify_rebuilt_table_count(
@@ -2891,7 +2986,16 @@ pub(crate) const FSQLITE_WAL_CERT_SIDECAR_SUFFIXES: &[&str] = &["-wal-cert", "-w
 /// The classic SQLite sidecars.
 pub(crate) const CLASSIC_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
 
-/// Every engine-managed sidecar suffix, classic and fsqlite-specific.
+/// The engine-managed sidecar suffixes produced by br's fsqlite
+/// configuration — the classic `-wal`/`-shm`/`-journal` set plus the
+/// namespace-admission and WAL-durability-certificate sidecars.
+///
+/// This is deliberately scoped to the sidecars br can actually create: it
+/// does not enumerate fsqlite suffixes gated behind features br never
+/// enables (e.g. WAL-FEC `-wal-fec*`, `-wal-seg-*` segments, or the
+/// advisory `-lock-*` files fsqlite self-removes). If br ever turns on one
+/// of those features, add its suffix here and to the coverage tests so the
+/// temp-file reaper (#299) keeps up.
 pub(crate) fn db_sidecar_suffixes() -> impl Iterator<Item = &'static &'static str> {
     CLASSIC_SIDECAR_SUFFIXES
         .iter()
@@ -2974,7 +3078,7 @@ fn compact_database_via_vacuum_into_in_place_under_write_authority(
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn compact_database_via_vacuum_into_in_place_with_reopener(
-    storage: SqliteStorage,
+    mut storage: SqliteStorage,
     db_path: &Path,
     lock_timeout: Option<u64>,
     write_authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -10813,6 +10917,31 @@ routing:
 
         verify_rebuilt_database_postconditions(&fixture.storage, &fixture.import_result)
             .expect("relation-rich rebuild state should satisfy postconditions");
+    }
+
+    #[test]
+    fn rebuilt_database_postconditions_reject_semantic_field_shift_with_equal_counts() {
+        let fixture = relation_rich_rebuild_fixture();
+        let expected = fixture
+            .storage
+            .get_issue_for_export("bd-parent")
+            .expect("read expected issue")
+            .expect("expected issue exists");
+        let mut import_result = fixture.import_result.clone();
+        import_result.applied_issues.push(expected);
+
+        fixture
+            .storage
+            .execute_raw("UPDATE issues SET title = 'shifted-field-value' WHERE id = 'bd-parent'")
+            .expect("inject semantic drift without changing row counts");
+
+        let err = verify_rebuilt_database_postconditions(&fixture.storage, &import_result)
+            .expect_err("semantic field shift must fail post-rebuild validation");
+        assert!(
+            err.to_string()
+                .contains("does not match its normalized JSONL payload"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

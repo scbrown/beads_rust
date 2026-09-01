@@ -23,9 +23,11 @@ guards.
 |-----------|-------------|
 | **Export** (`--flush-only`) | Writes issues from SQLite to `.beads/issues.jsonl` |
 | **Import** (`--import-only`) | Reads issues from JSONL into SQLite |
+| **Salvage import** (`--import-only --skip-invalid-records`) | Explicit additive recovery: removes invalid records after preserving an exact protected source backup, then imports the validated survivor generation |
 | **Merge** (`--merge`) | Three-way merge of base snapshot, SQLite, and JSONL |
 | **Additive reconciliation** (`--reconcile-additive`) | Plans exact-ID recovery of JSONL-only rows while preserving SQLite-only rows and events |
 | **Additive apply** (`--reconcile-additive --apply`) | Applies a conflict-free, hash-bound additive plan transactionally |
+| **Source-path migration** (`--migrate-source-repo-path`) | Reconciles DB/JSONL rows and plans normalization of every `source_repo_path` to the canonical current workspace while preserving portable `source_repo` names |
 | **Rebuild** (`--import-only --rebuild`) | Treats JSONL as authoritative and rebuilds SQLite from it |
 | **Status** (`--status`) | Shows database/JSONL sync state without probing VCS |
 
@@ -103,6 +105,7 @@ arbitrary daemonized descendants. No sync mode calls or delegates to it.
 |-------|-----------------|----------|
 | **Conflict marker scan** | Importing unresolved merge conflicts | **None** - must resolve conflicts |
 | **Schema validation** | Importing malformed JSON | **None** - must fix JSONL |
+| **Global positive comment-ID uniqueness** | Silently reallocating one of two cross-issue comments that claim the same persisted identity | **None** - renumber one source comment explicitly |
 | **Tombstone protection** | Resurrecting deleted issues | **None** - by design |
 
 ### Merge Guards
@@ -127,6 +130,21 @@ arbitrary daemonized descendants. No sync mode calls or delegates to it.
 | **Projected-cycle check** | Newly introducing a blocking or parent-child dependency cycle | **None** |
 | **Source/database witness recheck** | Applying a plan after either side changed | **None** - regenerate the plan |
 
+### Source Repository Path Migration Guards
+
+| Guard | What it prevents | Override |
+|-------|------------------|----------|
+| **Read-only default** | Reconciliation or path rewriting before review | `--apply` with the exact reviewed plan token |
+| **Canonical current target** | Retaining a stale home, temporary, or foreign checkout path | **None** |
+| **Portable-name preservation** | Replacing `source_repo` with a machine-specific path | **None** |
+| **Timestamp/tombstone rules** | Older JSONL clobbering newer SQLite, equal-timestamp drift, or resurrection | **None** |
+| **Complete-generation witness** | Applying after DB or JSONL changed | **None** - regenerate the plan |
+| **Commit-both recovery receipt** | An interruption leaving an unwitnessed DB/JSONL generation | **None** - the next migration/merge invocation resumes the pending receipt |
+
+The migration deliberately does not probe Git or infer staged/unstaged state;
+all `br sync` modes retain zero Git authority. Run `br vcs-status --json`
+separately before applying when VCS state is part of the operator's review.
+
 ---
 
 ## Using --force Safely
@@ -143,6 +161,29 @@ br sync --import-only --force
 # Safe: Merge after confirming the newer timestamp should win
 br sync --merge --force
 ```
+
+### Recovering a historical malformed record
+
+Ordinary import rejects any invalid issue record. If a pre-existing tracked
+JSONL is already malformed, use the explicit salvage flag:
+
+```bash
+br sync --import-only --skip-invalid-records --json
+```
+
+Salvage does not weaken the default parser. It retains exact original bytes in
+a protected `.beads/.br_history/*pre-salvage*.jsonl` backup excluded from
+automatic age/count rotation, reports every rejected line in robot output,
+refuses when no valid record would remain, and still hard-fails on
+merge-conflict markers. Explicit history pruning can still remove the backup.
+The cleaned file is conditionally published under the same JSONL-family
+authority used by normal sync and the import consumes that exact immutable
+generation.
+
+The recovery is additive and rejects `--force`, `--rebuild`, and
+`--rename-prefix`. If the database preserves valid records absent from the
+cleaned JSONL, the receipt reports `database_records_requiring_export`, sets
+`needs_flush`, and a normal `br sync --flush-only` restores full JSONL coverage.
 
 **When to use --force:**
 - After a deliberate database reset
@@ -240,6 +281,36 @@ SQLite-only state sets `needs_flush=true` rather than hiding divergence.
 Use authoritative rebuild only when deleting SQLite-only state is intentional.
 Additive reconciliation is the safer first recovery tool when both sides may
 contain valuable evidence.
+
+## Portable Source Repository Path Migration
+
+Use the migration when valid SQLite and JSONL generations may each contain
+valuable rows, but `source_repo_path` values came from another machine or
+checkout:
+
+```bash
+# Read-only reconciliation and path-normalization plan
+plan="$(br sync --migrate-source-repo-path --robot)"
+plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"
+
+# Commit only the exact reviewed DB/JSONL generation
+br sync --migrate-source-repo-path --apply \
+  --expect-plan-sha256 "$plan_sha256" --robot
+```
+
+The plan imports JSONL-only rows, takes a strictly newer shared payload from
+the newer side, preserves SQLite tombstones, and rejects equal-timestamp
+semantic drift. Every surviving row receives the canonical directory that
+contains the active `.beads/` folder in `source_repo_path`; the portable
+`source_repo` display name is not derived from or replaced by that path.
+
+Apply uses the same durable publication saga as three-way merge: the database
+transaction records a hash-bound pending receipt, JSONL is conditionally
+published from that exact database post-state, export bookkeeping and the base
+snapshot are witnessed, and the receipt is cleared only after command-level
+adoption. An interruption is therefore recoverable on the next migration or
+merge invocation. This is a crash-recoverable commit-both protocol, not a claim
+that SQLite and filesystem rename share one physical transaction.
 
 ---
 

@@ -418,8 +418,8 @@ script verifies automatically.
 > `RWS7nGFfBYC+MWeZLEaowkjNi77w5FEOk49fEhX2jZ6gpd9uQ4vzVIrF` (key ID
 > `31BE80055F619CBB`). v0.4.1 moved to the recoverable DSR key shown above,
 > but its release documentation did not record that rotation. From v0.5.1,
-> the same current key is installed in both DSR and GitHub Actions and is
-> verified before upload. Releases before v0.4.0 either shipped no
+> the current key is installed in the DSR release path and verified before
+> upload. Releases before v0.4.0 either shipped no
 > `.minisig` or used an unrecoverable CI-era key; treat those signatures as
 > unverifiable (see GitHub #411).
 
@@ -503,7 +503,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 |---------|-------------|---------|
 | `list` | List issues | `br list --status open --priority 0-1` |
 | `ready` | Actionable work | `br ready` |
-| `blocked` | Blocked issues | `br blocked` |
+| `blocked` | Blocked issues | `br blocked --json \| jq '.issues[]'` |
 | `search` | Full-text search | `br search "authentication"` |
 | `stale` | Stale issues | `br stale --days 30` |
 | `coordination status` | Hidden in-progress claim diagnosis | `br coordination status --json` |
@@ -547,7 +547,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `lint` | Check issues for missing template sections | `br lint --status all` |
 | `orphans` | List open issues referenced in commits | `br orphans` |
 | `changelog` | Generate changelog from closed issues | `br changelog --since-tag v0.1.44` |
-| `history` | Manage local history backups | `br history list` |
+| `history` | Manage bounded local history backups | `br history prune --max-bytes 1073741824` |
 | `status` | Alias for project statistics | `br status` |
 
 ### Agents & Tooling
@@ -571,6 +571,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `sync` | Explicit DB ↔ JSONL modes | `br sync --flush-only` |
 | `sync --witness` | Read-only deterministic JSONL witness | `br sync --witness --robot` |
 | `sync --reconcile-additive` | Lossless exact-ID recovery plan/apply | `br sync --reconcile-additive --robot` |
+| `sync --migrate-source-repo-path` | Reconcile rows and normalize machine-specific source paths | `br sync --migrate-source-repo-path --robot` |
 | `doctor` | Run diagnostics | `br doctor` |
 | `doctor migrate-schema` | Plan/apply/undo an explicit receipt-bound schema upgrade | `br doctor migrate-schema plan --json` |
 | `stats` | Project statistics | `br stats` |
@@ -891,7 +892,8 @@ Pull from git       ──►      git pull         ──►    JSONL updated
 ```
 
 Bare `br sync` is intentionally refused; choose `--flush-only`, `--import-only`,
-`--merge`, `--reconcile`, `--reconcile-additive`, `--status`, or `--witness`
+`--merge`, `--reconcile`, `--reconcile-additive`,
+`--migrate-source-repo-path`, `--status`, or `--witness`
 so the data direction and authority are explicit. `br sync --status` never
 probes Git; run `br vcs-status --json` only when Git visibility is explicitly
 wanted.
@@ -986,6 +988,46 @@ while the JSONL still holds rows the database never imported.
 `--rebuild` is an explicit import-mode operation. It is valid only with
 `--import-only`; after import it removes database entries that are absent from
 JSONL, while preserving deletion tombstones used by sync.
+
+### Error: invalid issue record in JSONL
+
+Normal import deliberately fails closed on malformed or semantically invalid
+records. For an inherited historical file that cannot be repaired by hand,
+run the explicit salvage operation:
+
+```bash
+br sync --import-only --skip-invalid-records --json
+```
+
+br first preserves the exact original bytes in a protected
+`.beads/.br_history/*pre-salvage*.jsonl` backup that automatic history rotation
+does not remove. It then reports every rejected line, refuses if no valid
+records would remain, conditionally publishes the validated survivor
+generation, and imports that exact snapshot. Salvage is additive and cannot be
+combined with `--force`, `--rebuild`, or `--rename-prefix`. If valid database
+rows were represented only by rejected JSONL records, the receipt reports how
+many were preserved, arms `needs_flush`, and directs you to run
+`br sync --flush-only` to restore JSONL coverage. Unresolved git conflict
+markers are never skipped. Explicit history-prune commands can still remove a
+protected backup, so retain it until recovery is verified.
+
+### Reconcile portable source repository paths
+
+To reconcile valid rows from both stores while replacing stale
+machine-specific `source_repo_path` values with the canonical current workspace
+path, review and apply an exact hash-bound plan:
+
+```bash
+plan="$(br sync --migrate-source-repo-path --robot)"
+plan_sha256="$(printf '%s\n' "$plan" | jq -r .plan_sha256)"
+br sync --migrate-source-repo-path --apply \
+  --expect-plan-sha256 "$plan_sha256" --robot
+```
+
+The portable `source_repo` name is preserved. Apply uses the durable sync
+publication receipt so an interruption after the database commit or JSONL
+publication is resumed safely. Sync still does not probe Git; use
+`br vcs-status --json` separately when staged/worktree state matters.
 
 ### Sync Issues After Git Merge
 

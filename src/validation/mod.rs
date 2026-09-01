@@ -48,7 +48,7 @@ impl IssueValidator {
         if !issue.id.is_empty() && !is_valid_id_format(&issue.id) {
             errors.push(ValidationError::new(
                 "id",
-                "invalid format (expected prefix-hash)",
+                "invalid format (expected lowercase prefix-hash)",
             ));
         }
 
@@ -907,6 +907,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -1344,6 +1347,23 @@ mod tests {
         assert!(!is_valid_id_format(
             "bd-abc123456789012345678901234567890123456789"
         ));
+    }
+
+    #[test]
+    fn issue_validation_names_the_lowercase_id_contract() {
+        let mut issue = base_issue();
+        issue.id = "BD-abc123".to_string();
+
+        let errors = IssueValidator::validate(&issue).unwrap_err();
+        let id_error = errors
+            .iter()
+            .find(|error| error.field == "id")
+            .expect("uppercase issue ID should produce an id validation error");
+
+        assert_eq!(
+            id_error.message,
+            "invalid format (expected lowercase prefix-hash)"
+        );
     }
 
     #[test]

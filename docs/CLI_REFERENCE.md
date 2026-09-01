@@ -311,6 +311,7 @@ br list [OPTIONS]
 | `-r, --reverse` | Reverse sort order |
 | `--long` | Long output format |
 | `--pretty` | Tree/pretty output format |
+| `--tree` | Group children under parents with tree connectors (text output) |
 | `--wrap` | Wrap long lines instead of truncating in text output |
 | `--format <FMT>` | Output format: text, json, csv, toon |
 | `--stats` | Show token savings stats when using TOON output |
@@ -388,7 +389,7 @@ br update [OPTIONS] [IDS]...
 | `--assignee <NAME>` | Assign (empty string clears) |
 | `--owner <EMAIL>` | Set owner (empty string clears) |
 | `--claim` | Atomic claim (assignee=actor + status=in_progress) |
-| `--force` | Force update even if issue is blocked |
+| `--force` | Force update even if issue is blocked; also required to replace a non-empty description/design/acceptance-criteria/notes/agent-context value with different content |
 | `--due <DATE>` | Set due date (empty string clears) |
 | `--defer <DATE>` | Set defer date (empty string clears) |
 | `--estimate <MINUTES>` | Set time estimate |
@@ -903,15 +904,18 @@ br search <QUERY> [OPTIONS]
 Supports all filter options from `list`. Unlike `list`/`ready` (which are
 complete by default), `search` results are **capped at 50 by default**
 (`--limit <N>`, `0`=unlimited) — a broad text query can match a large fraction
-of the corpus, so a bounded, relevance-ordered result set is the default.
+of the corpus, so a bounded, relevance-ordered result set is the default. Text
+and CSV output explicitly note when more matches exist; JSON/TOON reports
+`limit`, `offset`, and `has_more`.
 
 **Closed issues are excluded by default** (tombstones always). When that
 exclusion hides matches, text output ends with a trailing note
 (`note: N closed match(es) hidden; rerun with --all to include them`), and
 JSON/TOON output always uses the stable wrapper
-`{"issues": [...], "hidden_closed_count": N}`. The count is zero when nothing
-was hidden or the selected corpus already includes closed issues. Pass `--all`
-(or a terminal `--status` such as `closed`) to include closed issues.
+`{"issues": [...], "hidden_closed_count": N, "limit": N, "offset": N,
+"has_more": bool}`. The hidden count is zero when nothing was hidden or the
+selected corpus already includes closed issues. Pass `--all` (or a terminal
+`--status` such as `closed`) to include closed issues.
 
 **Examples:**
 ```bash
@@ -1398,6 +1402,7 @@ br sync [OPTIONS]
 | `--status` | Show sync status (read-only) |
 | `--witness` | Compute a deterministic read-only JSONL integrity witness |
 | `--reconcile-additive` | Plan a lossless exact-ID JSONL-to-SQLite reconciliation (read-only by default) |
+| `--migrate-source-repo-path` | Reconcile DB/JSONL rows and plan canonical `source_repo_path` normalization (read-only by default) |
 
 **Options:**
 | Option | Description |
@@ -1410,10 +1415,11 @@ br sync [OPTIONS]
 | `--error-policy <POLICY>` | Export error handling: strict, best-effort, partial, required-core |
 | `--orphans <MODE>` | Orphan handling: strict, resurrect, skip, allow |
 | `--rename-prefix` | During import, rewrite mismatched issue-ID prefixes into the configured default prefix, preserving the id remainder |
+| `--skip-invalid-records` | With plain additive `--import-only`, explicitly salvage valid JSONL records while preserving and reporting every rejected source line |
 | `--rebuild` | During import, rebuild SQLite from JSONL and remove DB entries absent from JSONL |
 | `--dry-run` | With `--reconcile`, preview the plan without any mutation |
-| `--apply` | Apply a conflict-free `--reconcile-additive` plan transactionally |
-| `--expect-plan-sha256 <SHA256>` | Required with additive `--apply`; must equal the exact reviewed dry-run token |
+| `--apply` | Apply a reviewed `--reconcile-additive` or `--migrate-source-repo-path` plan |
+| `--expect-plan-sha256 <SHA256>` | Required with `--apply`; must equal the exact reviewed dry-run token |
 | `--resolve-source-id <ISSUE_ID>` | Explicitly choose the allowed non-lifecycle JSONL scalar fields for one reviewed shared-ID conflict when JSONL is not older; repeat per ID |
 | `--robot` | Machine-readable output |
 
@@ -1449,6 +1455,16 @@ br sync [OPTIONS]
 - The import output reports every rewrite as a `prefix_renames` list of `{old_id, new_id, fallback?}` entries (text and `--json`/`--robot`); use it to fix up external references. The field is omitted from JSON when no rename happened.
 - Without `--force`, the import short-circuits (skipping the rename) when the JSONL content hash is unchanged since the last import; and a following `br sync --flush-only` needs `--force` to write the renamed ids back to the JSONL.
 
+**Malformed-record salvage (`--skip-invalid-records`):**
+- This is an explicit recovery operation and is valid only with `--import-only`; normal import remains fail-closed on every invalid record.
+- Salvage is additive. It rejects `--force`, `--rebuild`, and `--rename-prefix` so a malformed source row cannot authorize deletion or ID rewriting.
+- Merge-conflict markers are never skipped. Resolve `<<<<<<<` / `=======` / `>>>>>>>` regions before salvage.
+- br validates each nonblank line as a complete issue record, rejects invalid or duplicate records, and refuses to publish an empty survivor set.
+- Before replacing the tracked JSONL, br stores the exact original bytes in a protected `.beads/.br_history/*pre-salvage*.jsonl` backup with target metadata. Automatic age/count rotation excludes protected backups; an explicit history-prune command can still remove them.
+- The cleaned generation is staged, revalidated, conditionally published under the JSONL-family write authority, and then imported from the exact published snapshot.
+- Valid database rows absent from the survivor generation are preserved. br records their count in `database_records_requiring_export`, sets `needs_flush`, and directs the operator to run `br sync --flush-only` to restore the canonical JSONL.
+- Text output names every rejected line up to the normal human witness limit. `--json`/`--robot` emits the complete `salvage` receipt, including source/recovered digests, all line/error entries, the exact backup path, publication atomicity, preserved-record count, and whether `needs_flush` was armed.
+
 **Additive reconciliation semantics:**
 - `br sync --reconcile-additive --robot` is the default dry-run. It opens the current database read-only, compares exact issue IDs, and emits a hash-bound `br.sync.additive-reconciliation.v2` receipt plus a `plan_sha256` review token.
 - The planner preserves SQLite-only issues, audit events, close metadata, gate-result history, runtime config, and every unmodified relation row. It never performs content-hash identity merges, physical deletes, JSONL writes, base-snapshot writes, or merge-note writes.
@@ -1459,6 +1475,12 @@ br sync [OPTIONS]
 - Stale or missing `issues.content_hash` values are explicit token-bound repairs. They never alter issue timestamps, relations, dirty tracking, or audit events, and a second plan must be a true no-op.
 - The receipt distinguishes distinct conflicted issues from total conflict observations; includes complete ID/diff/remap manifests and their SHA-256 digests; and reports pre-existing, projected, and newly introduced blocking-cycle components.
 
+**Portable source path migration (`--migrate-source-repo-path`):**
+- The default invocation emits a `br.sync.source-repo-path-migration.v1` dry-run receipt. It reconciles JSONL-only and newer shared rows without deleting SQLite-only rows, preserves tombstones, and fails closed on equal-timestamp semantic drift.
+- Every surviving `source_repo_path` is planned for the canonical current workspace directory. The portable `source_repo` display name is preserved rather than replaced by a machine-specific path.
+- Apply requires the exact `plan_sha256` and uses the durable DB/JSONL/base publication saga. If interrupted after the database transaction or JSONL publication, the next migration or merge invocation resumes the pending receipt before starting new work.
+- Migration does not probe Git. Its receipt reports `vcs_status: "not_probed"`; run `br vcs-status --json` separately when staged/worktree state must be reviewed.
+
 **Examples:**
 ```bash
 # Export to JSONL explicitly; useful as a final check before committing .beads/
@@ -1466,6 +1488,9 @@ br sync --flush-only
 
 # Import from JSONL
 br sync --import-only
+
+# Recover valid rows from a historical JSONL containing malformed records
+br sync --import-only --skip-invalid-records --json
 
 # Merge DB and JSONL after both changed
 br sync --merge
@@ -1499,6 +1524,12 @@ br sync --reconcile-additive \
   --apply \
   --expect-plan-sha256 "$(jq -r .plan_sha256 /tmp/additive-plan.json)" \
   --robot
+
+# Reconcile both stores and normalize machine-specific source paths
+path_plan="$(br sync --migrate-source-repo-path --robot)"
+path_plan_sha256="$(printf '%s\n' "$path_plan" | jq -r .plan_sha256)"
+br sync --migrate-source-repo-path \
+  --apply --expect-plan-sha256 "$path_plan_sha256" --robot
 
 # Check sync status
 br sync --status
@@ -2001,10 +2032,19 @@ br history <COMMAND>
 | Command | Description |
 |---------|-------------|
 | `list` | List backups |
+| `diff <BACKUP>` | Compare a backup with its target JSONL |
 | `restore <BACKUP>` | Restore from backup |
+| `prune [--keep N] [--older-than DAYS] [--max-bytes BYTES]` | Remove oldest complete backup+metadata pairs by per-target count/age and an optional global logical-byte budget |
 
 **Notes:**
 - Backups are created during `br sync --flush-only` when overwriting a JSONL file inside `.beads/`, including custom `BEADS_JSONL` paths that still target `.beads/`.
+- Ordinary automatic rotation applies a 1 GiB global logical-byte budget across
+  all target stems after the per-target count/age limits. Set
+  `BR_HISTORY_MAX_BYTES` to an integer byte count to override it. Protected
+  pre-salvage evidence is excluded from automatic rotation.
+- Byte-budget pruning removes the oldest complete snapshot+metadata pairs
+  deterministically. The globally newest pair is retained even when that one
+  snapshot alone exceeds the budget; every older eligible pair is removed.
 
 ---
 

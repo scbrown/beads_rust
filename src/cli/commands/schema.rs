@@ -19,7 +19,8 @@ use crate::cli::{
 use crate::coordination::{CoordinationClaimRow, CoordinationStatusOutput};
 use crate::error::Result;
 use crate::format::{
-    BlockedIssueOutput, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue, Statistics,
+    BlockedIssueOutput, BlockedPage, IssueDetails, IssueWithCounts, ReadyIssue, StaleIssue,
+    Statistics,
 };
 use crate::model::Issue;
 use crate::output::{OutputContext, OutputMode};
@@ -194,6 +195,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
             schemas.insert("ReadyIssue", schema_for_output::<ReadyIssue>());
             schemas.insert("StaleIssue", schema_for_output::<StaleIssue>());
             schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
+            schemas.insert("BlockedPage", schema_for_output::<BlockedPage>());
             schemas.insert("TreeNode", schema_for_output::<TreeNode>());
             schemas.insert("CountGroup", schema_for_output::<CountGroup>());
             schemas.insert("Statistics", schema_for_output::<Statistics>());
@@ -212,6 +214,10 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
             schemas.insert(
                 "AdditiveReconcileReceipt",
                 schema_for_output::<AdditiveReconcileReceipt>(),
+            );
+            schemas.insert(
+                "SourceRepoPathMigrationReceipt",
+                schema_for_output::<crate::cli::commands::sync::SourceRepoPathMigrationReceipt>(),
             );
             schemas.insert("VcsExportStatus", schema_for_output::<VcsExportStatus>());
             schemas.insert("ErrorEnvelope", schema_for_output::<ErrorEnvelope>());
@@ -233,6 +239,7 @@ fn build_schemas(target: SchemaTarget) -> BTreeMap<&'static str, Schema> {
         }
         SchemaTarget::BlockedIssue => {
             schemas.insert("BlockedIssue", schema_for_output::<BlockedIssueOutput>());
+            schemas.insert("BlockedPage", schema_for_output::<BlockedPage>());
         }
         SchemaTarget::TreeNode => {
             schemas.insert("TreeNode", schema_for_output::<TreeNode>());
@@ -311,6 +318,21 @@ fn build_commands(target: SchemaTarget) -> BTreeMap<&'static str, CommandShape> 
         },
     );
     commands.insert(
+        "sync --migrate-source-repo-path",
+        CommandShape {
+            shape: "object",
+            jq_filter: ".",
+            items_at: None,
+            item_schema: Some("SourceRepoPathMigrationReceipt"),
+            error_envelope_on_stderr: false,
+            notes: Some(
+                "Read-only plan by default. Apply requires the exact plan_sha256 from an \
+                 identically configured reviewed dry-run via --expect-plan-sha256. Uses the \
+                 crash-recoverable sync publication saga and never probes Git.",
+            ),
+        },
+    );
+    commands.insert(
         "vcs-status",
         CommandShape {
             shape: "object",
@@ -375,12 +397,14 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
     commands.insert(
         "blocked",
         CommandShape {
-            shape: "array",
-            jq_filter: ".[]",
-            items_at: Some("."),
+            shape: "object",
+            jq_filter: ".issues[]",
+            items_at: Some(".issues"),
             item_schema: Some("BlockedIssue"),
             error_envelope_on_stderr: false,
-            notes: None,
+            notes: Some(
+                "Wrapper object with `total`, `limit`, `offset`, and `has_more`; iterate with `.issues[]`.",
+            ),
         },
     );
     commands.insert(
@@ -406,7 +430,8 @@ fn insert_issue_command_shapes(commands: &mut BTreeMap<&'static str, CommandShap
                 "Stable wrapper object `{\"issues\": [...], \
                  \"hidden_closed_count\": N}`; iterate with `.issues[]`. The count \
                  is zero when no closed matches were hidden or the selected corpus \
-                 already includes closed issues.",
+                 already includes closed issues. Pagination metadata also reports \
+                 `limit`, `offset`, and `has_more`; `has_more` discloses truncation.",
             ),
         },
     );
@@ -758,6 +783,22 @@ mod tests {
         assert_eq!(
             stats.error_envelope_on_stderr,
             status.error_envelope_on_stderr
+        );
+    }
+
+    #[test]
+    fn source_repo_path_migration_schema_and_command_shape_are_discoverable() {
+        let schemas = build_schemas(SchemaTarget::All);
+        assert!(schemas.contains_key("SourceRepoPathMigrationReceipt"));
+
+        let commands = build_commands(SchemaTarget::Commands);
+        let migration = commands
+            .get("sync --migrate-source-repo-path")
+            .expect("migration command shape must exist");
+        assert_eq!(migration.shape, "object");
+        assert_eq!(
+            migration.item_schema,
+            Some("SourceRepoPathMigrationReceipt")
         );
     }
 

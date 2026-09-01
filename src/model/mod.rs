@@ -530,6 +530,22 @@ pub struct Issue {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_by_session: Option<String>,
 
+    /// Close-policy bypass audit trail (GitHub #474). Serialized into the
+    /// JSONL export only when the close bypassed policy so a bypassed close
+    /// is reviewable off-machine; absent means "not bypassed" (pre-change
+    /// exports stay valid). Backed by the DB-only `close_metadata` table;
+    /// excluded from `content_hash` and from `sync_equals`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypassed_policy: Option<bool>,
+
+    /// Operator-supplied reason for the policy bypass (GitHub #474).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bypass_reason: Option<String>,
+
+    /// Names of the close-policy gates the bypass overrode (GitHub #474).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_gates_fired: Option<Vec<String>>,
+
     /// Due date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<DateTime<Utc>>,
@@ -649,6 +665,9 @@ impl Default for Issue {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -729,6 +748,12 @@ impl Issue {
             || self.ephemeral != other.ephemeral
             || self.pinned != other.pinned
             || self.is_template != other.is_template
+            // Inherited governance context (beads_rust#297): a live,
+            // JSONL-serialized payload field, so an agent_context-only change
+            // must count as a difference. Omitting it here silently dropped a
+            // peer's context update during three-way merge / import de-dup
+            // (persisted_import_issue_equals had to re-add it as a workaround).
+            || self.agent_context != other.agent_context
         {
             return false;
         }
@@ -1014,6 +1039,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -1483,6 +1511,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             source_repo_path: None,
@@ -1678,6 +1709,30 @@ mod tests {
 
         assert!(!issue1.sync_equals(&issue2));
         assert!(!issue2.sync_equals(&issue1));
+    }
+
+    #[test]
+    fn test_issue_sync_equals_detects_agent_context_changes() {
+        // beads_rust#297: an agent_context-only change is a real payload
+        // difference; if sync_equals ignored it, three-way merge / import
+        // de-dup would silently drop a peer's inherited-context update.
+        let mut issue1 = create_test_issue();
+        issue1.agent_context = Some(r#"{"constraints":["no network"]}"#.to_string());
+
+        let mut issue2 = issue1.clone();
+        issue2.agent_context = Some(r#"{"constraints":["offline only"]}"#.to_string());
+        assert!(!issue1.sync_equals(&issue2));
+        assert!(!issue2.sync_equals(&issue1));
+
+        // Setting vs. clearing the field is also a difference.
+        let mut issue3 = issue1.clone();
+        issue3.agent_context = None;
+        assert!(!issue1.sync_equals(&issue3));
+        assert!(!issue3.sync_equals(&issue1));
+
+        // Identical agent_context still compares equal.
+        let issue4 = issue1.clone();
+        assert!(issue1.sync_equals(&issue4));
     }
 
     #[test]

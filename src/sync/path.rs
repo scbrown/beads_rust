@@ -54,6 +54,32 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tracing::{debug, warn};
 
+/// Derive the absolute canonical path of the source repository (the parent of
+/// `.beads/`) for the `source_repo_path` field on an issue.
+///
+/// This lives in the process-free sync boundary because both issue creation
+/// and source-path migration need the same path identity without delegating
+/// from sync code into a process-capable CLI command module.
+#[must_use]
+pub fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
+    let parent = beads_dir.parent()?;
+    let parent = if parent.as_os_str().is_empty()
+        && beads_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, ".beads" | "_beads"))
+    {
+        Path::new(".")
+    } else if parent.as_os_str().is_empty() {
+        return None;
+    } else {
+        parent
+    };
+    let canonical = parent.canonicalize().ok()?;
+    let path_str = canonical.to_string_lossy().into_owned();
+    (!path_str.is_empty()).then_some(path_str)
+}
+
 fn raw_os_str_sha256(value: &OsStr) -> String {
     let mut hasher = Sha256::new();
     #[cfg(unix)]
@@ -223,6 +249,29 @@ fn strip_verbatim_prefix_lexically(path: &Path) -> PathBuf {
     simplified
 }
 
+/// Whether `candidate` is `ancestor` or lies inside it, ignoring the Windows
+/// extended-length (`\\?\`) spelling on either side.
+///
+/// `dunce::canonicalize` only drops the verbatim prefix when the result is
+/// representable as a legacy path, so once a `.beads/` path nears `MAX_PATH`
+/// the directory can canonicalize to `C:\…` while a longer file inside it
+/// canonicalizes to `\\?\C:\…`; a byte-wise prefix check then rejects a
+/// legitimate member as outside the directory (GitHub #462). The comparison
+/// stays lexical: nothing here touches the filesystem.
+#[cfg(windows)]
+pub(crate) fn path_within(candidate: &Path, ancestor: &Path) -> bool {
+    candidate.starts_with(ancestor)
+        || strip_verbatim_prefix_lexically(candidate)
+            .starts_with(strip_verbatim_prefix_lexically(ancestor))
+}
+
+/// Off Windows there is no verbatim spelling, so this is `Path::starts_with`.
+#[cfg(not(windows))]
+#[inline]
+pub(crate) fn path_within(candidate: &Path, ancestor: &Path) -> bool {
+    candidate.starts_with(ancestor)
+}
+
 /// One shared spelling for authority-path comparisons (#413).
 ///
 /// Windows mixes lexically absolute pinned routes
@@ -294,9 +343,19 @@ pub(crate) fn authority_path_within(candidate: &Path, ancestor: &Path) -> bool {
 
 fn symlink_escape_for_existing_ancestor(
     path: &Path,
+    beads_dir: &Path,
     canonical_beads: &Path,
 ) -> Option<PathValidation> {
     for ancestor in path.ancestors() {
+        // Only a symlink at or below the beads directory can carry a member
+        // *out* of it. A symlinked ancestor above the workspace (macOS `/var`
+        // -> `/private/var`, `/tmp` -> `/private/tmp`, a symlinked home) is
+        // ordinary filesystem layout: the canonical prefix checks that follow
+        // decide those paths, keeping their traversal/outside classification
+        // (beads_rust-rr1s).
+        if !(path_within(ancestor, beads_dir) || path_within(ancestor, canonical_beads)) {
+            continue;
+        }
         let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
             continue;
         };
@@ -308,7 +367,15 @@ fn symlink_escape_for_existing_ancestor(
         let target = std::fs::read_link(ancestor)
             .map(|target| resolve_symlink_target_for_validation(ancestor, &target))
             .unwrap_or_else(|_| ancestor.to_path_buf());
-        if !target.starts_with(canonical_beads) {
+        // Judge where the *candidate* lands once this ancestor is followed,
+        // not where the ancestor alone points, so an internal symlink whose
+        // target is itself inside the beads directory is not misreported.
+        let remainder = path
+            .strip_prefix(ancestor)
+            .unwrap_or_else(|_| Path::new(""));
+        let rerooted = target.join(remainder);
+        let rerooted = normalize_path_lexically(&rerooted).unwrap_or(rerooted);
+        if !path_within(&rerooted, canonical_beads) {
             return Some(PathValidation::SymlinkEscape {
                 path: ancestor.to_path_buf(),
                 target,
@@ -459,7 +526,9 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         }
     };
 
-    if let Some(result) = symlink_escape_for_existing_ancestor(&normalized_path, &canonical_beads) {
+    if let Some(result) =
+        symlink_escape_for_existing_ancestor(&normalized_path, beads_dir, &canonical_beads)
+    {
         warn!(
             path = %path.display(),
             reason = %result.rejection_reason().unwrap_or_default(),
@@ -469,8 +538,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
     }
 
     if had_parent_dir
-        && !normalized_path.starts_with(beads_dir)
-        && !normalized_path.starts_with(&canonical_beads)
+        && !path_within(&normalized_path, beads_dir)
+        && !path_within(&normalized_path, &canonical_beads)
     {
         let result = PathValidation::TraversalAttempt {
             path: path.to_path_buf(),
@@ -511,8 +580,8 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
             // For non-existent files, we can't canonicalize, so check prefix
             if !normalized_path.exists() {
                 // Check if the path starts with the beads directory
-                if normalized_path.starts_with(beads_dir)
-                    || normalized_path.starts_with(&canonical_beads)
+                if path_within(&normalized_path, beads_dir)
+                    || path_within(&normalized_path, &canonical_beads)
                 {
                     return validate_extension_and_name(&normalized_path);
                 }
@@ -535,7 +604,7 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         && let Ok(target) = std::fs::read_link(&normalized_path)
     {
         let canonical_target = resolve_symlink_target_for_validation(&normalized_path, &target);
-        if !canonical_target.starts_with(&canonical_beads) {
+        if !path_within(&canonical_target, &canonical_beads) {
             let result = PathValidation::SymlinkEscape {
                 path: path.to_path_buf(),
                 target: canonical_target,
@@ -586,7 +655,7 @@ pub fn validate_sync_path(path: &Path, beads_dir: &Path) -> PathValidation {
         canonical_path.join(normalized_path.file_name().unwrap_or_default())
     };
 
-    if !effective_canonical.starts_with(&canonical_beads) {
+    if !path_within(&effective_canonical, &canonical_beads) {
         let result = PathValidation::OutsideBeadsDir {
             path: path.to_path_buf(),
             beads_dir: canonical_beads,
@@ -753,12 +822,12 @@ pub fn validate_sync_path_with_external(
     // plain `.beads` still classifies internal instead of being refused as
     // external (#413). Like the lexical widening above, this only routes into
     // the *stricter* internal branch, which re-validates the path itself.
-    let is_internal = path.starts_with(beads_dir)
-        || path.starts_with(&canonical_beads)
-        || resolved_path.starts_with(beads_dir)
-        || resolved_path.starts_with(&canonical_beads)
+    let is_internal = path_within(path, beads_dir)
+        || path_within(path, &canonical_beads)
+        || path_within(&resolved_path, beads_dir)
+        || path_within(&resolved_path, &canonical_beads)
         || normalized_resolved.as_deref().is_some_and(|normalized| {
-            normalized.starts_with(beads_dir) || normalized.starts_with(&canonical_beads)
+            path_within(normalized, beads_dir) || path_within(normalized, &canonical_beads)
         })
         || authority_path_within(&resolved_path, beads_dir);
 
@@ -872,10 +941,10 @@ pub fn require_safe_sync_overwrite_path(
     // As in `validate_sync_path_with_external`, the shared-spelling disjunct
     // keeps Windows verbatim/8.3 descendants of a plain `.beads` in the
     // stricter internal branch instead of refusing them as external (#413).
-    let is_internal = resolved_path.starts_with(beads_dir)
-        || resolved_path.starts_with(&canonical_beads)
-        || path.starts_with(beads_dir)
-        || path.starts_with(&canonical_beads)
+    let is_internal = path_within(&resolved_path, beads_dir)
+        || path_within(&resolved_path, &canonical_beads)
+        || path_within(path, beads_dir)
+        || path_within(path, &canonical_beads)
         || authority_path_within(&resolved_path, beads_dir);
 
     if is_internal {
@@ -957,14 +1026,14 @@ pub fn validate_temp_file_path(
     let canonical_beads =
         dunce::canonicalize(beads_dir).unwrap_or_else(|_| beads_dir.to_path_buf());
     let temp_is_external =
-        !temp_path.starts_with(beads_dir) && !temp_path.starts_with(&canonical_beads);
+        !path_within(temp_path, beads_dir) && !path_within(temp_path, &canonical_beads);
     let safe_temp = if temp_is_external {
         external_path_descriptor(temp_path)
     } else {
         temp_path.display().to_string()
     };
     let target_is_external =
-        !target_path.starts_with(beads_dir) && !target_path.starts_with(&canonical_beads);
+        !path_within(target_path, beads_dir) && !path_within(target_path, &canonical_beads);
     let safe_target = if target_is_external {
         external_path_descriptor(target_path)
     } else {
@@ -2815,8 +2884,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// A temp directory under the *canonical* system temp root.
+    ///
+    /// br hands sync canonical workspace paths, so the pinned no-follow
+    /// JSONL traversal never meets a symlinked ancestor; on macOS the raw
+    /// `TMPDIR` lives under `/var` -> `/private/var`, which would make these
+    /// tests stricter than br itself.
+    fn canonical_temp_dir() -> TempDir {
+        let root = dunce::canonicalize(std::env::temp_dir()).expect("canonicalize temp root");
+        TempDir::new_in(root).expect("create temp dir")
+    }
+
     fn setup_test_beads_dir() -> (TempDir, PathBuf) {
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
         (temp, beads_dir)
@@ -2952,6 +3032,54 @@ mod tests {
             strip_verbatim_prefix_lexically(Path::new(r"\\.\PIPE\name")),
             Path::new(r"\\.\PIPE\name")
         );
+    }
+
+    /// #462: a verbatim (`\\?\`) member of a plain directory — the shape
+    /// `dunce::canonicalize` produces once a long `.beads/` path crosses
+    /// `MAX_PATH` — is still inside that directory, in either spelling
+    /// combination, while genuinely external routes stay outside.
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_within_ignores_verbatim_prefix_on_either_side() {
+        let plain_dir = Path::new(r"C:\repo\.beads");
+        let verbatim_dir = Path::new(r"\\?\C:\repo\.beads");
+        let plain_member = Path::new(r"C:\repo\.beads\issues.jsonl");
+        let verbatim_member = Path::new(r"\\?\C:\repo\.beads\issues.jsonl");
+
+        assert!(path_within(verbatim_member, plain_dir));
+        assert!(path_within(plain_member, verbatim_dir));
+        assert!(path_within(verbatim_member, verbatim_dir));
+        assert!(path_within(plain_member, plain_dir));
+        assert!(path_within(plain_dir, plain_dir));
+
+        assert!(!path_within(
+            Path::new(r"\\?\C:\repo\.beads2\x.jsonl"),
+            plain_dir
+        ));
+        assert!(!path_within(
+            Path::new(r"C:\elsewhere\issues.jsonl"),
+            verbatim_dir
+        ));
+        assert!(!path_within(
+            Path::new(r"\\?\UNC\server\share\issues.jsonl"),
+            plain_dir
+        ));
+    }
+
+    /// Off Windows there is no verbatim spelling, so `path_within` is exactly
+    /// `Path::starts_with`.
+    #[cfg(not(windows))]
+    #[test]
+    fn path_within_matches_starts_with_off_windows() {
+        let (_temp, beads_dir) = setup_test_beads_dir();
+        let member = beads_dir.join("issues.jsonl");
+        assert!(path_within(&member, &beads_dir));
+        assert!(path_within(&beads_dir, &beads_dir));
+        assert!(!path_within(&beads_dir, &member));
+        assert!(!path_within(
+            Path::new("/definitely/elsewhere.jsonl"),
+            &beads_dir
+        ));
     }
 
     #[cfg(any(unix, windows))]
@@ -3266,7 +3394,7 @@ mod tests {
     fn test_symlink_escape_rejected() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
 
@@ -3304,12 +3432,54 @@ mod tests {
         );
     }
 
+    /// beads_rust-rr1s: a symlinked ancestor *above* the workspace (macOS
+    /// `/var` -> `/private/var`, `/tmp` -> `/private/tmp`) re-roots the
+    /// candidate inside the canonical beads directory and must be allowed,
+    /// while a symlinked ancestor that carries the candidate elsewhere stays
+    /// rejected.
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinked_ancestor_above_workspace_is_not_an_escape() {
+        use std::os::unix::fs::symlink;
+
+        let temp = canonical_temp_dir();
+        let real_root = temp.path().join("real");
+        let real_beads = real_root.join(".beads");
+        std::fs::create_dir_all(&real_beads).expect("create real beads dir");
+        std::fs::write(real_beads.join("issues.jsonl"), "{}\n").expect("write jsonl");
+        let link_root = temp.path().join("link");
+        symlink(&real_root, &link_root).expect("symlink workspace root");
+
+        let linked_beads = link_root.join(".beads");
+        let result = validate_sync_path(&linked_beads.join("issues.jsonl"), &linked_beads);
+        assert!(
+            result.is_allowed(),
+            "a workspace reached through a symlinked ancestor must validate: {result:?}"
+        );
+        let new_file = validate_sync_path(&linked_beads.join("fresh.jsonl"), &linked_beads);
+        assert!(
+            new_file.is_allowed(),
+            "a not-yet-created file under the symlinked workspace must validate: {new_file:?}"
+        );
+
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".beads")).expect("create elsewhere");
+        let stray_link = temp.path().join("stray");
+        symlink(&elsewhere, &stray_link).expect("symlink elsewhere");
+        let stray =
+            validate_sync_path(&stray_link.join(".beads").join("issues.jsonl"), &real_beads);
+        assert!(
+            !stray.is_allowed(),
+            "a symlinked ancestor leading outside the beads dir must still be rejected: {stray:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_validate_no_git_path_rejects_symlinked_git_parent() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let git_dir = temp.path().join(".git");
         std::fs::create_dir_all(&git_dir).expect("create .git dir");
 
@@ -3329,7 +3499,7 @@ mod tests {
     fn test_validate_no_git_path_rejects_missing_descendant_under_symlinked_git_parent() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let git_dir = temp.path().join(".git");
         std::fs::create_dir_all(&git_dir).expect("create .git dir");
 
@@ -3350,7 +3520,7 @@ mod tests {
     {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         let git_dir = temp.path().join(".git");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
@@ -3380,7 +3550,7 @@ mod tests {
     fn test_validate_sync_path_with_external_rejects_symlinked_jsonl() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp dir");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir_all(&beads_dir).expect("create beads dir");
 
@@ -3831,7 +4001,7 @@ mod tests {
     fn pin_jsonl_target_rejects_symlinked_and_non_directory_parents() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let outside = temp.path().join("outside");
         let linked_parent = temp.path().join("linked-parent");
         let non_directory_parent = temp.path().join("not-a-directory");
@@ -3863,7 +4033,7 @@ mod tests {
     fn pin_jsonl_target_rejects_symlinked_and_nonregular_leaves() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let parent = temp.path().join("parent");
         let outside = temp.path().join("outside.jsonl");
         let symlink_leaf = parent.join("linked.jsonl");
@@ -3899,7 +4069,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let parent = temp.path().join("parent");
         std::fs::create_dir(&parent).expect("create parent directory");
         let pinned =
@@ -3930,7 +4100,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pinned_jsonl_parent_detects_route_replacement() {
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let routed_parent = temp.path().join("live");
         let displaced_parent = temp.path().join("displaced");
         std::fs::create_dir(&routed_parent).expect("create routed parent");
@@ -3955,7 +4125,7 @@ mod tests {
     fn pinned_jsonl_parent_reports_disappeared_or_symlinked_route_as_conflict() {
         use std::os::unix::fs::symlink;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let routed_parent = temp.path().join("live");
         let displaced_parent = temp.path().join("displaced");
         std::fs::create_dir(&routed_parent).expect("create routed parent");
@@ -4008,7 +4178,7 @@ mod tests {
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let routed_parent = temp.path().join("live");
         let displaced_parent = temp.path().join("displaced");
         let target_path = routed_parent.join("issues.jsonl");
@@ -4084,7 +4254,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let parent = temp.path().join("parent");
         std::fs::create_dir(&parent).expect("create parent directory");
         let pinned =
@@ -4559,7 +4729,7 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::unix::fs::MetadataExt;
 
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let beads_dir = temp.path().join(".beads");
         std::fs::create_dir(&beads_dir).expect("create .beads");
 
@@ -4592,7 +4762,7 @@ mod tests {
 
     #[test]
     fn private_snapshot_backing_falls_back_to_the_temp_directory() {
-        let temp = TempDir::new().expect("create temp directory");
+        let temp = canonical_temp_dir();
         let missing_parent = temp.path().join("does-not-exist");
 
         open_private_snapshot_backing(Some(&missing_parent))

@@ -2,8 +2,8 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
-use crate::franken_sync::Connection;
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
+use crate::franken_sync::{Connection, Row};
 use crate::model::{
     Comment, Dependency, DependencyType, Event, EventType, Issue, IssueType, Priority, Status,
 };
@@ -49,13 +49,10 @@ thread_local! {
 const WAL_CHECKPOINT_INTERVAL: u32 = 50;
 /// Per-statement busy spin timeout before SQLite returns SQLITE_BUSY.
 ///
-/// Set to 0 (#243): frankensqlite's busy_timeout implementation uses a
-/// hot spin loop (not sleep-based) that consumes 100% CPU and prevents
-/// the competing writer from making progress. With busy_timeout=0,
-/// `BEGIN IMMEDIATE` returns SQLITE_BUSY immediately when the write lock
-/// is held, allowing the application-level retry loop (8 attempts with
-/// jittered exponential backoff via thread::sleep) to provide proper
-/// desynchronization. This is critical for multi-agent concurrent access.
+/// Kept at 0 so `BEGIN IMMEDIATE` returns `SQLITE_BUSY` immediately and the
+/// application-level retry loop (8 attempts with jittered exponential
+/// backoff) remains the single bounded retry policy. Cross-process mutations
+/// are serialized by the workspace `.write.lock` before reaching SQLite.
 const DEFAULT_BUSY_TIMEOUT_MS: u64 = 0;
 const SQLITE_VAR_LIMIT: usize = 900;
 const REDUNDANT_LABEL_COVERAGE_MIN_CANDIDATES: usize = 8_192;
@@ -1356,6 +1353,41 @@ pub(crate) fn classify_pending_sync_merge_rows(
     PendingSyncMergeInspection::Valid(Box::new(receipt))
 }
 
+/// DB-only auxiliary/history tables that a JSONL rebuild would otherwise
+/// discard (GitHub #471). These never travel through the JSONL export, so a
+/// `br doctor --repair` rebuild must carry them across explicitly.
+pub(crate) const AUXILIARY_HISTORY_TABLES: &[&str] = &[
+    "events",
+    "gate_results",
+    "gate_result_history",
+    "close_metadata",
+    "capacity_occupancy",
+    "capacity_exemptions",
+    "capacity_exemption_history",
+];
+
+/// Raw rows captured from one auxiliary/history table before a rebuild.
+#[derive(Debug, Clone)]
+pub(crate) struct PreservedTableRows {
+    pub(crate) table: String,
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<Vec<SqliteValue>>,
+}
+
+/// Snapshot of every auxiliary/history table plus per-table capture failures
+/// (a corrupt source page must not abort preservation of the other tables).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AuxiliaryHistorySnapshot {
+    pub(crate) tables: Vec<PreservedTableRows>,
+    pub(crate) failures: Vec<String>,
+}
+
+impl AuxiliaryHistorySnapshot {
+    pub(crate) fn row_count(&self) -> usize {
+        self.tables.iter().map(|table| table.rows.len()).sum()
+    }
+}
+
 /// SQLite-based storage backend.
 #[derive(Debug)]
 pub struct SqliteStorage {
@@ -1367,6 +1399,11 @@ pub struct SqliteStorage {
     write_authority: Option<Arc<crate::sync::DatabaseFamilyWriteLock>>,
     /// Track mutations to trigger periodic WAL checkpoints.
     mutation_count: u32,
+    /// Shared registration as an opener of the persistent database. Held for
+    /// the lifetime of this handle so any br process can tell whether it is
+    /// the sole opener before running a WAL checkpoint (see
+    /// [`crate::sync::DatabaseOpenerLease`]). `None` for ephemeral databases.
+    opener_lease: Option<crate::sync::DatabaseOpenerLease>,
     /// When set, this storage owns an ephemeral on-disk temp database (created
     /// by [`SqliteStorage::open_memory`]) that must be unlinked — together with
     /// its WAL/SHM/journal sidecars — when the connection is dropped. FrankenSQLite
@@ -1401,6 +1438,16 @@ pub struct SqliteStorage {
     /// command layer immediately after success, so warnings cannot leak into
     /// an unrelated command.
     last_capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+}
+
+/// Outcome of [`SqliteStorage::admit_checkpoint`].
+enum CheckpointAdmission {
+    /// This process is the only opener; the exclusive opener hold (if the
+    /// database is persistent) must be returned through
+    /// [`SqliteStorage::release_checkpoint_admission`].
+    Sole(Option<std::fs::File>),
+    /// Another process has the database open; no checkpoint may run.
+    PeersPresent,
 }
 
 /// Context for a mutation operation, tracking side effects.
@@ -1636,7 +1683,7 @@ impl ReadyIssueProjection {
         }
     }
 
-    fn parse_row(self, row: &fsqlite::Row) -> Result<Issue> {
+    fn parse_row(self, row: &Row) -> Result<Issue> {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::ready_issue_from_row(row),
@@ -1668,7 +1715,7 @@ impl SearchIssueProjection {
         }
     }
 
-    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+    fn parse_issue(self, row: &Row) -> Result<Issue> {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::CommandText => SqliteStorage::search_command_issue_from_row(row),
@@ -1725,7 +1772,7 @@ impl BlockedIssueProjection {
         }
     }
 
-    fn parse_issue(self, row: &fsqlite::Row) -> Result<Issue> {
+    fn parse_issue(self, row: &Row) -> Result<Issue> {
         match self {
             Self::Full => SqliteStorage::issue_from_row(row),
             Self::Command => SqliteStorage::blocked_command_issue_from_row(row),
@@ -2359,12 +2406,14 @@ impl SqliteStorage {
         // Authority-aware startup/recovery callers use
         // `open_with_timeout_under_write_authority` below.
         preflight_effective_schema_before_writable_open(path)?;
+        // Register as an opener before the engine open so this process never
+        // starts reading a WAL that a peer's exclusive checkpoint is resetting.
+        let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
         let conn = Connection::open(path.to_string_lossy().into_owned())?;
 
-        // Set busy_timeout. Default is 0 (#243) — frankensqlite's busy
-        // handler hot-spins, so we rely on application-level retry (see
-        // `with_write_transaction`). The `.write.lock` flock serializes
-        // concurrent mutating processes before they reach this point.
+        // Keep SQLite's busy handler aligned with the caller's requested
+        // bound. The `.write.lock` serializes normal mutating processes, while
+        // `with_write_transaction` provides the bounded database-level retry.
         if let Some(timeout_ms) = lock_timeout_ms {
             conn.execute(&format!("PRAGMA busy_timeout={timeout_ms}"))?;
         }
@@ -2425,6 +2474,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -2468,6 +2518,7 @@ impl SqliteStorage {
         if namespace_sidecar_mode_repair_required(path)? {
             return Ok(None);
         }
+        let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2487,6 +2538,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -2541,6 +2593,7 @@ impl SqliteStorage {
                 message: "Token-bound reconciliation requires authority-gated fsqlite namespace sidecar repair before opening the database".to_string(),
             });
         }
+        let opener_lease = Some(crate::sync::DatabaseOpenerLease::register(path)?);
         let conn = open_with_flags(
             path.to_string_lossy().as_ref(),
             OpenFlags::SQLITE_OPEN_READ_WRITE,
@@ -2560,6 +2613,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -2630,6 +2684,7 @@ impl SqliteStorage {
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
             pending_event_attribution: None,
+            opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),
@@ -2818,6 +2873,164 @@ impl SqliteStorage {
     pub(crate) fn execute_raw_query(&self, sql: &str) -> Result<Vec<Vec<SqliteValue>>> {
         let rows = self.conn.query(sql)?;
         Ok(rows.iter().map(|r| r.values().to_vec()).collect())
+    }
+
+    /// Snapshot every DB-only auxiliary/history table so a JSONL rebuild can
+    /// carry them across (GitHub #471). The JSONL export holds issue state
+    /// only; without this, `br doctor --repair` silently empties the entire
+    /// provenance layer (events, gate results, close/bypass audit, capacity
+    /// records) while reporting success.
+    ///
+    /// Fault-tolerant by design: the source DB is typically corrupt when this
+    /// runs, so each table is captured independently and a failed read is
+    /// reported in the returned `failures` list instead of aborting — a
+    /// partially preserved history beats none.
+    pub(crate) fn snapshot_auxiliary_history_tables(&self) -> AuxiliaryHistorySnapshot {
+        let mut snapshot = AuxiliaryHistorySnapshot::default();
+        for &table in AUXILIARY_HISTORY_TABLES {
+            if !crate::storage::schema::table_exists(&self.conn, table) {
+                continue;
+            }
+            let capture = (|| -> Result<PreservedTableRows> {
+                let mut columns = Vec::new();
+                for row in self.conn.query(&format!("PRAGMA table_info({table})"))? {
+                    if let Some(name) = row.get(1).and_then(SqliteValue::as_text) {
+                        columns.push(name.to_string());
+                    }
+                }
+                if columns.is_empty() {
+                    return Err(BeadsError::Config(format!(
+                        "PRAGMA table_info({table}) returned no columns"
+                    )));
+                }
+                let order_by = if columns.iter().any(|c| c == "id") {
+                    " ORDER BY id ASC"
+                } else {
+                    ""
+                };
+                let rows = self
+                    .conn
+                    .query(&format!(
+                        "SELECT {} FROM {table}{order_by}",
+                        columns.join(", ")
+                    ))?
+                    .iter()
+                    .map(|row| row.values().to_vec())
+                    .collect();
+                Ok(PreservedTableRows {
+                    table: table.to_string(),
+                    columns,
+                    rows,
+                })
+            })();
+            match capture {
+                Ok(preserved) => {
+                    if !preserved.rows.is_empty() {
+                        snapshot.tables.push(preserved);
+                    }
+                }
+                Err(err) => snapshot
+                    .failures
+                    .push(format!("{table}: could not snapshot rows ({err})")),
+            }
+        }
+        snapshot
+    }
+
+    /// Restore auxiliary/history rows captured by
+    /// [`Self::snapshot_auxiliary_history_tables`] into a freshly rebuilt
+    /// database (GitHub #471). Returns per-table `(restored, skipped)` counts.
+    ///
+    /// * Columns are intersected with the rebuilt schema so a snapshot taken
+    ///   from an older schema still restores its shared columns.
+    /// * Rows whose `issue_id` no longer exists after the rebuild are skipped
+    ///   (the rebuild is authoritative for issue membership and the tables all
+    ///   have `ON DELETE CASCADE` foreign keys to `issues`).
+    /// * For append-only tables with an autoincrement `id`, the original ids
+    ///   are kept when the rebuilt table is empty; if the rebuild already
+    ///   wrote rows (e.g. import events), the snapshot ids are dropped and the
+    ///   rows appended in original order so nothing collides or is lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a restore write fails.
+    pub(crate) fn restore_auxiliary_history_tables(
+        &self,
+        snapshot: &AuxiliaryHistorySnapshot,
+    ) -> Result<Vec<(String, usize, usize)>> {
+        let mut report = Vec::new();
+        if snapshot.tables.is_empty() {
+            return Ok(report);
+        }
+        let live_issue_ids: std::collections::HashSet<String> = self
+            .conn
+            .query("SELECT id FROM issues")?
+            .iter()
+            .filter_map(|row| row.get(0).and_then(SqliteValue::as_text).map(String::from))
+            .collect();
+        self.with_connection_write_transaction(|conn| {
+            for preserved in &snapshot.tables {
+                let table = preserved.table.as_str();
+                if !crate::storage::schema::table_exists(conn, table) {
+                    continue;
+                }
+                let mut target_columns = std::collections::HashSet::new();
+                for row in conn.query(&format!("PRAGMA table_info({table})"))? {
+                    if let Some(name) = row.get(1).and_then(SqliteValue::as_text) {
+                        target_columns.insert(name.to_string());
+                    }
+                }
+                let target_row_count = conn
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"))?
+                    .get(0)
+                    .and_then(SqliteValue::as_integer)
+                    .unwrap_or(0);
+                let drop_id = preserved.columns.iter().any(|c| c == "id") && target_row_count > 0;
+                let keep: Vec<usize> = preserved
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| {
+                        target_columns.contains(*name) && !(drop_id && *name == "id")
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                if keep.is_empty() {
+                    continue;
+                }
+                let issue_id_index = preserved.columns.iter().position(|c| c == "issue_id");
+                let column_list = keep
+                    .iter()
+                    .map(|&i| preserved.columns[i].as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let placeholders = vec!["?"; keep.len()].join(", ");
+                let insert = format!(
+                    "INSERT OR IGNORE INTO {table} ({column_list}) VALUES ({placeholders})"
+                );
+                let mut restored = 0usize;
+                let mut skipped = 0usize;
+                for row in &preserved.rows {
+                    if let Some(index) = issue_id_index {
+                        let owner = row.get(index).and_then(|v| v.as_text());
+                        if !owner.is_some_and(|id| live_issue_ids.contains(id)) {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                    let params: Vec<SqliteValue> =
+                        keep.iter().filter_map(|&i| row.get(i).cloned()).collect();
+                    if params.len() != keep.len() {
+                        skipped += 1;
+                        continue;
+                    }
+                    restored += conn.execute_with_params(&insert, &params)?;
+                }
+                report.push((preserved.table.clone(), restored, skipped));
+            }
+            Ok(())
+        })?;
+        Ok(report)
     }
 
     /// Check whether a foreign-key-backed table contains rows whose reference
@@ -3446,7 +3659,7 @@ impl SqliteStorage {
     /// Attempt a WAL checkpoint (PASSIVE mode) to flush WAL back to the main
     /// database file. Errors are logged but do not propagate — checkpoint
     /// failure is non-fatal and will be retried on the next interval.
-    fn try_wal_checkpoint(&self) {
+    fn try_wal_checkpoint(&mut self) {
         // Issue #219: TRUNCATE mode requires an exclusive lock, which blocks
         // all concurrent readers and writers.  Under parallel agent operations
         // this was a major source of "database is busy" errors.  PASSIVE mode
@@ -3454,6 +3667,20 @@ impl SqliteStorage {
         // so it never blocks other connections.  The WAL file may grow slightly
         // larger between checkpoints, but journal_size_limit (set in
         // apply_runtime_pragmas) caps it.
+        let hold = match self.admit_checkpoint() {
+            CheckpointAdmission::Sole(hold) => hold,
+            CheckpointAdmission::PeersPresent => {
+                tracing::debug!(
+                    "Skipping periodic WAL checkpoint: another process has the database open"
+                );
+                return;
+            }
+        };
+        self.passive_checkpoint_as_sole_opener();
+        self.release_checkpoint_admission(hold);
+    }
+
+    fn passive_checkpoint_as_sole_opener(&self) {
         if let Err(e) = self.verify_attached_database_authority() {
             tracing::warn!(error = %e, "Skipping WAL checkpoint after database authority changed");
             return;
@@ -3462,6 +3689,34 @@ impl SqliteStorage {
             tracing::debug!(error = %e, "WAL checkpoint failed (non-fatal, will retry later)");
         } else if let Err(e) = self.verify_attached_database_authority() {
             tracing::warn!(error = %e, "Database authority changed during WAL checkpoint");
+        }
+    }
+
+    /// Prove this process is the only opener of the persistent database
+    /// before a WAL checkpoint.
+    ///
+    /// FrankenSQLite's multi-process checkpoint does not yet register against
+    /// peer processes' read snapshots (FrankenSQLite #399/#385), so a
+    /// checkpoint run while another `br` has the database open is the
+    /// interleaving behind the page-aliasing corruption in GitHub
+    /// #457/#460/#461. Ephemeral databases have no peers and are always
+    /// admitted.
+    fn admit_checkpoint(&mut self) -> CheckpointAdmission {
+        match self.opener_lease.as_mut() {
+            None => CheckpointAdmission::Sole(None),
+            Some(lease) => lease
+                .try_exclusive()
+                .map_or(CheckpointAdmission::PeersPresent, |hold| {
+                    CheckpointAdmission::Sole(Some(hold))
+                }),
+        }
+    }
+
+    /// Hand back the exclusive opener hold taken by [`Self::admit_checkpoint`]
+    /// and rejoin the shared opener registration.
+    fn release_checkpoint_admission(&mut self, hold: Option<std::fs::File>) {
+        if let (Some(lease), Some(hold)) = (self.opener_lease.as_mut(), hold) {
+            lease.release_exclusive(hold);
         }
     }
 
@@ -3478,9 +3733,27 @@ impl SqliteStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error only if even a PASSIVE checkpoint fails. TRUNCATE
-    /// failure is downgraded to a warning because it is best-effort.
-    pub(crate) fn checkpoint_full(&self) -> Result<()> {
+    /// Returns an error when another process has the database open (no
+    /// checkpoint is attempted at all; see [`Self::admit_checkpoint`]) or if
+    /// even a PASSIVE checkpoint fails. TRUNCATE failure is downgraded to a
+    /// warning because it is best-effort.
+    pub(crate) fn checkpoint_full(&mut self) -> Result<()> {
+        let hold = match self.admit_checkpoint() {
+            CheckpointAdmission::Sole(hold) => hold,
+            CheckpointAdmission::PeersPresent => {
+                return Err(BeadsError::Config(
+                    "WAL checkpoint skipped: another br process has the database open \
+                     (FrankenSQLite checkpoints are only safe for a sole opener)"
+                        .to_string(),
+                ));
+            }
+        };
+        let result = self.checkpoint_full_as_sole_opener();
+        self.release_checkpoint_admission(hold);
+        result
+    }
+
+    fn checkpoint_full_as_sole_opener(&self) -> Result<()> {
         self.verify_attached_database_authority()?;
         if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
             tracing::debug!(
@@ -3840,6 +4113,28 @@ impl SqliteStorage {
                 BeadsError::Config(format!("gate-result history row {id} missing after insert"))
             })?;
             recorded = Some(gate_result_record_from_row(row)?);
+            // GitHub #466: mirror the verdict into the current-state
+            // `gate_results` table. One row per (issue, gate, provider) with
+            // the provider's most-recent verdict; a re-report overwrites the
+            // prior row exactly as the schema comment promises. Transition
+            // enforcement never reads this table (it consults the scoped
+            // history above); the mirror keeps the documented current-state
+            // view populated for external queries. Runs after the
+            // last_insert_rowid() capture so it cannot disturb the history
+            // row lookup.
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO gate_results (
+                    issue_id, gate, provider, passed, note, recorded_by, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                &[
+                    SqliteValue::from(issue_id),
+                    SqliteValue::from(gate),
+                    SqliteValue::from(provider),
+                    SqliteValue::from(i64::from(passed)),
+                    note.map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(recorded_by),
+                ],
+            )?;
             Ok(())
         })?;
         recorded.ok_or_else(|| {
@@ -4222,7 +4517,7 @@ impl SqliteStorage {
     }
 
     fn capacity_exemption_record_from_row(
-        row: &fsqlite::Row,
+        row: &Row,
         now: chrono::DateTime<Utc>,
     ) -> Option<crate::close_policy::CapacityExemptionRecord> {
         let text = |index: usize| {
@@ -6226,8 +6521,27 @@ impl SqliteStorage {
                 }
             }
 
-            let blocked_cache_plan = BlockedCacheRefreshPlan::from_context(&ctx);
+            let mut blocked_cache_plan = BlockedCacheRefreshPlan::from_context(&ctx);
             if blocked_cache_plan.is_some() {
+                // An Incremental refresh only rewrites its own connected
+                // component and then declares the WHOLE cache fresh, which is
+                // sound only if the cache was already consistent. If a prior
+                // Deferred write left the cache stale (its edge is committed
+                // but not yet in blocked_issues_cache), an Incremental refresh
+                // would clear the stale marker while that earlier change is
+                // still missing — reporting a blocked issue as ready. Upgrade
+                // to a Full rebuild in that case (Full is always correct), so
+                // "the next non-deferred write rebuilds the cache" holds.
+                if matches!(
+                    blocked_cache_plan,
+                    Some(BlockedCacheRefreshPlan::Incremental(_))
+                ) && Self::metadata_equals(
+                    &storage.conn,
+                    BLOCKED_CACHE_STATE_KEY,
+                    BLOCKED_CACHE_STATE_STALE,
+                )? {
+                    blocked_cache_plan = Some(BlockedCacheRefreshPlan::Full);
+                }
                 storage.set_metadata_in_tx(BLOCKED_CACHE_STATE_KEY, BLOCKED_CACHE_STATE_STALE)?;
             }
 
@@ -7525,6 +7839,21 @@ impl SqliteStorage {
                 "DELETE FROM child_counters WHERE parent_id = ?",
                 &[SqliteValue::from(id)],
             )?;
+            // Keep hard deletion independent of connection-level foreign-key
+            // enforcement. The fsqlite connection can legitimately have
+            // enforcement disabled around schema/recovery work, so relying on
+            // ON DELETE CASCADE here leaves DB-only workflow evidence orphaned
+            // after a successful purge (GitHub #453).
+            for statement in [
+                "DELETE FROM close_metadata WHERE issue_id = ?",
+                "DELETE FROM gate_results WHERE issue_id = ?",
+                "DELETE FROM gate_result_history WHERE issue_id = ?",
+                "DELETE FROM capacity_exemptions WHERE issue_id = ?",
+                "DELETE FROM capacity_exemption_history WHERE issue_id = ?",
+                "DELETE FROM capacity_occupancy WHERE issue_id = ?",
+            ] {
+                conn.execute_with_params(statement, &[SqliteValue::from(id)])?;
+            }
             conn.execute_with_params("DELETE FROM issues WHERE id = ?", &[SqliteValue::from(id)])?;
 
             // Record the intentional removal so the exporter's stale-database
@@ -7997,6 +8326,9 @@ impl SqliteStorage {
                 break;
             }
 
+            // `is_template = 0` (not the `OR IS NULL` spelling) so stock
+            // SQLite can serve this from `idx_issues_list_active_order`; see
+            // `list_text_issues_by_priority_window` (#463).
             let sql = format!(
                 r"SELECT id, content_hash, title, description, design, acceptance_criteria, notes,
                          status, priority, issue_type, assignee, owner, estimated_minutes,
@@ -8007,7 +8339,7 @@ impl SqliteStorage {
                          sender, ephemeral, pinned, is_template, source_repo_path, agent_context
                   FROM issues
                   WHERE {status_filter}
-                    AND (is_template = 0 OR is_template IS NULL)
+                    AND is_template = 0
                     AND priority = ?
                   ORDER BY created_at DESC, id ASC
                   LIMIT {remaining}"
@@ -8115,11 +8447,19 @@ impl SqliteStorage {
             }
 
             let query_limit = remaining.saturating_add(offset);
+            // Spell the template predicate as the bare `is_template = 0` so the
+            // planner can prove it implies `idx_issues_list_active_order`'s
+            // partial-index predicate: `is_template` is `NOT NULL`, so stock
+            // SQLite folds `is_template IS NULL` to a constant at resolve time
+            // and the `(… OR is_template IS NULL)` spelling no longer matches
+            // the index's stored predicate. No `INDEXED BY`: when the planner
+            // cannot use a hinted index it fails the whole statement with
+            // "no query solution" instead of picking another plan (#463).
             let rows = self.conn.query_with_params(
                 "SELECT id, title, status, priority, issue_type, created_at, updated_at
-                 FROM issues INDEXED BY idx_issues_list_active_order
+                 FROM issues
                  WHERE status NOT IN ('closed', 'tombstone')
-                   AND (is_template = 0 OR is_template IS NULL)
+                   AND is_template = 0
                    AND priority = ?
                  ORDER BY created_at DESC, id ASC
                  LIMIT ?",
@@ -14475,7 +14815,51 @@ impl SqliteStorage {
             issues.push(Self::issue_from_row(row)?);
         }
 
+        self.attach_close_bypass_audit_for_export(&mut issues)?;
+
         Ok(issues)
+    }
+
+    /// Project the close-policy bypass audit trail from `close_metadata`
+    /// onto issues being exported (GitHub #474). Without this a
+    /// `--bypass-policy` close is recorded only in the gitignored local
+    /// database and is invisible in the shared JSONL record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the audit query fails.
+    pub(crate) fn attach_close_bypass_audit_for_export(&self, issues: &mut [Issue]) -> Result<()> {
+        if issues.is_empty() || !crate::storage::schema::table_exists(&self.conn, "close_metadata")
+        {
+            return Ok(());
+        }
+        let rows = self.conn.query(
+            "SELECT issue_id, bypass_reason, policy_gates_fired
+             FROM close_metadata WHERE bypassed_policy = 1",
+        )?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut audit: HashMap<String, (Option<String>, Option<Vec<String>>)> = HashMap::new();
+        for row in &rows {
+            let Some(issue_id) = row.get(0).and_then(SqliteValue::as_text) else {
+                continue;
+            };
+            let reason = row.get(1).and_then(SqliteValue::as_text).map(String::from);
+            let gates = row
+                .get(2)
+                .and_then(SqliteValue::as_text)
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok());
+            audit.insert(issue_id.to_string(), (reason, gates));
+        }
+        for issue in issues.iter_mut() {
+            if let Some((reason, gates)) = audit.get(&issue.id) {
+                issue.bypassed_policy = Some(true);
+                issue.bypass_reason.clone_from(reason);
+                issue.policy_gates_fired.clone_from(gates);
+            }
+        }
+        Ok(())
     }
 
     /// Get all dependency records for all issues.
@@ -15324,7 +15708,7 @@ impl SqliteStorage {
         })
     }
 
-    fn issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15375,6 +15759,9 @@ impl SqliteStorage {
             closed_at: get_opt_datetime(16)?,
             close_reason: get_non_empty_str(17),
             closed_by_session: get_non_empty_str(18),
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: get_opt_datetime(19)?,
             defer_until: get_opt_datetime(20)?,
             external_ref: get_opt_str(21),
@@ -15405,7 +15792,7 @@ impl SqliteStorage {
         })
     }
 
-    fn ready_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn ready_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15445,6 +15832,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15470,7 +15860,7 @@ impl SqliteStorage {
         })
     }
 
-    fn blocked_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn blocked_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15510,6 +15900,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15535,7 +15928,7 @@ impl SqliteStorage {
         })
     }
 
-    fn stale_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn stale_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15575,6 +15968,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15600,7 +15996,7 @@ impl SqliteStorage {
         })
     }
 
-    fn lint_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn lint_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15634,6 +16030,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15659,7 +16058,7 @@ impl SqliteStorage {
         })
     }
 
-    fn search_command_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn search_command_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15699,6 +16098,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15724,7 +16126,7 @@ impl SqliteStorage {
         })
     }
 
-    fn command_summary_issue_from_row(row: &fsqlite::Row) -> Result<Issue> {
+    fn command_summary_issue_from_row(row: &Row) -> Result<Issue> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15758,6 +16160,9 @@ impl SqliteStorage {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -15783,7 +16188,7 @@ impl SqliteStorage {
         })
     }
 
-    fn stats_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
+    fn stats_issue_from_row(row: &Row) -> Result<StatsIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15824,7 +16229,7 @@ impl SqliteStorage {
         })
     }
 
-    fn stats_summary_issue_from_row(row: &fsqlite::Row) -> Result<StatsIssueRow> {
+    fn stats_summary_issue_from_row(row: &Row) -> Result<StatsIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15853,7 +16258,7 @@ impl SqliteStorage {
         })
     }
 
-    fn changelog_issue_from_row(row: &fsqlite::Row) -> Result<ChangelogIssueRow> {
+    fn changelog_issue_from_row(row: &Row) -> Result<ChangelogIssueRow> {
         let get_str = |idx: usize| -> String {
             row.get(idx)
                 .and_then(SqliteValue::as_text)
@@ -15976,18 +16381,25 @@ fn finish_issue_mutation_write_probe(
     }
 }
 
-/// Best-effort removal of an ephemeral temp database and its SQLite sidecars.
+/// Best-effort removal of an ephemeral temp database and its engine sidecars.
 ///
-/// SQLite may create `-wal`, `-shm`, and `-journal` files next to the main
-/// database file; all of them must go so nothing is left in `TMPDIR` (#299).
+/// FrankenSQLite creates sidecars beside any database path it opens: the
+/// classic `-wal`/`-shm`/`-journal`, the multi-process namespace files
+/// (`-fsqlite-ns-gate`/`-fsqlite-ns-use`), the WAL-cert files
+/// (`-wal-cert`/`-wal-cert-head`), and a `.`-separated `.fsqlite-migration-state`
+/// file. All of them must go so nothing is left in `TMPDIR` (#299) — reaping
+/// only the classic three silently leaked the fsqlite-specific sidecars.
 /// Missing files are ignored; this is invoked on teardown and on a failed
 /// open, so errors are intentionally swallowed (logged at debug level).
 fn remove_temp_db_files(path: &Path) {
     let mut targets = vec![path.to_path_buf()];
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        for suffix in ["-wal", "-shm", "-journal"] {
+        for &suffix in crate::config::db_sidecar_suffixes() {
             targets.push(path.with_file_name(format!("{name}{suffix}")));
         }
+        // The migration-state sidecar is `.`-separated and is not part of
+        // `db_sidecar_suffixes()`, so append it explicitly.
+        targets.push(path.with_file_name(format!("{name}.fsqlite-migration-state")));
     }
     for target in targets {
         match std::fs::remove_file(&target) {
@@ -16746,8 +17158,16 @@ fn checked_database_header_user_version(path: &Path) -> Result<Option<u32>> {
     ])))
 }
 
-#[cfg(test)]
-fn database_header_user_version(path: &Path) -> Option<u32> {
+/// Best-effort, engine-free read of the checkpointed schema `user_version`
+/// from the SQLite file header.
+///
+/// Returns `None` when the path is absent, is not a SQLite database, is too
+/// short to carry a header, or cannot be read — this never surfaces an error,
+/// so it is safe for the `br doctor health` sub-200 ms tripwire (#464), which
+/// must not open the engine or fail. Reports the *checkpointed* header value;
+/// callers that need the WAL-resident effective version use
+/// [`effective_database_user_version`] instead.
+pub(crate) fn database_header_user_version(path: &Path) -> Option<u32> {
     checked_database_header_user_version(path).ok().flatten()
 }
 
@@ -17150,7 +17570,7 @@ fn parse_issue_type(s: Option<&str>) -> IssueType {
 }
 
 fn dependency_metadata_from_row(
-    row: &fsqlite::Row,
+    row: &Row,
     row_role: &str,
     allow_external_placeholder: bool,
 ) -> Result<IssueWithDependencyMetadata> {
@@ -17678,6 +18098,8 @@ impl SqliteStorage {
                 issue.comments = comments.clone();
             }
         }
+
+        self.attach_close_bypass_audit_for_export(&mut issues)?;
 
         Ok(issues)
     }
@@ -18446,10 +18868,50 @@ impl SqliteStorage {
                     issue.id
                 ))));
             }
+            self.persist_imported_close_bypass_audit_in_tx(issue)?;
             return Ok(true);
         }
 
-        Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
+        let inserted = self.insert_issue_row_for_import(issue, &timestamps)? > 0;
+        if inserted {
+            self.persist_imported_close_bypass_audit_in_tx(issue)?;
+        }
+        Ok(inserted)
+    }
+
+    /// Persist an imported close-policy bypass audit trail into
+    /// `close_metadata` (GitHub #474). A locally recorded row wins — the
+    /// machine that performed the bypass holds the richer record (closer
+    /// attribution columns) — so this is insert-only.
+    fn persist_imported_close_bypass_audit_in_tx(&self, issue: &Issue) -> Result<()> {
+        if issue.bypassed_policy != Some(true) {
+            return Ok(());
+        }
+        let gates_json = issue
+            .policy_gates_fired
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|err| {
+                BeadsError::Config(format!(
+                    "could not serialize imported policy_gates_fired for {}: {err}",
+                    issue.id
+                ))
+            })?;
+        self.conn.execute_with_params(
+            "INSERT OR IGNORE INTO close_metadata \
+             (issue_id, bypassed_policy, bypass_reason, policy_gates_fired) \
+             VALUES (?, 1, ?, ?)",
+            &[
+                SqliteValue::from(issue.id.as_str()),
+                issue
+                    .bypass_reason
+                    .as_deref()
+                    .map_or(SqliteValue::Null, SqliteValue::from),
+                gates_json.map_or(SqliteValue::Null, SqliteValue::from),
+            ],
+        )?;
+        Ok(())
     }
 
     /// Check whether relation rows already exist for an imported issue ID.
@@ -18763,6 +19225,35 @@ impl SqliteStorage {
         )?;
 
         self.insert_comment_rows_for_import(issue_id, comments)
+    }
+
+    /// Delete comments owned by issues that an outer import transaction will
+    /// replace.
+    ///
+    /// Imported comment IDs are globally unique and may move between issues in
+    /// authoritative JSONL. Clearing the complete applied-owner set before any
+    /// issue is replayed makes that transfer independent of JSONL line order.
+    /// Callers must invoke this inside the same transaction that restores the
+    /// replacement rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database operation fails.
+    pub(crate) fn delete_comments_for_import_issue_ids_in_tx(
+        &self,
+        issue_ids: &[String],
+    ) -> Result<usize> {
+        let mut deleted = 0usize;
+        for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!("DELETE FROM comments WHERE issue_id IN ({placeholders})");
+            let params = chunk
+                .iter()
+                .map(|issue_id| SqliteValue::from(issue_id.as_str()))
+                .collect::<Vec<_>>();
+            deleted += self.conn.execute_with_params(&sql, &params)?;
+        }
+        Ok(deleted)
     }
 
     /// Insert relation rows for an issue that was just created during import.
@@ -19709,9 +20200,7 @@ fn insert_comment_row(conn: &Connection, issue_id: &str, author: &str, text: &st
     Ok(comment_id)
 }
 
-fn gate_result_record_from_row(
-    row: &fsqlite::Row,
-) -> Result<crate::close_policy::GateResultRecord> {
+fn gate_result_record_from_row(row: &Row) -> Result<crate::close_policy::GateResultRecord> {
     let required_text = |index: usize, name: &str| {
         row.get(index)
             .and_then(SqliteValue::as_text)
@@ -19761,7 +20250,7 @@ fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
     comment_from_row(&row)
 }
 
-fn comment_from_row(row: &fsqlite::Row) -> Result<Comment> {
+fn comment_from_row(row: &Row) -> Result<Comment> {
     let id = row
         .get(0)
         .and_then(SqliteValue::as_integer)
@@ -19858,13 +20347,29 @@ impl Drop for SqliteStorage {
         // (`crate::shutdown`) returns from main without re-entering
         // `with_write_transaction` — get one final TRUNCATE here so WAL
         // frames are not stranded on disk after the process ends (#270).
-        if self.mutation_count > 0
-            && let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        {
-            tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+        //
+        // The checkpoint runs only while this process provably is the sole
+        // opener; the exclusive opener hold is kept until the connection is
+        // closed so no peer starts reading a WAL this teardown is resetting.
+        let mut exit_hold = None;
+        if self.mutation_count > 0 {
+            match self.admit_checkpoint() {
+                CheckpointAdmission::Sole(hold) => {
+                    exit_hold = hold;
+                    if let Err(e) = self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)") {
+                        tracing::debug!(error = %e, "WAL checkpoint on drop failed (non-fatal)");
+                    }
+                }
+                CheckpointAdmission::PeersPresent => {
+                    tracing::debug!(
+                        "Skipping exit WAL checkpoint: another process has the database open"
+                    );
+                }
+            }
         }
         // Explicitly close the connection to avoid fsqlite drop_close warnings.
         let _ = self.conn.close_in_place();
+        drop(exit_hold);
         // Ephemeral temp databases (open_memory) are unlinked here, after the
         // connection is closed, so the file and its WAL/SHM/journal sidecars are
         // not left behind in TMPDIR (#299). Persistent databases have
@@ -19930,6 +20435,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             external_ref: None,
             source_system: None,
@@ -21002,6 +21510,30 @@ mod tests {
         assert_eq!(
             storage.get_gate_result_history("bd-cycle").unwrap().len(),
             2
+        );
+
+        // GitHub #466: every scoped report must also mirror the latest
+        // (gate, provider) verdict into the current-state `gate_results`
+        // table. Two reports from the same provider collapse into one row
+        // carrying the most recent verdict/note.
+        let mirror = storage
+            .conn
+            .query("SELECT issue_id, gate, provider, passed, note FROM gate_results")
+            .unwrap();
+        assert_eq!(
+            mirror.len(),
+            1,
+            "gate_results must hold exactly one current-state row per (issue, gate, provider)"
+        );
+        let row = &mirror[0];
+        assert_eq!(row.get(0).and_then(SqliteValue::as_text), Some("bd-cycle"));
+        assert_eq!(row.get(1).and_then(SqliteValue::as_text), Some("ci_green"));
+        assert_eq!(row.get(2).and_then(SqliteValue::as_text), Some("ci"));
+        assert_eq!(row.get(3).and_then(SqliteValue::as_integer), Some(1));
+        assert_eq!(
+            row.get(4).and_then(SqliteValue::as_text),
+            Some("cycle two"),
+            "a re-report must overwrite the mirror row with the latest verdict"
         );
     }
 
@@ -23363,9 +23895,18 @@ mod tests {
             .expect("temp db name");
         let leftovers: Vec<PathBuf> = std::iter::once(db_path.clone())
             .chain(
-                ["-wal", "-shm", "-journal"]
-                    .iter()
-                    .map(|s| db_path.with_file_name(format!("{name}{s}"))),
+                [
+                    "-wal",
+                    "-shm",
+                    "-journal",
+                    "-fsqlite-ns-gate",
+                    "-fsqlite-ns-use",
+                    "-wal-cert",
+                    "-wal-cert-head",
+                    ".fsqlite-migration-state",
+                ]
+                .iter()
+                .map(|s| db_path.with_file_name(format!("{name}{s}"))),
             )
             .filter(|p| p.exists())
             .collect();
@@ -23382,7 +23923,20 @@ mod tests {
     fn remove_temp_db_files_clears_all_sidecars() {
         let dir = TempDir::new().unwrap();
         let base = dir.path().join("beads_mem_test_0.db");
-        for suffix in ["", "-wal", "-shm", "-journal"] {
+        // Cover every engine-managed sidecar, not just the classic three: the
+        // fsqlite namespace / WAL-cert / migration-state files leaked before.
+        let sidecars = [
+            "",
+            "-wal",
+            "-shm",
+            "-journal",
+            "-fsqlite-ns-gate",
+            "-fsqlite-ns-use",
+            "-wal-cert",
+            "-wal-cert-head",
+            ".fsqlite-migration-state",
+        ];
+        for suffix in sidecars {
             fs::write(
                 dir.path().join(format!("beads_mem_test_0.db{suffix}")),
                 b"x",
@@ -23390,7 +23944,7 @@ mod tests {
             .unwrap();
         }
         remove_temp_db_files(&base);
-        for suffix in ["", "-wal", "-shm", "-journal"] {
+        for suffix in sidecars {
             let p = dir.path().join(format!("beads_mem_test_0.db{suffix}"));
             assert!(!p.exists(), "should have been removed: {}", p.display());
         }
@@ -23421,6 +23975,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -24668,6 +25225,273 @@ mod tests {
             .and_then(SqliteValue::as_integer)
             .unwrap_or(0);
         assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn test_purge_issue_removes_every_issue_owned_auxiliary_row() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let issue = make_issue(
+            "bd-purge-aux",
+            "Purge auxiliary state",
+            Status::Open,
+            2,
+            None,
+            t1,
+            None,
+        );
+        storage.create_issue(&issue, "tester").unwrap();
+
+        storage
+            .conn
+            .execute(
+                "INSERT INTO close_metadata (issue_id, bypassed_policy) \
+                 VALUES ('bd-purge-aux', 0)",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO gate_results (issue_id, gate, provider, passed) \
+                 VALUES ('bd-purge-aux', 'review', 'test', 1)",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO gate_result_history \
+                 (issue_id, from_status, to_status, status_revision, gate, provider, passed) \
+                 VALUES ('bd-purge-aux', 'open', 'closed', 1, 'review', 'test', 1)",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO capacity_exemptions \
+                 (issue_id, capacity_kind, capacity_name, provider, reason, granted_by) \
+                 VALUES ('bd-purge-aux', 'status', 'open', 'test', 'test', 'tester')",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO capacity_exemption_history \
+                 (issue_id, capacity_kind, capacity_name, action, provider, actor) \
+                 VALUES ('bd-purge-aux', 'status', 'open', 'grant', 'test', 'tester')",
+            )
+            .unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO capacity_occupancy (issue_id, actor) \
+                 VALUES ('bd-purge-aux', 'tester')",
+            )
+            .unwrap();
+
+        storage.purge_issue("bd-purge-aux", "tester").unwrap();
+
+        for table in [
+            "close_metadata",
+            "gate_results",
+            "gate_result_history",
+            "capacity_exemptions",
+            "capacity_exemption_history",
+            "capacity_occupancy",
+        ] {
+            let count = storage
+                .conn
+                .query_row(&format!(
+                    "SELECT COUNT(*) FROM {table} WHERE issue_id = 'bd-purge-aux'"
+                ))
+                .unwrap()
+                .get(0)
+                .and_then(SqliteValue::as_integer)
+                .unwrap_or_default();
+            assert_eq!(count, 0, "purge left an issue-owned row in {table}");
+        }
+
+        let foreign_key_violations = storage.conn.query("PRAGMA foreign_key_check").unwrap();
+        assert!(
+            foreign_key_violations.is_empty(),
+            "purge left foreign-key violations: {foreign_key_violations:?}"
+        );
+    }
+
+    /// GitHub #471: the auxiliary/history snapshot must carry every DB-only
+    /// table across a rebuild, keep ids when the target tables are empty,
+    /// and skip rows whose issue did not survive the rebuild.
+    #[test]
+    fn test_auxiliary_history_snapshot_restores_after_rebuild() {
+        let t1 = Utc.with_ymd_and_hms(2025, 5, 1, 0, 0, 0).unwrap();
+        let mut source = SqliteStorage::open_memory().unwrap();
+        let survivor = make_issue("bd-hist-keep", "survives", Status::Open, 2, None, t1, None);
+        let dropped = make_issue("bd-hist-drop", "dropped", Status::Open, 2, None, t1, None);
+        source.create_issue(&survivor, "tester").unwrap();
+        source.create_issue(&dropped, "tester").unwrap();
+        for (issue, gate) in [("bd-hist-keep", "review"), ("bd-hist-drop", "review")] {
+            source
+                .conn
+                .execute_with_params(
+                    "INSERT INTO gate_result_history \
+                     (issue_id, from_status, to_status, status_revision, gate, provider, passed) \
+                     VALUES (?, 'open', 'closed', 1, ?, 'test', 1)",
+                    &[SqliteValue::from(issue), SqliteValue::from(gate)],
+                )
+                .unwrap();
+        }
+        source
+            .conn
+            .execute(
+                "INSERT INTO close_metadata (issue_id, bypassed_policy, bypass_reason) \
+                 VALUES ('bd-hist-keep', 1, 'urgent')",
+            )
+            .unwrap();
+        source
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO capacity_occupancy (issue_id, actor) \
+                 VALUES ('bd-hist-keep', 'tester')",
+            )
+            .unwrap();
+        let source_events = source.get_events("bd-hist-keep", 0).unwrap().len();
+        assert!(source_events > 0, "creation must have produced events");
+
+        let snapshot = source.snapshot_auxiliary_history_tables();
+        assert!(snapshot.failures.is_empty(), "{:?}", snapshot.failures);
+        assert!(snapshot.row_count() > 0);
+
+        // Rebuild target holds only the survivor (as after a JSONL rebuild
+        // whose export lacked the dropped issue).
+        let mut rebuilt = SqliteStorage::open_memory().unwrap();
+        rebuilt.create_issue(&survivor, "import").unwrap();
+        let report = rebuilt.restore_auxiliary_history_tables(&snapshot).unwrap();
+
+        let restored_events = rebuilt
+            .conn
+            .query_row("SELECT COUNT(*) FROM events WHERE issue_id = 'bd-hist-keep'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert!(
+            restored_events >= i64::try_from(source_events).unwrap(),
+            "survivor events must be preserved (got {restored_events})"
+        );
+        let gate_rows = rebuilt
+            .conn
+            .query("SELECT issue_id FROM gate_result_history")
+            .unwrap();
+        assert_eq!(gate_rows.len(), 1, "only the survivor's gate history stays");
+        assert_eq!(
+            gate_rows[0].get(0).and_then(SqliteValue::as_text),
+            Some("bd-hist-keep")
+        );
+        let close_reason = rebuilt
+            .conn
+            .query_row("SELECT bypass_reason FROM close_metadata WHERE issue_id = 'bd-hist-keep'")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .map(String::from);
+        assert_eq!(close_reason.as_deref(), Some("urgent"));
+        let occupancy = rebuilt
+            .conn
+            .query_row("SELECT COUNT(*) FROM capacity_occupancy")
+            .unwrap()
+            .get(0)
+            .and_then(SqliteValue::as_integer)
+            .unwrap();
+        assert_eq!(occupancy, 1);
+        assert!(
+            report
+                .iter()
+                .any(|(table, restored, _)| table == "gate_result_history" && *restored == 1),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|(table, _, skipped)| table == "gate_result_history" && *skipped == 1),
+            "dropped issue's history must be counted as skipped: {report:?}"
+        );
+        let fk = rebuilt.conn.query("PRAGMA foreign_key_check").unwrap();
+        assert!(fk.is_empty(), "restore left FK violations: {fk:?}");
+    }
+
+    /// GitHub #474: a bypassed close must travel through the JSONL export
+    /// and re-import into `close_metadata` on another machine.
+    #[test]
+    fn test_close_bypass_audit_exports_and_imports() {
+        let t1 = Utc.with_ymd_and_hms(2025, 6, 1, 0, 0, 0).unwrap();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let mut issue = make_issue(
+            "bd-bypassed",
+            "bypassed close",
+            Status::Closed,
+            2,
+            None,
+            t1,
+            None,
+        );
+        issue.closed_at = Some(t1);
+        storage.create_issue(&issue, "tester").unwrap();
+        storage
+            .conn
+            .execute(
+                "INSERT INTO close_metadata \
+                 (issue_id, bypassed_policy, bypass_reason, policy_gates_fired) \
+                 VALUES ('bd-bypassed', 1, 'demonstrating the export gap', \
+                         '[\"typed_references_required\"]')",
+            )
+            .unwrap();
+
+        let exported = storage
+            .get_issues_for_export(&["bd-bypassed".to_string()])
+            .unwrap();
+        assert_eq!(exported.len(), 1);
+        assert_eq!(exported[0].bypassed_policy, Some(true));
+        assert_eq!(
+            exported[0].bypass_reason.as_deref(),
+            Some("demonstrating the export gap")
+        );
+        assert_eq!(
+            exported[0].policy_gates_fired.as_deref(),
+            Some(&["typed_references_required".to_string()][..])
+        );
+        let line = serde_json::to_string(&exported[0]).unwrap();
+        assert!(line.contains("\"bypassed_policy\":true"), "{line}");
+        assert!(line.contains("bypass_reason"), "{line}");
+
+        // A non-bypassed close serializes no audit fields (additive schema).
+        let mut clean = make_issue("bd-clean", "clean close", Status::Closed, 2, None, t1, None);
+        clean.closed_at = Some(t1);
+        storage.create_issue(&clean, "tester").unwrap();
+        let clean_export = storage
+            .get_issues_for_export(&["bd-clean".to_string()])
+            .unwrap();
+        let clean_line = serde_json::to_string(&clean_export[0]).unwrap();
+        assert!(!clean_line.contains("bypassed_policy"), "{clean_line}");
+
+        // Import the exported record on a "different machine".
+        let other = SqliteStorage::open_memory().unwrap();
+        let parsed: Issue = serde_json::from_str(&line).unwrap();
+        other.upsert_issue_for_import(&parsed).unwrap();
+        let row = other
+            .conn
+            .query_row(
+                "SELECT bypassed_policy, bypass_reason, policy_gates_fired \
+                 FROM close_metadata WHERE issue_id = 'bd-bypassed'",
+            )
+            .unwrap();
+        assert_eq!(row.get(0).and_then(SqliteValue::as_integer), Some(1));
+        assert_eq!(
+            row.get(1).and_then(SqliteValue::as_text),
+            Some("demonstrating the export gap")
+        );
+        assert_eq!(
+            row.get(2).and_then(SqliteValue::as_text),
+            Some("[\"typed_references_required\"]")
+        );
     }
 
     #[test]
@@ -26811,6 +27635,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -26892,6 +27719,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -26967,6 +27797,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -27099,6 +27932,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -27717,6 +28553,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             defer_until: None,
             due_at: None,
             external_ref: None,
@@ -27885,6 +28724,46 @@ mod tests {
         assert_eq!(
             count, 1,
             "stale cache entry should persist (reads must not mutate cache)"
+        );
+    }
+
+    #[test]
+    fn test_incremental_refresh_after_deferred_write_rebuilds_fully() {
+        // Regression: an Incremental blocked-cache refresh only recomputes its
+        // own parent-child component but then declares the whole cache fresh.
+        // If a prior Deferred write left the cache stale (its blocking edge is
+        // committed but not yet in blocked_issues_cache), an unrelated
+        // Incremental write must NOT clear the stale marker while that earlier
+        // change is still missing — it must upgrade to a Full rebuild.
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for (id, title) in [("bd-x", "X"), ("bd-y", "Y"), ("bd-z", "Z"), ("bd-w", "W")] {
+            let issue = make_issue(id, title, Status::Open, 2, None, Utc::now(), None);
+            storage.create_issue(&issue, "tester").unwrap();
+        }
+
+        // A "blocks" dependency uses the Deferred plan: commits the edge and
+        // marks the cache stale, but does NOT write blocked_issues_cache.
+        storage
+            .add_dependency("bd-x", "bd-y", "blocks", "tester")
+            .unwrap();
+        assert!(
+            storage.blocked_cache_marked_stale().unwrap(),
+            "add_dependency must leave the cache stale"
+        );
+
+        // An UNRELATED set_parent uses the Incremental plan. bd-x is outside
+        // bd-z/bd-w's parent-child component, so a naive incremental refresh
+        // would clear the stale marker with bd-x still absent from the cache.
+        storage.set_parent("bd-z", Some("bd-w"), "tester").unwrap();
+
+        assert!(
+            !storage.blocked_cache_marked_stale().unwrap(),
+            "the incremental-after-deferred write should have fully rebuilt and cleared stale"
+        );
+        assert!(
+            storage.is_blocked("bd-x").unwrap(),
+            "bd-x must still be reported blocked by open bd-y after the unrelated \
+             incremental write (regression: incremental cleared stale with bd-x missing)"
         );
     }
 
@@ -31084,7 +31963,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 1. count(*) no WHERE: {:?}",
-            r1.first().map(fsqlite::Row::values)
+            r1.first().map(Row::values)
         );
 
         // 2: count with literal WHERE
@@ -31093,7 +31972,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 2. count(*) literal WHERE: {:?}",
-            r2.first().map(fsqlite::Row::values)
+            r2.first().map(Row::values)
         );
 
         // 3: count with bind WHERE
@@ -31114,7 +31993,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 3. count(*) bind WHERE: {:?}",
-            r3.first().map(fsqlite::Row::values)
+            r3.first().map(Row::values)
         );
 
         // Also get EXPLAIN for the working non-aggregate version
@@ -31134,7 +32013,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 4. select k bind WHERE: {:?}",
-            r4.first().map(fsqlite::Row::values)
+            r4.first().map(Row::values)
         );
 
         // 5: count(k) with bind WHERE
@@ -31146,7 +32025,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 5. count(k) bind WHERE: {:?}",
-            r5.first().map(fsqlite::Row::values)
+            r5.first().map(Row::values)
         );
 
         // 6: count with bind WHERE but no match
@@ -31158,7 +32037,7 @@ mod tests {
             .unwrap();
         eprintln!(
             "[DIAG] 6. count(*) bind WHERE no match: {:?}",
-            r6.first().map(fsqlite::Row::values)
+            r6.first().map(Row::values)
         );
 
         let c = r3
@@ -33519,6 +34398,7 @@ mod tests {
             mutation_count: 0,
             temp_db_path: None,
             pending_event_attribution: None,
+            opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
             workflow_transition_policy: crate::close_policy::Workflow::default(),
             last_capacity_warnings: Vec::new(),

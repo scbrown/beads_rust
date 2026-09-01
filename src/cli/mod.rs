@@ -1263,7 +1263,9 @@ pub struct UpdateArgs {
     #[arg(long)]
     pub claim: bool,
 
-    /// Force update even if issue is blocked
+    /// Force update even if issue is blocked, and allow replacing a
+    /// non-empty description/design/acceptance-criteria/notes/agent-context
+    /// value with different content (GitHub #467)
     #[arg(long)]
     pub force: bool,
 
@@ -1811,7 +1813,7 @@ pub struct ListArgs {
     #[arg(long)]
     pub notes_contains: Option<String>,
 
-    /// Include closed issues (default excludes closed)
+    /// Include closed issues (ephemeral rows remain visible but are not exported)
     #[arg(long, short = 'a')]
     pub all: bool,
 
@@ -1846,6 +1848,13 @@ pub struct ListArgs {
     /// Use tree/pretty output format
     #[arg(long)]
     pub pretty: bool,
+
+    /// Group children under their parents with tree connectors (text output).
+    /// Hierarchy follows dotted child IDs (`bd-abc.2` under `bd-abc`); a
+    /// child whose parent is filtered out of the result set is shown at the
+    /// top level (GitHub #475).
+    #[arg(long)]
+    pub tree: bool,
 
     /// Wrap long lines instead of truncating in text output
     #[arg(long)]
@@ -2875,6 +2884,15 @@ pub struct SyncArgs {
     #[arg(long)]
     pub import_only: bool,
 
+    /// Recover an import by removing invalid JSONL records
+    ///
+    /// Only valid with --import-only. Before replacing issues.jsonl, br keeps
+    /// an exact non-rotating backup under .beads/.br_history, reports every
+    /// rejected line, and validates the remaining generation. Merge-conflict
+    /// markers are never skipped.
+    #[arg(long, requires = "import_only")]
+    pub skip_invalid_records: bool,
+
     /// Perform a 3-way merge (Base + Local DB + Remote JSONL)
     ///
     /// Reconciles changes when both the database and JSONL have been modified.
@@ -2894,9 +2912,13 @@ pub struct SyncArgs {
 
     /// Preview the reconcile plan without mutating anything
     ///
-    /// Only valid with --reconcile. Opens no write transaction and performs
+    /// Valid with --reconcile, --reconcile-additive, and
+    /// --migrate-source-repo-path. Opens no write transaction and performs
     /// no metadata, cache, dirty-marker, JSONL, or base-snapshot writes.
-    #[arg(long, requires = "reconcile")]
+    /// The reviewed modes (--reconcile-additive, --migrate-source-repo-path)
+    /// already plan without mutating unless --apply is given; there this
+    /// flag is an explicit no-op alias for that default (GitHub #473).
+    #[arg(long, conflicts_with = "apply")]
     pub dry_run: bool,
 
     /// Show sync status (read-only)
@@ -2926,17 +2948,28 @@ pub struct SyncArgs {
     #[arg(long = "reconcile-additive")]
     pub reconcile_additive: bool,
 
-    /// Apply a conflict-free additive reconciliation plan transactionally
+    /// Reconcile JSONL and normalize source_repo_path atomically
     ///
-    /// Without this flag, --reconcile-additive only prints the dry-run plan.
-    #[arg(long, requires = "reconcile_additive")]
+    /// Read-only by default. Builds a hash-bound plan that preserves the
+    /// portable source_repo value, imports source-only/newer rows, and rewrites
+    /// source_repo_path to the canonical current workspace path. Combine with
+    /// --apply and the exact --expect-plan-sha256 token to commit DB and JSONL
+    /// through the crash-recoverable sync publication saga.
+    #[arg(long = "migrate-source-repo-path")]
+    pub migrate_source_repo_path: bool,
+
+    /// Apply a reviewed reconciliation or migration plan transactionally
+    ///
+    /// Without this flag, reviewed migration/reconciliation modes only print
+    /// their dry-run plan.
+    #[arg(long)]
     pub apply: bool,
 
-    /// SHA-256 from the reviewed additive-reconciliation dry-run receipt
+    /// SHA-256 from the reviewed dry-run receipt
     ///
     /// Required with --apply. The command refuses mutation if the exact source,
-    /// database, resolution set, or expected post-state now produces another
-    /// plan token.
+    /// database, selected operation, resolution set, or expected post-state
+    /// now produces another plan token.
     #[arg(long = "expect-plan-sha256", value_name = "SHA256", requires = "apply")]
     pub expect_plan_sha256: Option<String>,
 
@@ -3174,6 +3207,12 @@ pub enum HistoryCommands {
         /// Remove backups older than N days
         #[arg(long)]
         older_than: Option<u32>,
+        /// Global logical-byte budget across all backup+metadata pairs
+        ///
+        /// Oldest complete pairs are removed until within budget. The newest
+        /// pair is always retained even when it alone exceeds this value.
+        #[arg(long, value_name = "BYTES")]
+        max_bytes: Option<u64>,
     },
 }
 

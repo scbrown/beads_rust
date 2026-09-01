@@ -815,6 +815,40 @@ fn import_only_heals_false_equal_and_dry_run_sees_it() {
 }
 
 #[test]
+fn reconcile_preserves_legacy_labels_exactly() {
+    let ws = BrWorkspace::new();
+    init_workspace(&ws, "legacy_labels");
+    let issue_id = create_issue(&ws, "Legacy labels", "legacy_labels_create");
+    let flush = run_br(
+        &ws,
+        ["sync", "--flush-only", "--json"],
+        "legacy_labels_flush",
+    );
+    assert!(flush.status.success(), "flush failed: {}", flush.stderr);
+
+    let mut lines = read_jsonl_lines(&ws);
+    assert_eq!(lines.len(), 1, "expected one exported row");
+    let expected = vec![
+        String::new(),
+        "needs review".to_string(),
+        "release.1".to_string(),
+        "sys/stat".to_string(),
+    ];
+    lines[0] = set_row_field(&lines[0], "labels", json!(expected));
+    lines[0] = set_row_field(&lines[0], "updated_at", json!("2030-01-01T00:00:00Z"));
+    write_jsonl_lines(&ws, &lines);
+
+    let receipt = reconcile_receipt(&ws, false, "legacy_labels_reconcile");
+    assert_eq!(plan_count(&receipt, "updated"), 1, "receipt: {receipt}");
+
+    let storage = SqliteStorage::open(&db_path(&ws)).expect("open storage");
+    assert_eq!(
+        storage.get_labels(&issue_id).expect("read imported labels"),
+        expected
+    );
+}
+
+#[test]
 fn force_import_repairs_exact_duplicate_comments_and_reports_the_repair() {
     let ws = BrWorkspace::new();
     init_workspace(&ws, "duplicate_comment");

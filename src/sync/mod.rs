@@ -9150,7 +9150,7 @@ fn validate_jsonl_issue_records_from_reader(
                         .push_failure(line_num + 1, format!("Duplicate issue id '{}'", issue.id));
                     continue;
                 }
-                if let Err(errors) = IssueValidator::validate(&issue) {
+                if let Err(errors) = IssueValidator::validate_imported(&issue) {
                     summary.push_failure(
                         line_num + 1,
                         errors
@@ -13106,7 +13106,7 @@ fn parse_normalized_import_issue(trimmed: &str, line_num: usize) -> Result<(Issu
 
     let exact_duplicate_comments_deduplicated = normalize_issue(&mut issue);
 
-    if let Err(errors) = IssueValidator::validate(&issue) {
+    if let Err(errors) = IssueValidator::validate_imported(&issue) {
         let details = errors
             .iter()
             .map(ToString::to_string)
@@ -22845,6 +22845,37 @@ mod tests {
         let json_check = result.checks.iter().find(|c| c.name == "json_valid");
         assert!(json_check.is_some());
         assert_eq!(json_check.unwrap().status, PreflightCheckStatus::Pass);
+    }
+
+    #[test]
+    fn test_preflight_import_preserves_legacy_label_characters() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        std::fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+
+        let mut issue = make_test_issue("bd-legacy", "Legacy labels");
+        issue.labels = vec![
+            "release.1".to_string(),
+            "needs review".to_string(),
+            "sys/stat".to_string(),
+            String::new(),
+        ];
+        std::fs::write(
+            &jsonl_path,
+            format!("{}\n", serde_json::to_string(&issue).unwrap()),
+        )
+        .unwrap();
+
+        let summary = validate_jsonl_issue_records(&jsonl_path).unwrap();
+        assert_eq!(summary.record_count, 1);
+        assert_eq!(summary.invalid_count, 0, "{:?}", summary.failures);
+
+        let parsed = parse_normalized_import_issue(&serde_json::to_string(&issue).unwrap(), 1)
+            .expect("legacy labels should pass normalized import validation");
+        let mut expected_labels = issue.labels;
+        expected_labels.sort();
+        assert_eq!(parsed.labels, expected_labels);
     }
 
     #[test]

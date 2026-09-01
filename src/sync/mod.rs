@@ -5013,6 +5013,13 @@ fn additive_sha256(value: &impl Serialize, context: &str) -> Result<String> {
 
 fn canonicalize_additive_issue(issue: &mut Issue) {
     issue.content_hash = None;
+    // GitHub #474: the close-policy bypass audit fields are a DB-backed audit
+    // trail projected into the export for off-machine review. They are not
+    // part of the synced issue payload, and hydration paths differ in whether
+    // they attach them — never let them create false scalar conflicts.
+    issue.bypassed_policy = None;
+    issue.bypass_reason = None;
+    issue.policy_gates_fired = None;
     issue.labels.sort_unstable();
     issue.dependencies.sort_by(|left, right| {
         left.issue_id
@@ -10336,6 +10343,8 @@ fn hydrate_export_issue_batch(
         ctx,
     );
 
+    storage.attach_close_bypass_audit_for_export(&mut issues)?;
+
     Ok(issues)
 }
 
@@ -13123,6 +13132,7 @@ fn collect_import_validation_plan(
 ) -> Result<ImportValidationPlan> {
     let mut plan = ImportValidationPlan::default();
     let mut seen_ids = HashSet::new();
+    let mut positive_comment_owners = HashMap::<i64, (String, usize)>::new();
 
     for_each_jsonl_import_issue(source, |line_num, issue, _| {
         let prefix_mismatch = !config.skip_prefix_validation
@@ -13147,6 +13157,25 @@ fn collect_import_validation_plan(
                 source.display_path().display(),
                 line_num
             )));
+        }
+
+        for comment in &issue.comments {
+            if comment.id <= 0 {
+                continue;
+            }
+            if let Some((first_issue_id, first_line_num)) =
+                positive_comment_owners.insert(comment.id, (issue.id.clone(), line_num))
+            {
+                return Err(BeadsError::Config(format!(
+                    "Duplicate positive comment id '{}' in {}: issue '{}' at line {} conflicts with issue '{}' at line {}",
+                    comment.id,
+                    source.display_path().display(),
+                    first_issue_id,
+                    first_line_num,
+                    issue.id,
+                    line_num
+                )));
+            }
         }
 
         if prefix_mismatch {
@@ -13483,6 +13512,9 @@ fn skipped_import_matches_stored_issue(
     if expected.id != target_id {
         expected.id = target_id.to_string();
     }
+    // GitHub #468: hydrated storage carries persisted defaults for fields a
+    // sparse legacy record omits; certify the skip against that form.
+    canonicalize_persisted_issue_defaults(&mut expected);
 
     normalize_issue_for_export(&mut stored);
     normalize_issue_for_export(&mut expected);
@@ -13635,6 +13667,20 @@ fn stream_import_actions_in_tx(
 pub(crate) fn canonicalize_persisted_issue_defaults(issue: &mut Issue) {
     issue.source_repo.get_or_insert_with(|| ".".to_string());
     issue.original_size.get_or_insert(0);
+    // GitHub #468: legacy JSONL may omit dependency `created_by`, `metadata`,
+    // and `thread_id`. The import writer and SQLite schema persist those as
+    // "import", "{}", and "" — the same defaults
+    // `canonicalize_additive_issue_for_storage` documents — so strict
+    // verification must compare the sparse source against its hydrated form
+    // instead of rejecting a lossless first import (or refusing to certify
+    // an equal-timestamp second import as a no-op).
+    for dependency in &mut issue.dependencies {
+        dependency
+            .created_by
+            .get_or_insert_with(|| "import".to_string());
+        dependency.metadata.get_or_insert_with(|| "{}".to_string());
+        dependency.thread_id.get_or_insert_with(String::new);
+    }
 }
 
 /// Compare every persisted import field while retaining the order-independent
@@ -15761,6 +15807,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -16428,6 +16477,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,
@@ -20335,6 +20387,88 @@ mod tests {
     }
 
     #[test]
+    fn test_import_rejects_cross_issue_duplicate_positive_comment_ids_before_mutation() {
+        fn assert_rejected(second_body: &str, reverse_lines: bool) {
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            let sentinel = make_test_issue("bd-comment-sentinel", "Existing state");
+            storage.create_issue(&sentinel, "tester").unwrap();
+            let sentinel_comment = storage
+                .add_comment(&sentinel.id, "keeper", "must remain unchanged")
+                .unwrap();
+
+            let temp_dir = TempDir::new().unwrap();
+            let jsonl_path = temp_dir.path().join("issues.jsonl");
+            let mut first = make_test_issue("bd-comment-duplicate-a", "First owner");
+            let mut second = make_test_issue("bd-comment-duplicate-b", "Second owner");
+            first.comments.push(crate::model::Comment {
+                id: 3_560,
+                issue_id: first.id.clone(),
+                author: "alice".to_string(),
+                body: "shared identity".to_string(),
+                created_at: first.created_at,
+            });
+            second.comments.push(crate::model::Comment {
+                id: 3_560,
+                issue_id: second.id.clone(),
+                author: "alice".to_string(),
+                body: second_body.to_string(),
+                created_at: first.created_at,
+            });
+            let issues = if reverse_lines {
+                [&second, &first]
+            } else {
+                [&first, &second]
+            };
+            fs::write(
+                &jsonl_path,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(issues[0]).unwrap(),
+                    serde_json::to_string(issues[1]).unwrap()
+                ),
+            )
+            .unwrap();
+
+            let err = import_from_jsonl(
+                &mut storage,
+                &jsonl_path,
+                &ImportConfig::default(),
+                Some("bd-"),
+            )
+            .expect_err("cross-issue positive comment identities must be globally unique");
+            let message = err.to_string();
+            assert!(message.contains("Duplicate positive comment id '3560'"));
+            assert!(message.contains("bd-comment-duplicate-a"));
+            assert!(message.contains("bd-comment-duplicate-b"));
+            assert!(message.contains("line 1"));
+            assert!(message.contains("line 2"));
+
+            assert!(
+                storage
+                    .get_issue("bd-comment-duplicate-a")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                storage
+                    .get_issue("bd-comment-duplicate-b")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                storage.get_comments(&sentinel.id).unwrap(),
+                vec![sentinel_comment],
+                "preflight rejection must not mutate existing comments"
+            );
+        }
+
+        for reverse_lines in [false, true] {
+            assert_rejected("different payload", reverse_lines);
+            assert_rejected("shared identity", reverse_lines);
+        }
+    }
+
+    #[test]
     fn test_import_repairs_cross_issue_comment_id_swap_before_semantic_verification() {
         let mut storage = SqliteStorage::open_memory().unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -20462,6 +20596,104 @@ mod tests {
                 .get_comments(&incoming_updated.id)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// GitHub #468: legacy JSONL dependencies omitting `created_by`,
+    /// `metadata`, and `thread_id` hydrate to the persisted defaults
+    /// ("import", "{}", ""). Strict verification must accept the first
+    /// lossless import and certify the second import as a true no-op, while
+    /// explicit non-default values stay byte-for-byte intact.
+    #[test]
+    fn test_import_accepts_omitted_dependency_persistence_defaults() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let jsonl_path = temp_dir.path().join("issues.jsonl");
+
+        let target = make_test_issue("bd-dep-target", "Dependency target");
+        let explicit_target = make_test_issue("bd-dep-explicit", "Explicit target");
+        let mut dependent = make_test_issue("bd-dep-sparse", "Sparse dependent");
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: target.id.clone(),
+            dep_type: DependencyType::Blocks,
+            created_at: dependent.created_at,
+            created_by: None,
+            metadata: None,
+            thread_id: None,
+        });
+        dependent.dependencies.push(Dependency {
+            issue_id: dependent.id.clone(),
+            depends_on_id: explicit_target.id.clone(),
+            dep_type: DependencyType::Related,
+            created_at: dependent.created_at,
+            created_by: Some("source-agent".to_string()),
+            metadata: Some(r#"{"origin":"explicit"}"#.to_string()),
+            thread_id: Some("thread-explicit".to_string()),
+        });
+        // The sparse dependency really serializes without the three fields.
+        let record = serde_json::to_value(&dependent).unwrap();
+        assert!(record["dependencies"][0].get("created_by").is_none());
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::to_string(&target).unwrap(),
+                serde_json::to_string(&explicit_target).unwrap(),
+                serde_json::to_string(&dependent).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let result = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("sparse dependency defaults must import losslessly");
+        assert_eq!(result.created_count, 3);
+        verify_applied_import_issue_semantics(&storage, &result.applied_issues)
+            .expect("strict verification must accept persisted dependency defaults");
+
+        let stored = storage
+            .get_issue_for_export("bd-dep-sparse")
+            .unwrap()
+            .expect("dependent issue addressable");
+        let sparse = stored
+            .dependencies
+            .iter()
+            .find(|dep| dep.dep_type == DependencyType::Blocks)
+            .unwrap();
+        assert_eq!(sparse.created_by.as_deref(), Some("import"));
+        assert_eq!(sparse.metadata.as_deref(), Some("{}"));
+        assert_eq!(sparse.thread_id.as_deref(), Some(""));
+        let explicit = stored
+            .dependencies
+            .iter()
+            .find(|dep| dep.dep_type == DependencyType::Related)
+            .unwrap();
+        assert_eq!(explicit.created_by.as_deref(), Some("source-agent"));
+        assert_eq!(
+            explicit.metadata.as_deref(),
+            Some(r#"{"origin":"explicit"}"#)
+        );
+        assert_eq!(explicit.thread_id.as_deref(), Some("thread-explicit"));
+
+        let second = import_from_jsonl(
+            &mut storage,
+            &jsonl_path,
+            &ImportConfig::default(),
+            Some("bd-"),
+        )
+        .expect("converged second import must succeed");
+        assert_eq!(second.created_count, 0);
+        assert_eq!(second.updated_count, 0);
+        assert_eq!(second.skipped_count, 3);
+        assert_ne!(
+            storage.get_metadata("needs_flush").unwrap().as_deref(),
+            Some("true"),
+            "a certified no-op second import must not arm needs_flush"
         );
     }
 
@@ -23076,6 +23308,9 @@ mod tests {
             closed_at: None,
             close_reason: None,
             closed_by_session: None,
+            bypassed_policy: None,
+            bypass_reason: None,
+            policy_gates_fired: None,
             due_at: None,
             defer_until: None,
             external_ref: None,

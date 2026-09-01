@@ -610,7 +610,7 @@ fn fail_if_jsonl_contains_missing_database_id(
             Ok(resolution) => {
                 return Err(BeadsError::SyncConflict {
                     message: format!(
-                        "Database/JSONL divergence: issue {} exists in JSONL but is not addressable in SQLite; refusing a false missing-issue result. Run `br doctor --repair` against a preserved workspace copy before trusting database-backed reads",
+                        "Database/JSONL divergence: issue {} exists in JSONL but is not addressable in SQLite; refusing a false missing-issue result. Run `br sync --flush-only` first: rows outside the JSONL export contract are removed safely, while a refused flush names regular rows that require `br sync --import-only` before retrying",
                         resolution.id
                     ),
                 });
@@ -618,7 +618,7 @@ fn fail_if_jsonl_contains_missing_database_id(
             Err(BeadsError::AmbiguousId { matches, .. }) if !matches.is_empty() => {
                 return Err(BeadsError::SyncConflict {
                     message: format!(
-                        "Database/JSONL divergence: {candidate:?} matches {} issue IDs in JSONL but none are addressable in SQLite; refusing a false missing-issue result. Run `br doctor --repair` against a preserved workspace copy before trusting database-backed reads",
+                        "Database/JSONL divergence: {candidate:?} matches {} issue IDs in JSONL but none are addressable in SQLite; refusing a false missing-issue result. Run `br sync --flush-only` first: rows outside the JSONL export contract are removed safely, while a refused flush names regular rows that require `br sync --import-only` before retrying",
                         matches.len()
                     ),
                 });

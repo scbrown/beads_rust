@@ -10874,9 +10874,13 @@ fn compute_db_jsonl_id_delta(conn: &Connection, jsonl_path: &Path) -> Result<IdD
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
             && let Some(id) = value.get("id").and_then(serde_json::Value::as_str)
         {
-            // Apply the same wisp filter as the DB query so the
-            // comparison stays apples-to-apples.
-            if id.contains("-wisp-") {
+            // Apply the complete export filter used by the DB query so
+            // the comparison stays apples-to-apples.
+            let ephemeral = value
+                .get("ephemeral")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if ephemeral || id.contains("-wisp-") {
                 continue;
             }
             jsonl_ids.insert(id.to_string());
@@ -10907,10 +10911,11 @@ fn check_jsonl(path: &Path, checks: &mut Vec<CheckResult>) -> Result<JsonlCountS
             Some(format!("Parsed {} records", summary.record_count)),
             Some(serde_json::json!({
                 "path": path.display().to_string(),
-                "records": summary.record_count
+                "records": summary.record_count,
+                "exportable_records": summary.exportable_record_count
             })),
         );
-        Ok(JsonlCountState::Available(summary.record_count))
+        Ok(JsonlCountState::Available(summary.exportable_record_count))
     } else {
         let preview = summary.preview_messages();
         push_check(
@@ -12944,12 +12949,14 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     // to legacy in-place writes or accidentally ignore --dry-run.
     let mut session: Option<DoctorRepairSession> = if args.repair {
         let repo_root = beads_dir.parent().unwrap_or(&beads_dir);
-        Some(DoctorRepairSession::new(repo_root, args.dry_run).map_err(|err| {
+        let mut session = DoctorRepairSession::new(repo_root, args.dry_run).map_err(|err| {
             BeadsError::Config(format!(
                 "Cannot run doctor --repair without a reversible repair session: failed to create doctor run directory ({err}). No repair writes were applied. Set {} to a writable directory if the workspace is read-only.",
                 run_dir::ENV_RUNS_DIR
             ))
-        })?)
+        })?;
+        authorize_selected_beads_dir(&mut session, &beads_dir);
+        Some(session)
     } else {
         None
     };
@@ -13963,6 +13970,27 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
     }
 
     Ok(())
+}
+
+/// Authorize the exact store selected after redirect resolution.
+///
+/// A routed workspace can resolve `.beads` to a sibling such as `_beads`,
+/// outside the repair session's default `<repo_root>/.beads` scope. Keep the
+/// grant narrow: the selected store itself, never its parent directory.
+fn authorize_selected_beads_dir(session: &mut DoctorRepairSession, beads_dir: &Path) {
+    if !session
+        .ctx
+        .capabilities
+        .write_scopes
+        .iter()
+        .any(|scope| scope == beads_dir)
+    {
+        session
+            .ctx
+            .capabilities
+            .write_scopes
+            .push(beads_dir.to_path_buf());
+    }
 }
 
 /// Build and emit the `br.doctor.triage.v1` envelope from a flat
@@ -16311,6 +16339,36 @@ mod tests {
         assert!(
             actions.is_empty(),
             "identical anchor must be a no-op: {actions}"
+        );
+    }
+
+    #[test]
+    fn authorize_selected_beads_dir_adds_exact_redirect_target_once() {
+        let temp = TempDir::new().unwrap();
+        let selected = temp.path().join("_beads");
+        fs::create_dir_all(&selected).unwrap();
+        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
+            .expect("session must build");
+
+        authorize_selected_beads_dir(&mut session, &selected);
+        authorize_selected_beads_dir(&mut session, &selected);
+
+        let selected_scopes = session
+            .ctx
+            .capabilities
+            .write_scopes
+            .iter()
+            .filter(|scope| *scope == &selected)
+            .count();
+        assert_eq!(selected_scopes, 1);
+        assert!(
+            !session
+                .ctx
+                .capabilities
+                .write_scopes
+                .iter()
+                .any(|scope| scope == temp.path()),
+            "redirect repair must not widen authority to the store parent"
         );
     }
 
@@ -20431,8 +20489,13 @@ mod tests {
     fn test_check_jsonl_returns_count_only_for_valid_records() -> Result<()> {
         let mut file = NamedTempFile::new().unwrap();
         let issue = sample_issue("bd-good01", "Good issue");
+        let mut ephemeral = sample_issue("bd-ephemeral", "Ephemeral issue");
+        ephemeral.ephemeral = true;
         let encoded = serde_json::to_string(&issue)?;
+        let ephemeral_encoded = serde_json::to_string(&ephemeral)?;
         std::io::Write::write_all(file.as_file_mut(), encoded.as_bytes())?;
+        std::io::Write::write_all(file.as_file_mut(), b"\n")?;
+        std::io::Write::write_all(file.as_file_mut(), ephemeral_encoded.as_bytes())?;
         std::io::Write::write_all(file.as_file_mut(), b"\n")?;
 
         let mut checks = Vec::new();
@@ -20441,6 +20504,9 @@ mod tests {
 
         let check = find_check(&checks, "jsonl.parse").expect("check present");
         assert!(matches!(check.status, CheckStatus::Ok));
+        let details = check.details.as_ref().expect("parse details");
+        assert_eq!(details["records"], 2);
+        assert_eq!(details["exportable_records"], 1);
 
         Ok(())
     }
@@ -25485,6 +25551,40 @@ version = "2026-05-11-abc123"
         assert!(
             delta.only_jsonl.is_empty(),
             "wisp ids must be filtered from the JSONL side too: {:?}",
+            delta.only_jsonl
+        );
+    }
+
+    #[test]
+    fn compute_db_jsonl_id_delta_skips_flagged_ephemeral_ids() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("beads.db");
+        let mut storage = SqliteStorage::open(&db_path).unwrap();
+        insert_minimal_issue(&mut storage, "bd-a");
+        drop(storage);
+
+        let jsonl_path = tmp.path().join("issues.jsonl");
+        let regular = sample_issue("bd-a", "Regular");
+        let mut ephemeral = sample_issue("bd-ephemeral", "Ephemeral");
+        ephemeral.ephemeral = true;
+        fs::write(
+            &jsonl_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&regular).unwrap(),
+                serde_json::to_string(&ephemeral).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let delta = compute_db_jsonl_id_delta(&conn, &jsonl_path).unwrap();
+
+        assert_eq!(delta.both_count, 1);
+        assert!(delta.only_db.is_empty(), "{:?}", delta.only_db);
+        assert!(
+            delta.only_jsonl.is_empty(),
+            "flagged ephemeral ids must be filtered from the JSONL side too: {:?}",
             delta.only_jsonl
         );
     }

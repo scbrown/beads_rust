@@ -9104,6 +9104,7 @@ pub(crate) struct JsonlIssueValidationFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct JsonlIssueValidationSummary {
     pub record_count: usize,
+    pub exportable_record_count: usize,
     pub invalid_count: usize,
     pub failures: Vec<JsonlIssueValidationFailure>,
 }
@@ -9158,6 +9159,8 @@ fn validate_jsonl_issue_records_from_reader(
                             .collect::<Vec<_>>()
                             .join(", "),
                     );
+                } else if !issue.ephemeral && !issue.id.contains("-wisp-") {
+                    summary.exportable_record_count += 1;
                 }
             }
             Err(err) => summary.push_failure(line_num + 1, err.to_string()),
@@ -10060,6 +10063,8 @@ pub(crate) fn ensure_no_conflict_markers_snapshot(source: &JsonlSourceSnapshot) 
 #[derive(Deserialize)]
 struct PartialId {
     id: String,
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 /// Analyze JSONL to get line count and unique issue IDs efficiently.
@@ -10074,15 +10079,17 @@ pub fn analyze_jsonl(path: &Path) -> Result<(usize, HashSet<String>)> {
         Err(e) => return Err(BeadsError::Io(e)),
     };
     path::validate_jsonl_fd_metadata(&file, path)?;
-    analyze_jsonl_from_reader(path, BufReader::new(file))
+    let (count, ids, _) = analyze_jsonl_from_reader(path, BufReader::new(file))?;
+    Ok((count, ids))
 }
 
 fn analyze_jsonl_from_reader(
     display_path: &Path,
     mut reader: impl BufRead,
-) -> Result<(usize, HashSet<String>)> {
+) -> Result<(usize, HashSet<String>, HashSet<String>)> {
     let mut count = 0;
     let mut ids = HashSet::new();
+    let mut exportable_ids = HashSet::new();
     let mut line_buf = String::new();
     let mut line_num = 0;
 
@@ -10110,15 +10117,25 @@ fn analyze_jsonl_from_reader(
                 line_num
             )));
         }
+        if !partial.ephemeral && !partial.id.contains("-wisp-") {
+            exportable_ids.insert(partial.id);
+        }
         count += 1;
     }
 
-    Ok((count, ids))
+    Ok((count, ids, exportable_ids))
 }
 
 pub(crate) fn analyze_jsonl_snapshot(
     source: &JsonlSourceSnapshot,
 ) -> Result<(usize, HashSet<String>)> {
+    let (count, ids, _) = analyze_jsonl_from_reader(source.display_path(), source.reader())?;
+    Ok((count, ids))
+}
+
+fn analyze_jsonl_snapshot_for_export(
+    source: &JsonlSourceSnapshot,
+) -> Result<(usize, HashSet<String>, HashSet<String>)> {
     analyze_jsonl_from_reader(source.display_path(), source.reader())
 }
 
@@ -10879,7 +10896,8 @@ fn export_to_jsonl_with_policy_expected_authority(
     if !config.force
         && let Some(previous_source) = previous_source
     {
-        let (jsonl_count, jsonl_ids) = analyze_jsonl_snapshot(previous_source)?;
+        let (jsonl_count, jsonl_ids, exportable_jsonl_ids) =
+            analyze_jsonl_snapshot_for_export(previous_source)?;
         // IDs the operator intentionally hard-deleted (purged) are expected
         // to disappear from the JSONL on the next export; they are not data
         // loss (#405).
@@ -10899,9 +10917,9 @@ fn export_to_jsonl_with_policy_expected_authority(
         }
 
         // Check 2: prevent exporting stale database that would lose issues
-        if !jsonl_ids.is_empty() {
+        if !exportable_jsonl_ids.is_empty() {
             let db_ids: HashSet<String> = export_ids.iter().cloned().collect();
-            let missing: Vec<_> = jsonl_ids
+            let missing: Vec<_> = exportable_jsonl_ids
                 .difference(&db_ids)
                 .filter(|id| !purged_ids.contains(id.as_str()))
                 .collect();
@@ -10921,7 +10939,7 @@ fn export_to_jsonl_with_policy_expected_authority(
                     "Refusing to export stale database that would lose issues.\n\
                      Database has {} issues, JSONL has {} unique issues.\n\
                      Export would lose {} issue(s): {}{}\n\
-                     Hint: Run import first, or use --force to override.",
+                     Hint: Run `br sync --import-only` first, or use --force to override.",
                     export_ids.len(),
                     jsonl_ids.len(),
                     missing_list.len(),
@@ -19773,6 +19791,63 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("stale database") || err.contains("lose"));
+    }
+
+    #[test]
+    fn test_stale_database_guard_ignores_jsonl_ephemeral_and_wisp_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        let regular = make_test_issue("bd-regular", "Regular issue");
+        let mut ephemeral = make_test_issue("bd-ephemeral", "Ephemeral issue");
+        ephemeral.ephemeral = true;
+        let wisp = make_test_issue("bd-wisp-session", "Legacy wisp");
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&regular).unwrap(),
+            serde_json::to_string(&ephemeral).unwrap(),
+            serde_json::to_string(&wisp).unwrap()
+        );
+        fs::write(&output_path, content).unwrap();
+        storage.create_issue(&regular, "test").unwrap();
+
+        let result = export_to_jsonl(&storage, &output_path, &ExportConfig::default()).unwrap();
+
+        assert_eq!(result.exported_ids, vec![regular.id.clone()]);
+        let (_, exported_ids) = analyze_jsonl(&output_path).unwrap();
+        assert_eq!(exported_ids, HashSet::from([regular.id]));
+    }
+
+    #[test]
+    fn test_stale_database_guard_still_rejects_real_loss_beside_ephemeral_rows() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let temp_dir = TempDir::new().unwrap();
+        let output_path = temp_dir.path().join("issues.jsonl");
+
+        let regular = make_test_issue("bd-regular", "Regular issue");
+        let missing = make_test_issue("bd-missing", "Missing regular issue");
+        let mut ephemeral = make_test_issue("bd-ephemeral", "Ephemeral issue");
+        ephemeral.ephemeral = true;
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string(&regular).unwrap(),
+            serde_json::to_string(&missing).unwrap(),
+            serde_json::to_string(&ephemeral).unwrap()
+        );
+        fs::write(&output_path, content).unwrap();
+        storage.create_issue(&regular, "test").unwrap();
+
+        let err = export_to_jsonl(&storage, &output_path, &ExportConfig::default())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("bd-missing"), "unexpected error: {err}");
+        assert!(!err.contains("bd-ephemeral"), "unexpected error: {err}");
+        assert!(
+            err.contains("br sync --import-only"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

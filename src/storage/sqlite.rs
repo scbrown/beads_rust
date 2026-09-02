@@ -2545,6 +2545,77 @@ impl SqliteStorage {
         }))
     }
 
+    /// Open a private byte snapshot of a database family for an observational
+    /// read while the caller holds the live family's write authority.
+    ///
+    /// FrankenSQLite's WAL reader updates the live `-shm` coordination file
+    /// even for `SQLITE_OPEN_READ_ONLY`.  Authority-gated mutation checks must
+    /// leave every live family member byte-identical, so copy the durable
+    /// database/WAL inputs to a scratch family and let the engine mutate only
+    /// scratch coordination sidecars.
+    fn open_current_read_only_snapshot_under_authority(
+        path: &Path,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<Option<Self>> {
+        static SNAPSHOT_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
+        let count = SNAPSHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snapshot_path = std::env::temp_dir().join(format!(
+            "beads_read_snapshot_{}_{}.db",
+            std::process::id(),
+            count
+        ));
+        remove_temp_db_files(&snapshot_path);
+
+        let copy_result = (|| {
+            authority.verify_database_authority()?;
+            for suffix in ["", "-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
+                let source_path = database_sidecar_path(path, suffix);
+                let description = if suffix.is_empty() {
+                    "database"
+                } else {
+                    "database sidecar"
+                };
+                let Some(mut source) =
+                    StableSchemaSource::open_optional(&source_path, description)?
+                else {
+                    continue;
+                };
+                let destination = database_sidecar_path(&snapshot_path, suffix);
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)?;
+                std::io::copy(&mut source.file, &mut output)?;
+                output.sync_all()?;
+                source.verify_path(&source_path, description)?;
+                authority.verify_database_authority()?;
+            }
+            Ok::<(), BeadsError>(())
+        })();
+        if let Err(error) = copy_result {
+            remove_temp_db_files(&snapshot_path);
+            return Err(error);
+        }
+
+        let opened = Self::open_current_read_only(&snapshot_path);
+        match opened {
+            Ok(Some(mut storage)) => {
+                storage.temp_db_path = Some(snapshot_path);
+                Ok(Some(storage))
+            }
+            Ok(None) => {
+                remove_temp_db_files(&snapshot_path);
+                Ok(None)
+            }
+            Err(error) => {
+                remove_temp_db_files(&snapshot_path);
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
         // A current version stamp is not a complete runtime witness: reviewed
         // migrations and interrupted/manual repairs can leave any required
@@ -19806,7 +19877,9 @@ impl SqliteStorage {
                     .to_string(),
             });
         }
-        let Some(mut storage) = Self::open_current_read_only(path)? else {
+        let Some(mut storage) =
+            Self::open_current_read_only_snapshot_under_authority(path, authority)?
+        else {
             let found = effective_database_user_version(path)?;
             return match found {
                 Some(found) => Err(BeadsError::SchemaMismatch {

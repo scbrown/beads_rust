@@ -335,7 +335,7 @@ jobs:
       # A cold release build exceeded the hosted runner's memory and was
       # killed with SIGTERM before Criterion started. Bound compilation
       # concurrency so the regression gate actually reaches its benchmark.
-      CARGO_BUILD_JOBS: 2
+      CARGO_BUILD_JOBS: 1
     # Reuse the Linux build job's populated Rust cache instead of starting a
     # second cold release build in the initial fan-out. Two cold benchmark
     # runners were preempted before Criterion started.
@@ -476,6 +476,11 @@ jobs:
     name: Quick E2E
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Keep hosted-runner resource use bounded and fail a hanging smoke test
+      # quickly enough to report the test, rather than losing the runner.
+      CARGO_BUILD_JOBS: 1
+      E2E_TIMEOUT: 60
     # The first hosted run spent 7m48s on its cold build, leaving only two
     # minutes for six tests. Start after the build matrix so rust-cache can
     # restore compiled artifacts and retain a real test budget.

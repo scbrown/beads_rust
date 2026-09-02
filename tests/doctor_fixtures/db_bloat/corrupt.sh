@@ -18,15 +18,12 @@ cd "$target_dir"
 
 # The detector intentionally ignores tiny workspaces. Keep this comfortably
 # above DB_BLOAT_MIN_JSONL_BYTES (1 MiB) with a single valid issue record.
+# Create it through the public CLI so this fixture follows the current JSONL
+# schema instead of carrying a hand-written record that normalization rejects.
 payload_file=".fixture_large_description"
 head -c 1200000 /dev/zero | tr '\0' 'x' > "$payload_file"
-{
-  printf '{"id":"bd-bloat-001","title":"db bloat fixture","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","assignee":null,"labels":[],"description":"'
-  cat "$payload_file"
-  printf '","acceptance_criteria":"","dependencies":[],"epic_id":null,"discovered_by":null,"discovered_from":null,"source_repo":null,"design":null,"notes":null,"closed_at":null,"close_reason":null}\n'
-} > .beads/issues.jsonl
-
-"$tool_bin" sync --import-only --rebuild >/dev/null 2>&1
+"$tool_bin" create "db bloat fixture" --type task --priority 2 \
+  --description-file "$payload_file" >/dev/null
 "$tool_bin" sync --flush-only >/dev/null 2>&1
 
 sqlite3 .beads/beads.db 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA integrity_check;' \
@@ -50,4 +47,3 @@ if [ -e .fixture_baseline ]; then
 fi
 mkdir -p .fixture_baseline
 tar --exclude=.fixture_baseline -cf .fixture_baseline/state.tar .
-

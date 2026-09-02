@@ -372,14 +372,10 @@ jobs:
           fi
 
       - name: Run benchmarks
-        run: |
-          set -euo pipefail
-          if find target/criterion -path "*/main/estimates.json" -type f 2>/dev/null | grep -q .; then
-            cargo bench --bench storage_perf -- --baseline main --save-baseline main
-          else
-            cargo bench --bench storage_perf -- --save-baseline main
-          fi
-        continue-on-error: true
+        # The previous baseline was copied aside above, so this run only needs
+        # to replace `main`. Criterion rejects --baseline and --save-baseline
+        # together; allowing that exit to continue made a non-run look green.
+        run: cargo bench --bench storage_perf -- --save-baseline main
 
       - name: Check benchmark regressions (10% threshold)
         run: |

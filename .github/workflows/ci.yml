@@ -330,7 +330,9 @@ jobs:
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # A cold single-job release build takes about 27 minutes on hosted runners;
+    # leave enough wall time for Criterion to run after compilation completes.
+    timeout-minutes: 60
     env:
       # A cold release build exceeded the hosted runner's memory and was
       # killed with SIGTERM before Criterion started. Bound compilation

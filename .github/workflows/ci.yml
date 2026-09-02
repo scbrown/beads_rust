@@ -168,7 +168,9 @@ jobs:
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
 
       - name: Install cargo-insta
-        run: cargo install cargo-insta --locked --version 1.46.1
+        # Tool installation must not inherit the repository's pinned nightly:
+        # cargo-insta's locked rustix 0.37 dependency is incompatible with it.
+        run: cargo +stable install cargo-insta --locked --version 1.46.1
 
       - name: Build release br binary (used by shell harnesses)
         run: cargo build --release
@@ -314,7 +316,12 @@ jobs:
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      # A cold release build exceeded the hosted runner's memory and was
+      # killed with SIGTERM before Criterion started. Bound compilation
+      # concurrency so the regression gate actually reaches its benchmark.
+      CARGO_BUILD_JOBS: 2
     needs: check
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:

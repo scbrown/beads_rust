@@ -322,7 +322,10 @@ jobs:
       # killed with SIGTERM before Criterion started. Bound compilation
       # concurrency so the regression gate actually reaches its benchmark.
       CARGO_BUILD_JOBS: 2
-    needs: check
+    # Reuse the Linux build job's populated Rust cache instead of starting a
+    # second cold release build in the initial fan-out. Two cold benchmark
+    # runners were preempted before Criterion started.
+    needs: [check, build]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -456,8 +459,11 @@ jobs:
   e2e-quick:
     name: Quick E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: check
+    timeout-minutes: 30
+    # The first hosted run spent 7m48s on its cold build, leaving only two
+    # minutes for six tests. Start after the build matrix so rust-cache can
+    # restore compiled artifacts and retain a real test budget.
+    needs: [check, build]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

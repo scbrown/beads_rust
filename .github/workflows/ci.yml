@@ -168,7 +168,9 @@ jobs:
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
 
       - name: Install cargo-insta
-        run: cargo install cargo-insta --locked --version 1.46.1
+        # Tool installation must not inherit the repository's pinned nightly:
+        # cargo-insta's locked rustix 0.37 dependency is incompatible with it.
+        run: cargo +stable install cargo-insta --locked --version 1.46.1
 
       - name: Build release br binary (used by shell harnesses)
         run: cargo build --release
@@ -314,8 +316,16 @@ jobs:
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: check
+    timeout-minutes: 30
+    env:
+      # A cold release build exceeded the hosted runner's memory and was
+      # killed with SIGTERM before Criterion started. Bound compilation
+      # concurrency so the regression gate actually reaches its benchmark.
+      CARGO_BUILD_JOBS: 2
+    # Reuse the Linux build job's populated Rust cache instead of starting a
+    # second cold release build in the initial fan-out. Two cold benchmark
+    # runners were preempted before Criterion started.
+    needs: [check, build]
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -449,8 +459,11 @@ jobs:
   e2e-quick:
     name: Quick E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    needs: check
+    timeout-minutes: 30
+    # The first hosted run spent 7m48s on its cold build, leaving only two
+    # minutes for six tests. Start after the build matrix so rust-cache can
+    # restore compiled artifacts and retain a real test budget.
+    needs: [check, build]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

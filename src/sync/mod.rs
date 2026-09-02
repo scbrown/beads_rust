@@ -22875,7 +22875,7 @@ mod tests {
             .expect("legacy labels should pass normalized import validation");
         let mut expected_labels = issue.labels;
         expected_labels.sort();
-        assert_eq!(parsed.labels, expected_labels);
+        assert_eq!(parsed.0.labels, expected_labels);
     }
 
     #[test]

@@ -398,7 +398,7 @@ The resource surface is `beads://project/info`, `beads://issues/{id}`,
 
 ```bash
 br --version
-# br 0.5.2
+# br 0.5.7
 ```
 
 ### Verify Release Signatures
@@ -908,6 +908,11 @@ wanted.
 | Sync uses an allowlist for writes | Default writes stay in `.beads/`; external JSONL paths require `--allow-external-jsonl` or an explicit external DB/JSONL family and `.git/` paths are still rejected |
 | Checked publication and transactions | JSONL/base/manifest publication uses checked temporary replacement; database mutations use transactions and operation-specific rollback |
 | No data loss | Guards prevent overwriting non-empty JSONL with empty DB |
+
+The storage engine is FrankenSQLite (pure Rust, no C SQLite). How br contains
+engine-level risk, which sidecar files belong to a database, and what must
+pass before the engine is bumped are documented in
+[docs/reliability/ENGINE_OPERATING_MODEL.md](docs/reliability/ENGINE_OPERATING_MODEL.md).
 
 ---
 

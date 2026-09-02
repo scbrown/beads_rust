@@ -912,6 +912,10 @@ pub(crate) const CHECK_NAME_TO_FINDING_ID: &[(&str, &str)] = &[
     ("db.open", FM_SQLITE_PAGE_MALFORMED),
     ("db.sidecars", FM_WAL_SHM_SIDECAR_ORPHAN),
     (
+        "db.read_only_open_observational",
+        "fm-state_files-read-only-open-not-observational",
+    ),
+    (
         "db.recovery_artifacts",
         "fm-state_files-recovery-artifacts-orphaned",
     ),
@@ -12542,6 +12546,75 @@ fn emit_fully_unblocked_open(
     );
 }
 
+/// Runtime witness for the read-only contract (GitHub #476).
+///
+/// On a private copy of the database family, a current-schema read-only open
+/// must leave the main file, WAL, and rollback journal byte-identical and may
+/// touch the WAL-index only inside the reader-mark array. The unit test that
+/// pins this contract only runs in CI; this check runs it against the engine
+/// and database actually installed, so an engine bump that starts writing on
+/// open shows up in `br doctor` instead of in a user's corrupted workspace.
+/// Warn-level because the probe runs on a copy and never on the caller's
+/// database.
+fn check_read_only_open_observational(db_path: &Path, checks: &mut Vec<CheckResult>) -> Result<()> {
+    const NAME: &str = "db.read_only_open_observational";
+    let probe = crate::storage::sqlite::probe_read_only_open_is_observational(db_path)?;
+    if let Some(reason) = &probe.skipped {
+        push_check(
+            checks,
+            NAME,
+            CheckStatus::Ok,
+            Some(format!("Read-only open probe skipped: {reason}")),
+            Some(serde_json::json!({ "skipped": reason })),
+        );
+        return Ok(());
+    }
+    if !probe.opened {
+        push_check(
+            checks,
+            NAME,
+            CheckStatus::Ok,
+            Some(
+                "Read-only current-schema open is not applicable (schema is not current or a sidecar repair is pending)"
+                    .to_string(),
+            ),
+            Some(serde_json::json!({
+                "opened": false,
+                "copied_bytes": probe.copied_bytes,
+            })),
+        );
+        return Ok(());
+    }
+    if probe.diffs.is_empty() {
+        push_check(
+            checks,
+            NAME,
+            CheckStatus::Ok,
+            None,
+            Some(serde_json::json!({
+                "opened": true,
+                "copied_bytes": probe.copied_bytes,
+            })),
+        );
+        return Ok(());
+    }
+    push_check(
+        checks,
+        NAME,
+        CheckStatus::Warn,
+        Some(format!(
+            "Read-only open changed {} database-family artifact(s) outside the WAL-index reader-mark exemption",
+            probe.diffs.len()
+        )),
+        Some(serde_json::json!({
+            "opened": true,
+            "copied_bytes": probe.copied_bytes,
+            "diffs": probe.diffs,
+        })),
+    );
+    Ok(())
+}
+
 fn inspect_doctor_database(
     beads_dir: &Path,
     db_path: &Path,
@@ -12584,6 +12657,14 @@ fn inspect_doctor_database(
     }
 
     if db_path.exists() {
+        if let Err(err) = check_read_only_open_observational(db_path, checks) {
+            push_inspection_error(
+                checks,
+                "db.read_only_open_observational",
+                "Failed to probe the read-only open contract",
+                &err,
+            );
+        }
         inspect_existing_doctor_database(db_path, jsonl_path, jsonl_count, mode, checks);
     } else {
         push_check(
@@ -14190,30 +14271,55 @@ mod tests {
         (temp, db_path)
     }
 
+    #[test]
+    fn read_only_open_probe_check_is_ok_on_a_healthy_database() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("beads.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+
+        let mut checks = Vec::new();
+        check_read_only_open_observational(&db_path, &mut checks).unwrap();
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].name, "db.read_only_open_observational");
+        assert!(
+            matches!(checks[0].status, CheckStatus::Ok),
+            "expected Ok, got {:?}: {:?}",
+            checks[0].status,
+            checks[0].message
+        );
+        let details = checks[0].details.as_ref().expect("details");
+        assert_eq!(details["opened"], serde_json::Value::Bool(true));
+        assert_eq!(
+            details["finding_id"],
+            serde_json::Value::String(
+                "fm-state_files-read-only-open-not-observational".to_string()
+            )
+        );
+    }
+
     fn database_family_bytes(db_path: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
-        ["", "-wal", "-shm", "-journal"]
-            .into_iter()
-            .map(|suffix| {
-                let path = if suffix.is_empty() {
-                    db_path.to_path_buf()
-                } else {
-                    PathBuf::from(format!("{}{suffix}", db_path.to_string_lossy()))
-                };
-                let bytes = match fs::read(&path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) => {
-                        assert_eq!(
-                            error.kind(),
-                            io::ErrorKind::NotFound,
-                            "read database-family artifact {}: {error}",
-                            path.display()
-                        );
-                        None
-                    }
-                };
-                (suffix.to_string(), bytes)
-            })
-            .collect()
+        crate::storage::sqlite::database_family_snapshot(db_path).expect("read database family")
+    }
+
+    /// Assert that a read-only operation left the database family untouched:
+    /// the main file, WAL, and rollback journal must be byte-identical, and the
+    /// WAL-index (`-shm`) may differ only inside the reader-mark array
+    /// (`crate::storage::sqlite::SHM_READ_MARK_RANGE`, GitHub #476).
+    ///
+    /// The comparison itself lives in the storage layer so this test, the
+    /// storage-level tests, and the `db.read_only_open_observational` doctor
+    /// check all enforce one definition of the contract. Failures name the
+    /// artifact and the first differing offsets instead of dumping whole files.
+    fn assert_database_family_read_only(
+        before: &BTreeMap<String, Option<Vec<u8>>>,
+        after: &BTreeMap<String, Option<Vec<u8>>>,
+        context: &str,
+    ) {
+        let diffs = crate::storage::sqlite::database_family_read_only_diffs(before, after);
+        assert!(
+            diffs.is_empty(),
+            "{context}: read-only contract violated: {diffs:#?}"
+        );
     }
 
     fn run_br(cwd: &Path, args: &[&str]) -> std::process::Output {
@@ -14282,10 +14388,13 @@ mod tests {
             state.receipt_id.as_deref(),
             Some(receipt.receipt_id.as_str())
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before,
-            "read-only authority inspection must not change DB/WAL/SHM/journal bytes"
+        // The main file, WAL, and journal must be byte-identical; the
+        // WAL-index may only carry the reader mark the WAL read lock
+        // registered (GitHub #476).
+        assert_database_family_read_only(
+            &before,
+            &database_family_bytes(&db_path),
+            "read-only authority inspection",
         );
     }
 
@@ -14546,10 +14655,10 @@ mod tests {
             "newer JSONL was imported despite the pending gate:\n{}",
             String::from_utf8_lossy(&output.stdout)
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "read-only command changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "read-only command",
         );
         assert_eq!(
             inspect_pending_sync_merge_at_path(&db_path)
@@ -14584,10 +14693,10 @@ mod tests {
             rendered.contains("Refusing non-merge mutation") && rendered.contains("sync-merge"),
             "wrong refusal:\n{rendered}"
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "refused mutation changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "refused mutation",
         );
         assert_eq!(
             fs::read(&jsonl_path).expect("read JSONL after mutation"),
@@ -14633,10 +14742,10 @@ mod tests {
                 && rendered.contains("sync --merge"),
             "wrong no-DB refusal:\n{rendered}"
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "refused no-DB mutation changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "refused no-DB mutation",
         );
         assert_eq!(
             fs::read(&jsonl_path).expect("read JSONL after no-DB mutation"),
@@ -14672,10 +14781,10 @@ mod tests {
             report_rendered.contains("sync.merge_pending"),
             "doctor omitted the dedicated pending finding:\n{report_rendered}"
         );
-        assert_eq!(
-            database_family_bytes(&db_path),
-            before_bytes,
-            "read-only doctor changed database-family bytes"
+        assert_database_family_read_only(
+            &before_bytes,
+            &database_family_bytes(&db_path),
+            "read-only doctor",
         );
 
         let cases: &[(&str, &[&str])] = &[
@@ -14702,10 +14811,10 @@ mod tests {
                 rendered.contains("sync.merge_pending"),
                 "{name} omitted structured gate evidence:\n{rendered}"
             );
-            assert_eq!(
-                database_family_bytes(&db_path),
-                before_bytes,
-                "{name} changed database-family bytes"
+            assert_database_family_read_only(
+                &before_bytes,
+                &database_family_bytes(&db_path),
+                &format!("refused {name}"),
             );
         }
 

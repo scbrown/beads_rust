@@ -13,7 +13,8 @@ case "$stage" in
     # WAL index in process-local memory rather than a sibling SHM file.
     echo "$out" | jq -e '
       .checks[] | select(.name == "db.sidecars") | select(.status == "ok")
-      | select(.message | test("WAL sidecar"; "i"))
+      | select(.details.finding_id == "fm-state_files-wal-shm-sidecar-orphan")
+      | select(.message | test("WAL-only family is expected for frankensqlite"; "i"))
     ' >/dev/null || {
       echo "ASSERT FAIL[$stage]: db.sidecars not healthy for valid WAL-without-SHM" >&2
       echo "$out" | jq '.checks[] | select(.name == "db.sidecars")' >&2

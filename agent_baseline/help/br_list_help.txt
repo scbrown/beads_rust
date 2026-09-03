@@ -43,7 +43,7 @@ Options:
           Notes contains substring
 
   -a, --all
-          Include closed issues (default excludes closed)
+          Include closed issues (ephemeral rows remain visible but are not exported)
 
       --limit <LIMIT>
           Maximum number of results (0 = unlimited; default: unlimited — the full work surface)
@@ -68,6 +68,9 @@ Options:
 
       --pretty
           Use tree/pretty output format
+
+      --tree
+          Group children under their parents with tree connectors (text output). Hierarchy follows dotted child IDs (`bd-abc.2` under `bd-abc`); a child whose parent is filtered out of the result set is shown at the top level (GitHub #475)
 
       --wrap
           Wrap long lines instead of truncating in text output

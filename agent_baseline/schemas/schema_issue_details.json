@@ -120,6 +120,30 @@
             "null"
           ]
         },
+        "bypassed_policy": {
+          "description": "Close-policy bypass audit trail (GitHub #474). Serialized into the\nJSONL export only when the close bypassed policy so a bypassed close\nis reviewable off-machine; absent means \"not bypassed\" (pre-change\nexports stay valid). Backed by the DB-only `close_metadata` table;\nexcluded from `content_hash` and from `sync_equals`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "bypass_reason": {
+          "description": "Operator-supplied reason for the policy bypass (GitHub #474).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "policy_gates_fired": {
+          "description": "Names of the close-policy gates the bypass overrode (GitHub #474).",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
         "due_at": {
           "description": "Due date.",
           "type": [

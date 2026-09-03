@@ -17485,7 +17485,7 @@ pub(crate) struct ReadOnlyOpenProbe {
 }
 
 /// Prove, on a private copy of the database family, that
-/// [`SqliteStorage::open_current_read_only`] is observational.
+/// [`SqliteStorage::open_current_read_only_snapshot`] is observational.
 ///
 /// Every file that shares the database's name prefix (the main file, the
 /// WAL/SHM/journal sidecars, and fsqlite's namespace and certificate
@@ -17538,7 +17538,7 @@ pub(crate) fn probe_read_only_open_is_observational(db_path: &Path) -> Result<Re
     }
 
     let before = database_family_snapshot(&copy_path)?;
-    let opened = match SqliteStorage::open_current_read_only(&copy_path)? {
+    let opened = match SqliteStorage::open_current_read_only_snapshot(&copy_path)? {
         Some(storage) => {
             drop(storage);
             true
@@ -31548,6 +31548,27 @@ mod tests {
             SqliteStorage::open_current_read_only(&db_path)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn probe_read_only_open_is_observational_without_live_shm() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("probe_wal_only.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+        let shm_path = database_family_member_path(&db_path, "-shm");
+        std::fs::remove_file(&shm_path).unwrap();
+
+        let probe = probe_read_only_open_is_observational(&db_path).unwrap();
+        assert!(probe.opened);
+        assert!(
+            probe.diffs.is_empty(),
+            "snapshot read created a database-family diff: {:#?}",
+            probe.diffs
+        );
+        assert!(
+            !shm_path.exists(),
+            "observational probe must not recreate the caller's SHM"
         );
     }
 

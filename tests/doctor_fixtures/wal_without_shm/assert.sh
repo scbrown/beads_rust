@@ -14,7 +14,7 @@ case "$stage" in
     echo "$out" | jq -e '
       .checks[] | select(.name == "db.sidecars") | select(.status == "ok")
       | select(.details.finding_id == "fm-state_files-wal-shm-sidecar-orphan")
-      | select(.message | test("WAL-only family is expected for frankensqlite"; "i"))
+      | select(.message | test("WAL sidecar exists without a matching SHM sidecar.*expected for frankensqlite"; "i"))
     ' >/dev/null || {
       echo "ASSERT FAIL[$stage]: db.sidecars not healthy for valid WAL-without-SHM" >&2
       echo "$out" | jq '.checks[] | select(.name == "db.sidecars")' >&2

@@ -535,8 +535,14 @@ fn test_version_metadata_matches_cargo() {
     let readme = fs::read_to_string("README.md").expect("Failed to read README.md");
     let readme_version = readme
         .lines()
-        .find_map(|line| line.trim().strip_prefix("# br "))
+        .filter_map(|line| line.trim().strip_prefix("# br "))
         .map(str::trim)
+        .find(|value| {
+            !value.is_empty()
+                && value
+                    .split('.')
+                    .all(|component| component.parse::<u64>().is_ok())
+        })
         .expect("README.md must show `# br <version>` under Verify Installation");
     assert_eq!(
         readme_version, cargo_version,

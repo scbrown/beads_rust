@@ -84,6 +84,7 @@ fn make_local_changes(workspace: &BrWorkspace) {
                 id,
                 "--description",
                 description.as_str(),
+                "--force",
                 "--no-auto-flush",
             ],
             &format!("local_update_{id}"),

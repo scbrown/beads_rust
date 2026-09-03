@@ -338,6 +338,10 @@ jobs:
       # killed with SIGTERM before Criterion started. Bound compilation
       # concurrency so the regression gate actually reaches its benchmark.
       CARGO_BUILD_JOBS: 1
+      # Criterion's default 100 samples made one batch case request 266s and
+      # left delete/single collecting until the 60-minute job timeout. Ten is
+      # Criterion's supported minimum and keeps the CI regression gate bounded.
+      BENCH_SAMPLE_SIZE: 10
     # Reuse the Linux build job's populated Rust cache instead of starting a
     # second cold release build in the initial fan-out. Two cold benchmark
     # runners were preempted before Criterion started.

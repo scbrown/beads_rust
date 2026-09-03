@@ -3070,6 +3070,7 @@ fn e2e_parallel_writes_preserve_large_description_and_freelist() {
                                     &issue_id,
                                     "--notes",
                                     &format!("overflow write {worker}-{index}"),
+                                    "--force",
                                     "--json",
                                 ],
                             )

@@ -482,7 +482,7 @@ jobs:
       # Keep hosted-runner resource use bounded and fail a hanging smoke test
       # quickly enough to report the test, rather than losing the runner.
       CARGO_BUILD_JOBS: 1
-      E2E_TIMEOUT: 60
+      E2E_TIMEOUT: 180
     # The first hosted run spent 7m48s on its cold build, leaving only two
     # minutes for six tests. Start after the build matrix so rust-cache can
     # restore compiled artifacts and retain a real test budget.

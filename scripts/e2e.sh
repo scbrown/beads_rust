@@ -92,7 +92,19 @@ done
 # Ensure build is up to date
 log "Building br binary..."
 cd "$PROJECT_ROOT"
-cargo build --release --quiet 2>/dev/null || cargo build --release
+cargo build --quiet 2>/dev/null || cargo build
+
+# Compile the selected integration-test binaries before applying the per-test
+# timeout. On a cold runner, linking each distinct test target can exceed the
+# runtime budget even when the test itself completes in seconds. The workflow's
+# job timeout still bounds compilation; E2E_TIMEOUT now measures execution.
+log "Precompiling quick E2E test binaries..."
+for test in "${QUICK_TESTS[@]}"; do
+    if [[ -n "$FILTER" ]] && [[ ! "$test" =~ $FILTER ]]; then
+        continue
+    fi
+    cargo test --test "$test" --no-run --quiet
+done
 
 # Create artifacts directory
 mkdir -p "$ARTIFACTS_DIR"
@@ -119,7 +131,7 @@ for test in "${QUICK_TESTS[@]}"; do
     TEST_START=$(date +%s.%N)
 
     if [[ "$VERBOSE" -eq 1 ]]; then
-        if timeout "$TIMEOUT" cargo test --release --test "$test" -- --nocapture 2>&1; then
+        if timeout "$TIMEOUT" cargo test --test "$test" -- --nocapture 2>&1; then
             RESULT="pass"
             PASSED=$((PASSED + 1))
         else
@@ -127,7 +139,7 @@ for test in "${QUICK_TESTS[@]}"; do
             FAILED=$((FAILED + 1))
         fi
     else
-        if timeout "$TIMEOUT" cargo test --release --test "$test" -- --nocapture >/dev/null 2>&1; then
+        if timeout "$TIMEOUT" cargo test --test "$test" -- --nocapture >/dev/null 2>&1; then
             RESULT="pass"
             PASSED=$((PASSED + 1))
         else

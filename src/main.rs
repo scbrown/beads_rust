@@ -3236,12 +3236,19 @@ mod tests {
 
         let displaced_path = beads_dir.join("beads.displaced.db");
         fs::rename(&paths.db_path, &displaced_path).expect("displace original database");
-        let mut replacement = beads_rust::storage::SqliteStorage::open(&paths.db_path)
+        // Model an external atomic replacement: construct and close the new
+        // database under a different pathname, then rename it over the
+        // canonical name. Opening the canonical pathname while the displaced
+        // inode is still live leaves that pathname's fsqlite namespace owned
+        // by the old handle and is not how an atomic producer publishes a DB.
+        let replacement_path = beads_dir.join("beads.replacement.db");
+        let mut replacement = beads_rust::storage::SqliteStorage::open(&replacement_path)
             .expect("create canonical replacement");
         replacement
             .set_metadata("fast_open_inode_marker", "replacement")
             .expect("mark replacement database");
         drop(replacement);
+        fs::rename(&replacement_path, &paths.db_path).expect("publish canonical replacement");
 
         let authority = Arc::new(
             beads_rust::sync::blocking_database_family_write_lock_with_timeout(

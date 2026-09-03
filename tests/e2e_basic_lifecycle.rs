@@ -612,6 +612,7 @@ fn e2e_update_description_file_preserves_exact_content() {
             issue_id.clone(),
             "--description-file".to_string(),
             empty_path.display().to_string(),
+            "--force".to_string(),
         ],
         "update_description_from_empty_file",
     );

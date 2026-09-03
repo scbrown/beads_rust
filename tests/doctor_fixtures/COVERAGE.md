@@ -69,6 +69,7 @@ invocation (env override or flag) to pin the finding/check contract;
 | fm-state_files-no-db-mode-db-checks-skipped | no_db_mode_marker | assert: the fixture's assert.sh runs `br doctor --no-db --json` and pins the ok-status marker check + finding id; a full run must not carry the marker |
 | fm-state_files-orphan-tmp-files | orphan_tmp_quarantine | detect |
 | fm-state_files-orphaned-write-lock | permissions_write_lock_unwritable | detect: env-skip protocol (exit 3) on hosts where permission bits do not bind (root / CAP_DAC_OVERRIDE) |
+| fm-state_files-read-only-open-not-observational | healthy_workspace_baseline | assert: the healthy baseline pins that an observational doctor read leaves the database family byte-identical; dedicated read-only storage regressions exercise the emitted finding path |
 | fm-state_files-recovery-artifacts-orphaned | recovery_artifacts_orphaned, recovery_artifacts_aged | detect |
 | fm-state_files-sqlite-page-malformed | sqlite_page_malformed, doctor_mutates_without_fix | detect |
 | fm-state_files-sync-merge-pending | — | exception: the id is emitted by the `sync.merge_pending` refuse gate, which fires only while a committed `br sync --merge` saga is still unreconciled. Planting one means writing the pending-merge metadata row by hand, and any repair stage then refuses every mutation by design, so a fixture round-trip would assert nothing beyond the refusal already covered by `cli::commands::doctor::tests::pending_sync_merge_read_only_inspector_rejects_duplicate_and_empty_rows` |

@@ -203,6 +203,7 @@ fn e2e_create_agent_context_file_forms() {
             &id_json,
             "--agent-context",
             &format!("@{}", yaml_path.display()),
+            "--force",
             "--no-auto-flush",
             "--no-auto-import",
         ],

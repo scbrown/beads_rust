@@ -13755,7 +13755,15 @@ fn verify_applied_import_issue_semantics(
         .map(|issue| (issue.id.clone(), issue))
         .collect::<HashMap<_, _>>();
 
-    for expected in expected_issues {
+    let mut verified_ids = HashSet::new();
+    for expected in expected_issues.iter().rev() {
+        // Multiple JSONL records may intentionally resolve to the same issue
+        // through different collision keys. The database contains the final
+        // applied payload, so intermediate payloads are not valid post-state
+        // expectations.
+        if !verified_ids.insert(expected.id.clone()) {
+            continue;
+        }
         let actual = actual_by_id.get(&expected.id).ok_or_else(|| {
             BeadsError::SyncConflict {
                 message: format!(

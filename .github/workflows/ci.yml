@@ -77,7 +77,9 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # The all-features suite can exceed an hour on a cold hosted runner now
+    # that the recovery fixtures exercise full, disk-backed reconciliation.
+    timeout-minutes: 90
     needs: check
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -156,7 +158,9 @@ jobs:
   audit-gates:
     name: Audit Guardrails (2026-05-09)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Snapshot freshness performs a release build plus the full fixture corpus.
+    # A 60-minute cap canceled healthy runs before later witnesses could start.
+    timeout-minutes: 90
     needs: check
     # Gates added by beads_rust-6jmq for the audit-driven cleanup EPIC
     # (beads_rust-ebzi). Each step corresponds to a sibling bead's harness:
@@ -477,7 +481,9 @@ jobs:
   e2e-quick:
     name: Quick E2E
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Cold precompilation of the six independent integration-test targets can
+    # consume the former 30-minute budget before their fast test bodies run.
+    timeout-minutes: 60
     env:
       # Keep hosted-runner resource use bounded and fail a hanging smoke test
       # quickly enough to report the test, rather than losing the runner.

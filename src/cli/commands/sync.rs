@@ -659,6 +659,24 @@ pub fn execute(
         return execute_witness(&path_policy, args, ctx.is_json() || args.robot, ctx);
     }
 
+    if args.reconcile && args.dry_run {
+        let (_, startup, path_policy) = resolve_sync_startup_paths(args, cli)?;
+        let mut storage =
+            crate::storage::SqliteStorage::open_current_read_only_snapshot(&startup.paths.db_path)?
+                .ok_or_else(|| {
+                    BeadsError::Config(
+                        "Reconcile requires an existing current-schema database".to_string(),
+                    )
+                })?;
+        return execute_reconcile(
+            &mut storage,
+            &path_policy,
+            args,
+            ctx.is_json() || args.robot,
+            ctx,
+        );
+    }
+
     if args.reconcile_additive && !args.apply {
         let beads_dir = config::discover_beads_dir_with_cli(cli)?;
         let plan = plan_reviewed_additive_reconcile(&ReviewedAdditiveReconcilePlanRequest {

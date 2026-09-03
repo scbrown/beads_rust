@@ -4563,7 +4563,7 @@ pub fn plan_reviewed_additive_reconcile(
     let (canonical_beads, canonical_database, configured_source, database_identity) =
         resolve_reviewed_additive_workspace(&request.beads_dir, request.db_override.as_ref())?;
     let storage = redact_reviewed_path_result(
-        SqliteStorage::open_current_read_only(&canonical_database),
+        SqliteStorage::open_current_read_only_snapshot(&canonical_database),
         &canonical_database,
         "database",
         "open",

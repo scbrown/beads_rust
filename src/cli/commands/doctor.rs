@@ -1071,7 +1071,7 @@ pub fn inspect_pending_sync_merge_at_path(db_path: &Path) -> Result<Option<Pendi
         }
     }
 
-    let storage = SqliteStorage::open_current_read_only(db_path)?.ok_or_else(|| {
+    let storage = SqliteStorage::open_current_read_only_snapshot(db_path)?.ok_or_else(|| {
         BeadsError::SyncConflict {
             message: format!(
                 "Pending sync-merge state is unknown because database '{}' does not have the current supported schema",

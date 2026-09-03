@@ -2545,6 +2545,70 @@ impl SqliteStorage {
         }))
     }
 
+    /// Open a private byte snapshot for a lock-free observational read.
+    ///
+    /// FrankenSQLite updates the live `-shm` file even for a read-only WAL
+    /// connection. Reconcile dry-runs promise not to mutate any workspace
+    /// artifact and deliberately do not wait for the writer lock, so copy the
+    /// durable database/WAL inputs through stable handles and let the engine
+    /// touch only scratch coordination files.
+    pub(crate) fn open_current_read_only_snapshot(path: &Path) -> Result<Option<Self>> {
+        static SNAPSHOT_COUNTER: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+
+        let count = SNAPSHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snapshot_path = std::env::temp_dir().join(format!(
+            "beads_reconcile_snapshot_{}_{}.db",
+            std::process::id(),
+            count
+        ));
+        remove_temp_db_files(&snapshot_path);
+
+        let copy_result = (|| {
+            for suffix in ["", "-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
+                let source_path = database_sidecar_path(path, suffix);
+                let description = if suffix.is_empty() {
+                    "database"
+                } else {
+                    "database sidecar"
+                };
+                let Some(mut source) =
+                    StableSchemaSource::open_optional(&source_path, description)?
+                else {
+                    continue;
+                };
+                let destination = database_sidecar_path(&snapshot_path, suffix);
+                let mut output = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&destination)?;
+                std::io::copy(&mut source.file, &mut output)?;
+                output.sync_all()?;
+                source.verify_path(&source_path, description)?;
+            }
+            Ok::<(), BeadsError>(())
+        })();
+        if let Err(error) = copy_result {
+            remove_temp_db_files(&snapshot_path);
+            return Err(error);
+        }
+
+        match Self::open_current_read_only(&snapshot_path) {
+            Ok(Some(mut storage)) => {
+                storage.temp_db_path = Some(snapshot_path);
+                Ok(Some(storage))
+            }
+            Ok(None) => {
+                remove_temp_db_files(&snapshot_path);
+                Ok(None)
+            }
+            Err(error) => {
+                remove_temp_db_files(&snapshot_path);
+                Err(error)
+            }
+        }
+    }
+
     /// Open a private byte snapshot of a database family for an observational
     /// read while the caller holds the live family's write authority.
     ///

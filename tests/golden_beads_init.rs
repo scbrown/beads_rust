@@ -70,7 +70,10 @@ fn is_transient_sqlite(name: &str) -> bool {
         || name.ends_with("-fsqlite-ns-use")
         // The persistent multi-process opener lease is an engine coordination
         // sidecar whose hash depends on the workspace path.
-        || (name.starts_with(".br-db-openers-") && name.ends_with(".lock"))
+        || (name.starts_with(".br-db-openers-")
+            && std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lock")))
         // fsqlite 0.3.6+ engine-upgrade bookkeeping, written beside the DB
         // and recreated on demand.
         || name.ends_with(".fsqlite-migration-state")

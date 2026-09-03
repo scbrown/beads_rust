@@ -13,6 +13,7 @@ mod common;
 
 use beads_rust::model::{DependencyType, Status};
 use beads_rust::storage::{IssueUpdate, ReadyFilters, ReadySortPolicy, SqliteStorage};
+use chrono::{Duration, Utc};
 use common::{fixtures, test_db};
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,61 @@ fn status_update(status: Status) -> IssueUpdate {
         status: Some(status),
         ..Default::default()
     }
+}
+
+#[test]
+fn ready_excludes_dependent_for_every_non_terminal_blocker_state() {
+    let mut storage = test_db();
+    let blocker = fixtures::issue("ready-state-blocker");
+    let dependent = fixtures::issue("ready-state-dependent");
+
+    storage.create_issue(&blocker, "tester").unwrap();
+    storage.create_issue(&dependent, "tester").unwrap();
+    storage
+        .add_dependency(
+            &dependent.id,
+            &blocker.id,
+            DependencyType::Blocks.as_str(),
+            "tester",
+        )
+        .unwrap();
+
+    let cases = [
+        (Status::Open, None),
+        (Status::InProgress, None),
+        (Status::Deferred, None),
+        (Status::Deferred, Some(Utc::now() - Duration::days(1))),
+        (Status::Deferred, Some(Utc::now() + Duration::days(1))),
+    ];
+
+    for (status, defer_until) in cases {
+        storage
+            .update_issue(
+                &blocker.id,
+                &IssueUpdate {
+                    status: Some(status.clone()),
+                    defer_until: Some(defer_until),
+                    ..Default::default()
+                },
+                "tester",
+            )
+            .unwrap();
+
+        assert!(
+            blocked_ids(&storage).contains(&dependent.id),
+            "blocked walk must include dependent when blocker is {status}"
+        );
+        assert!(
+            !ready_ids(&storage).contains(&dependent.id),
+            "ready must exclude dependent when blocker is {status}"
+        );
+    }
+
+    storage
+        .update_issue(&blocker.id, &status_update(Status::Closed), "tester")
+        .unwrap();
+    assert!(!blocked_ids(&storage).contains(&dependent.id));
+    assert!(ready_ids(&storage).contains(&dependent.id));
 }
 
 // ===========================================================================

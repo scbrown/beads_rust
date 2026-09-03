@@ -213,6 +213,7 @@ fn e2e_dotted_child_show_and_update_stay_on_exact_issue_after_rebuild() {
                 &child_id,
                 "--notes",
                 &note,
+                "--force",
                 "--json",
             ],
             &format!("update_child_{i}"),

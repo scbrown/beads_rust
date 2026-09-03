@@ -68,6 +68,9 @@ fn is_transient_sqlite(name: &str) -> bool {
         // recreated on demand, so they are transient in the same sense.
         || name.ends_with("-fsqlite-ns-gate")
         || name.ends_with("-fsqlite-ns-use")
+        // The persistent multi-process opener lease is an engine coordination
+        // sidecar whose hash depends on the workspace path.
+        || (name.starts_with(".br-db-openers-") && name.ends_with(".lock"))
         // fsqlite 0.3.6+ engine-upgrade bookkeeping, written beside the DB
         // and recreated on demand.
         || name.ends_with(".fsqlite-migration-state")

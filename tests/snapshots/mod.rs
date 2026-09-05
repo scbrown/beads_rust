@@ -445,6 +445,32 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
     }
 
     // 6. Redact issue IDs
+    // Mask version numbers BEFORE redacting ids, and not later. ORDER IS
+    // LOAD-BEARING HERE (aegis-enj83g).
+    //
+    // ID_RE is `\b[a-zA-Z0-9_-]+-[a-z0-9]{3,}\b`, and a semver pre-release
+    // suffix has exactly that shape: in `br version 0.5.8-aegis.1` the token
+    // `8-aegis` is a legal id match. Redacting first therefore rewrote the line
+    // to `br version 0.5.ID-REDACTED.1`, which VERSION_NUM_RE can no longer
+    // match, so the version survived UNMASKED into the snapshot and every
+    // version bump with a suffix broke snapshot_version_output. Measured on
+    // 2026-09-05 against 0.5.8-aegis.1.
+    //
+    // Masking the version first makes it `X.Y.Z`, which contains no id-shaped
+    // token, so the two rules stop competing. This is the same collision the
+    // `vcs-status` sentinel below already guards against — one lexical shape
+    // that is both a legal id and something else — handled by ordering rather
+    // than by a second sentinel.
+    //
+    // A plain numeric version is unaffected by the move: it masks identically
+    // either way, and real issue ids are still redacted afterwards.
+    if config.mask_version_numbers && VERSION_NUM_RE.is_match(&normalized) {
+        normalized = VERSION_NUM_RE
+            .replace_all(&normalized, "$1 X.Y.Z")
+            .to_string();
+        log.push("version_numbers".to_string());
+    }
+
     if config.redact_ids && ID_RE.is_match(&normalized) {
         // `vcs-status` has the same lexical shape as a configurable issue ID,
         // but it is a stable command name and must remain visible in CLI help
@@ -527,17 +553,10 @@ fn normalize_text_with_log(text: &str, config: &TextNormConfig) -> (String, Vec<
         log.push("usernames".to_string());
     }
 
-    // 13. Mask version numbers. (Whole doctor `binary_version` result lines
-    // are replaced outright by the host-tooling rule in step 13b, which
-    // subsumes the older OK-line version mask that lived here.)
-    if config.mask_version_numbers && VERSION_NUM_RE.is_match(&normalized) {
-        normalized = VERSION_NUM_RE
-            .replace_all(&normalized, "$1 X.Y.Z")
-            .to_string();
-        log.push("version_numbers".to_string());
-    }
-
     // 13b. Mask check results determined by the host rather than by br.
+    // (There is no step 13 here any more: the version mask it used to hold now
+    // runs before the id redactor, where the ordering comment explains why.
+    // This block still subsumes the older OK-line version mask.)
     if config.mask_host_tooling && HOST_DEPENDENT_CHECK_RE.is_match(&normalized) {
         normalized = HOST_DEPENDENT_CHECK_RE
             .replace_all(&normalized, "${1}HOST-DEPENDENT ${2}")

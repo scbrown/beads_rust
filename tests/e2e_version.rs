@@ -22,15 +22,38 @@ fn e2e_version_short_flag() {
     );
 
     let stdout = version.stdout.trim();
-    // Should be just the version number, e.g. "0.1.7"
+    // Should be just the version number, e.g. "0.1.7" or "0.5.8-aegis.1".
+    //
+    // A release version may carry a semver pre-release or build suffix —
+    // scripts/bump-version.sh explicitly accepts one
+    // (`^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?$`). Checking that EVERY
+    // character is a digit or a dot rejected such a version outright, so the
+    // suite failed on a legal bump and reported it as `--short` printing
+    // something other than a version. Split the suffix off and check the parts.
+    //
+    // The point of the test is unchanged and still enforced: `--short` must
+    // print the bare version and not a decorated line. "br 0.5.8-aegis.1" fails
+    // here, because the core before the first `-` is "br 0.5.8", which is not
+    // digits and dots.
+    let (core, suffix) = match stdout.find(['-', '+']) {
+        Some(i) => (&stdout[..i], &stdout[i + 1..]),
+        None => (stdout, ""),
+    };
     assert!(
-        stdout.chars().all(|c| c.is_numeric() || c == '.'),
+        !core.is_empty() && core.chars().all(|c| c.is_numeric() || c == '.'),
         "version --short should contain only version number, got: '{}'",
         stdout
     );
     assert!(
-        stdout.contains('.'),
+        core.contains('.'),
         "version --short should look like semver, got: '{}'",
+        stdout
+    );
+    assert!(
+        suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'),
+        "version --short suffix should be semver-shaped, got: '{}'",
         stdout
     );
 }

@@ -609,15 +609,34 @@ fn map_update_error<E: std::error::Error + Send + Sync + 'static>(err: E) -> Bea
 ///
 /// Handles semver-like versions (e.g., "0.2.0" > "0.1.0", "0.10.0" > "0.9.0").
 fn version_newer(new: &str, current: &str) -> bool {
-    let parse_version = |v: &str| -> Vec<u32> {
-        v.trim_start_matches('v')
-            .split('.')
-            .filter_map(|s| s.parse().ok())
-            .collect()
+    // A semver pre-release or build suffix must be split off BEFORE parsing.
+    //
+    // This used to `filter_map(|s| s.parse().ok())` over `split('.')`, which
+    // silently DROPPED any component that would not parse. On a version like
+    // `0.5.8-aegis.1` that yields [0, 5, 1] — the "8-aegis" component vanishes
+    // and the version compares as 0.5.1, LOWER than 0.5.7. `br upgrade` would
+    // then report an older release as an available update and offer a
+    // downgrade, with nothing in the output saying the version had been
+    // misread. Measured 2026-09-05 (aegis-enj83g), and scripts/bump-version.sh
+    // accepts exactly such versions, so this was reachable by design rather
+    // than by accident.
+    //
+    // Precedence follows semver: compare the numeric cores first, and when
+    // those are equal a version WITH a pre-release is older than one without
+    // (0.5.8-aegis.1 < 0.5.8). Build metadata is ignored for precedence, as
+    // semver requires, so it is stripped with the pre-release here.
+    let split_core = |v: &str| -> (Vec<u32>, bool) {
+        let v = v.trim_start_matches('v');
+        let core = v.split(['-', '+']).next().unwrap_or(v);
+        let has_suffix = core.len() != v.len();
+        (
+            core.split('.').filter_map(|s| s.parse().ok()).collect(),
+            has_suffix,
+        )
     };
 
-    let new_parts = parse_version(new);
-    let current_parts = parse_version(current);
+    let (new_parts, new_pre) = split_core(new);
+    let (current_parts, current_pre) = split_core(current);
 
     for (n, c) in new_parts.iter().zip(current_parts.iter()) {
         match n.cmp(c) {
@@ -627,8 +646,13 @@ fn version_newer(new: &str, current: &str) -> bool {
         }
     }
 
-    // If all compared parts are equal, the one with more parts is newer
-    new_parts.len() > current_parts.len()
+    if new_parts.len() != current_parts.len() {
+        // If all compared parts are equal, the one with more parts is newer
+        return new_parts.len() > current_parts.len();
+    }
+
+    // Identical cores: a pre-release is older than the release it precedes.
+    current_pre && !new_pre
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -779,6 +803,28 @@ fn render_upgrade_result_rich(result: &UpdateResult, current_version: &str, ctx:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_version_comparison_handles_a_prerelease_suffix() {
+        // The parser used to drop the unparseable component silently, so
+        // "0.5.8-aegis.1" became [0, 5, 1] and compared as 0.5.1 (aegis-enj83g).
+        assert!(
+            version_newer("0.5.8-aegis.1", "0.5.7"),
+            "a prerelease of 0.5.8 is newer than the 0.5.7 release"
+        );
+        assert!(
+            !version_newer("0.5.7", "0.5.8-aegis.1"),
+            "0.5.7 must NOT read as an upgrade over a 0.5.8 prerelease — this is \
+             the downgrade offer the old parser produced"
+        );
+        // Semver precedence: a prerelease precedes its own release.
+        assert!(version_newer("0.5.8", "0.5.8-aegis.1"));
+        assert!(!version_newer("0.5.8-aegis.1", "0.5.8"));
+        // Equal, suffix and all.
+        assert!(!version_newer("0.5.8-aegis.1", "0.5.8-aegis.1"));
+        // Build metadata is ignored for precedence, as semver requires.
+        assert!(!version_newer("0.5.8+build.9", "0.5.8"));
+    }
 
     #[test]
     fn test_version_comparison_basic() {

@@ -74,11 +74,27 @@ jobs:
       - name: Check for yanked dependencies
         run: cargo audit --deny yanked
 
+  # THREE FEATURE SETS, THREE JOBS, IN PARALLEL — not three steps sharing one
+  # budget.
+  #
+  # These are three separate compiles (all-features, no-default-features and the
+  # default set the doc tests use), so running them as steps of one job cost the
+  # SUM of three builds plus three test runs against a single timeout. Measured
+  # on run 33945673274: all-features took 49m30s and no-default-features was
+  # killed 40m later at the 90m job wall, with the doc tests never starting.
+  #
+  # It had been over budget for some time and was masked: on 23223607 the
+  # no-default-features step FAILED at ~81m, and cargo stops there, so the run
+  # exited before the wall and the suite never revealed that it no longer fits.
+  # Repairing that assertion is what surfaced the timeout.
+  #
+  # Splitting costs the same total compute and about a third of the wall time,
+  # and it also stops one feature set's failure from hiding the next one's.
+  # Raising timeout-minutes instead would have bought silence: the number would
+  # grow again, and the masking would remain.
   test:
     name: Test Suite
     runs-on: ubuntu-latest
-    # The all-features suite can exceed an hour on a cold hosted runner now
-    # that the recovery fixtures exercise full, disk-backed reconciliation.
     timeout-minutes: 90
     needs: check
     steps:
@@ -94,13 +110,51 @@ jobs:
         with:
           shared-key: ci-native
 
+      # The recovery fixtures exercise full, disk-backed reconciliation, so this
+      # one alone runs ~50m on a cold hosted runner.
       - name: Run all tests (all features)
         run: cargo test --all-features -- --nocapture
         env:
           RUST_LOG: beads_rust=debug
 
+  test-no-default-features:
+    name: Test Suite (no default features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    needs: check
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
+        with:
+          shared-key: ci-native
+
       - name: Run tests (no default features)
         run: cargo test --no-default-features
+
+  test-doc:
+    name: Doc Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: check
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2.9.1
+        with:
+          shared-key: ci-native
 
       - name: Run doc tests
         run: cargo test --doc
@@ -231,7 +285,11 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: test
+    # All three feature sets, not just the all-features one. Before the split
+    # these were steps of a single `test` job, so depending on `test` meant
+    # depending on all of them; naming only `test` now would quietly narrow
+    # that to one third of the suite.
+    needs: [test, test-no-default-features, test-doc]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

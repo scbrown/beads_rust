@@ -278,6 +278,11 @@ pub struct CloseWithSuggestResult {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub skipped: Vec<SkippedIssue>,
     pub unblocked: Vec<UnblockedIssue>,
+    /// Newly unblocked dependents that are DEFERRED.
+    ///
+    /// Omitted when empty, so this is additive for existing consumers.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unblocked_deferred: Vec<UnblockedIssue>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
@@ -312,6 +317,13 @@ struct CloseExecution {
     closed: Vec<ClosedIssue>,
     skipped: Vec<SkippedIssue>,
     unblocked: Vec<UnblockedIssue>,
+    /// Dependents whose gate this close lifted but which are DEFERRED.
+    ///
+    /// Reported separately rather than merged into `unblocked`, so existing
+    /// consumers of that field keep its meaning (active work you can pick up
+    /// now) while the population that nothing else will ever surface stops
+    /// being silently dropped. See `aegis-b3hcl0`.
+    unblocked_deferred: Vec<UnblockedIssue>,
     ordered_outcomes: Vec<CloseOutcome>,
     capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 }
@@ -327,6 +339,7 @@ fn build_close_json_payload(
     closed_issues: Vec<ClosedIssue>,
     skipped_issues: Vec<SkippedIssue>,
     unblocked_issues: Vec<UnblockedIssue>,
+    unblocked_deferred_issues: Vec<UnblockedIssue>,
     capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 ) -> Result<String> {
     let json = if args.suggest_next {
@@ -335,6 +348,7 @@ fn build_close_json_payload(
             closed: closed_issues,
             skipped: skipped_issues,
             unblocked: unblocked_issues,
+            unblocked_deferred: unblocked_deferred_issues,
             warnings: capacity_warnings,
         };
         serde_json::to_string_pretty(&result)?
@@ -359,6 +373,7 @@ fn render_close_json(
     closed_issues: Vec<ClosedIssue>,
     skipped_issues: Vec<SkippedIssue>,
     unblocked_issues: Vec<UnblockedIssue>,
+    unblocked_deferred_issues: Vec<UnblockedIssue>,
     capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
 ) -> Result<()> {
     let json = build_close_json_payload(
@@ -366,6 +381,7 @@ fn render_close_json(
         closed_issues,
         skipped_issues,
         unblocked_issues,
+        unblocked_deferred_issues,
         capacity_warnings,
     )?;
     println!("{json}");
@@ -377,6 +393,7 @@ fn emit_close_structured_output(
     closed_issues: Vec<ClosedIssue>,
     skipped_issues: Vec<SkippedIssue>,
     unblocked_issues: Vec<UnblockedIssue>,
+    unblocked_deferred_issues: Vec<UnblockedIssue>,
     capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
     ctx: &OutputContext,
 ) -> Result<()> {
@@ -385,6 +402,7 @@ fn emit_close_structured_output(
             closed: closed_issues,
             skipped: skipped_issues,
             unblocked: unblocked_issues,
+            unblocked_deferred: unblocked_deferred_issues,
             warnings: capacity_warnings,
         };
         if ctx.is_toon() {
@@ -409,6 +427,7 @@ fn emit_close_structured_output(
                 closed_issues,
                 skipped_issues,
                 unblocked_issues,
+                unblocked_deferred_issues,
                 capacity_warnings,
             )?;
         }
@@ -618,6 +637,7 @@ pub fn execute_with_args(
     let mut closed_issues = Vec::new();
     let mut skipped_issues = Vec::new();
     let mut unblocked_issues = Vec::new();
+    let mut unblocked_deferred_issues = Vec::new();
     let mut capacity_warnings = Vec::new();
 
     if routed_batches.iter().any(|batch| batch.is_external) {
@@ -647,12 +667,14 @@ pub fn execute_with_args(
             )?;
             let CloseExecution {
                 unblocked,
+                unblocked_deferred,
                 ordered_outcomes,
                 capacity_warnings: route_warnings,
                 ..
             } = execution;
             routed_outcomes.push((batch.issue_inputs, ordered_outcomes));
             unblocked_issues.extend(unblocked);
+            unblocked_deferred_issues.extend(unblocked_deferred);
             capacity_warnings.extend(route_warnings);
         }
 
@@ -674,6 +696,7 @@ pub fn execute_with_args(
         closed_issues = execution.closed;
         skipped_issues = execution.skipped;
         unblocked_issues = execution.unblocked;
+        unblocked_deferred_issues = execution.unblocked_deferred;
         capacity_warnings = execution.capacity_warnings;
     }
 
@@ -697,6 +720,7 @@ pub fn execute_with_args(
             closed_issues,
             skipped_issues,
             unblocked_issues,
+            unblocked_deferred_issues,
             capacity_warnings,
             ctx,
         )?;
@@ -716,6 +740,22 @@ pub fn execute_with_args(
             ctx.newline();
             ctx.info(&format!("Unblocked {} issue(s):", unblocked_issues.len()));
             for issue in &unblocked_issues {
+                ctx.print_line(&unblocked_human_line(issue));
+            }
+        }
+        // Reported in its own section, and unconditionally rather than behind a
+        // flag: a flag defaulting to off leaves this population exactly as
+        // invisible as it was. `ready` excludes deferred by the same predicate
+        // that used to drop it here, and an open-ended deferral cannot lapse,
+        // so this close is the ONLY moment anything can say the gate lifted
+        // (aegis-b3hcl0).
+        if !unblocked_deferred_issues.is_empty() {
+            ctx.newline();
+            ctx.info(&format!(
+                "Newly unblocked but DEFERRED — {} issue(s), not in `ready`; undefer to pick up:",
+                unblocked_deferred_issues.len()
+            ));
+            for issue in &unblocked_deferred_issues {
                 ctx.print_line(&unblocked_human_line(issue));
             }
         }
@@ -1162,77 +1202,93 @@ fn execute_route(
         finalize_batched_blocked_cache_refresh(&mut storage_ctx.storage, cache_dirty, "close")?;
     }
 
-    let unblocked_issues: Vec<UnblockedIssue> = if args.suggest_next && !closed_issues.is_empty() {
-        let blocked_after_result = storage_ctx.storage.get_blocked_issues();
-        let blocked_after = match preserve_blocked_cache_on_error(
-            &mut storage_ctx.storage,
-            cache_dirty,
-            "close",
-            blocked_after_result,
-        ) {
-            Ok(blocked_after) => Some(
-                blocked_after
-                    .into_iter()
-                    .map(|(issue, _)| issue.id)
-                    .collect::<Vec<_>>(),
-            ),
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "Skipping suggest-next calculation after committed close because blocked-cache lookup failed"
-                );
-                None
-            }
-        };
-
-        let Some(blocked_after) = blocked_after else {
-            storage_ctx.flush_no_db_if_dirty()?;
-            return Ok(CloseExecution {
-                closed: closed_issues,
-                skipped: skipped_issues,
-                unblocked: Vec::new(),
-                ordered_outcomes,
-                capacity_warnings,
-            });
-        };
-
-        let newly_unblocked: Vec<String> = blocked_before
-            .into_iter()
-            .filter(|id| !blocked_after.contains(id))
-            .collect();
-
-        tracing::debug!(unblocked = ?newly_unblocked, "Issues unblocked by close");
-
-        let mut unblocked = Vec::new();
-        for uid in newly_unblocked {
-            let issue_result = storage_ctx.storage.get_issue(&uid);
-            match preserve_blocked_cache_on_error(
+    let (unblocked_issues, unblocked_deferred_issues): (Vec<UnblockedIssue>, Vec<UnblockedIssue>) =
+        if args.suggest_next && !closed_issues.is_empty() {
+            let blocked_after_result = storage_ctx.storage.get_blocked_issues();
+            let blocked_after = match preserve_blocked_cache_on_error(
                 &mut storage_ctx.storage,
                 cache_dirty,
                 "close",
-                issue_result,
+                blocked_after_result,
             ) {
-                Ok(Some(issue)) if issue.status.is_active() => {
-                    unblocked.push(UnblockedIssue {
-                        id: issue.id,
-                        title: issue.title,
-                        priority: issue.priority.0,
-                    });
-                }
-                Ok(_) => {}
+                Ok(blocked_after) => Some(
+                    blocked_after
+                        .into_iter()
+                        .map(|(issue, _)| issue.id)
+                        .collect::<Vec<_>>(),
+                ),
                 Err(error) => {
                     tracing::warn!(
-                        issue_id = %uid,
                         error = %error,
-                        "Skipping suggest-next candidate after committed close because issue lookup failed"
+                        "Skipping suggest-next calculation after committed close because blocked-cache lookup failed"
                     );
+                    None
+                }
+            };
+
+            let Some(blocked_after) = blocked_after else {
+                storage_ctx.flush_no_db_if_dirty()?;
+                return Ok(CloseExecution {
+                    closed: closed_issues,
+                    skipped: skipped_issues,
+                    unblocked: Vec::new(),
+                    unblocked_deferred: Vec::new(),
+                    ordered_outcomes,
+                    capacity_warnings,
+                });
+            };
+
+            let newly_unblocked: Vec<String> = blocked_before
+                .into_iter()
+                .filter(|id| !blocked_after.contains(id))
+                .collect();
+
+            tracing::debug!(unblocked = ?newly_unblocked, "Issues unblocked by close");
+
+            let mut unblocked = Vec::new();
+            let mut unblocked_deferred = Vec::new();
+            for uid in newly_unblocked {
+                let issue_result = storage_ctx.storage.get_issue(&uid);
+                match preserve_blocked_cache_on_error(
+                    &mut storage_ctx.storage,
+                    cache_dirty,
+                    "close",
+                    issue_result,
+                ) {
+                    // A DEFERRED dependent whose blocker just closed is routed to its
+                    // own bucket rather than dropped. `is_active()` is Open|InProgress,
+                    // so the previous filter discarded exactly the population that no
+                    // other mechanism ever surfaces: `ready` excludes deferred by the
+                    // same predicate, and an open-ended deferral cannot lapse, so a
+                    // lifted gate produced no event anywhere (aegis-b3hcl0).
+                    Ok(Some(issue)) if issue.status == crate::model::Status::Deferred => {
+                        unblocked_deferred.push(UnblockedIssue {
+                            id: issue.id,
+                            title: issue.title,
+                            priority: issue.priority.0,
+                        });
+                    }
+                    Ok(Some(issue)) if issue.status.is_active() => {
+                        unblocked.push(UnblockedIssue {
+                            id: issue.id,
+                            title: issue.title,
+                            priority: issue.priority.0,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            issue_id = %uid,
+                            error = %error,
+                            "Skipping suggest-next candidate after committed close because issue lookup failed"
+                        );
+                    }
                 }
             }
-        }
-        unblocked
-    } else {
-        Vec::new()
-    };
+            (unblocked, unblocked_deferred)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     storage_ctx.flush_no_db_if_dirty()?;
     if auto_flush_external && let Err(error) = storage_ctx.auto_flush_if_enabled() {
@@ -1248,6 +1304,7 @@ fn execute_route(
         closed: closed_issues,
         skipped: skipped_issues,
         unblocked: unblocked_issues,
+        unblocked_deferred: unblocked_deferred_issues,
         ordered_outcomes,
         capacity_warnings,
     })
@@ -1456,6 +1513,7 @@ mod tests {
                     priority: 2,
                 },
             ],
+            unblocked_deferred: vec![],
             warnings: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -1477,6 +1535,7 @@ mod tests {
                 reason: "not found".to_string(),
             }],
             unblocked: vec![],
+            unblocked_deferred: vec![],
             warnings: vec![],
         };
         let json = serde_json::to_string(&result).unwrap();
@@ -1726,6 +1785,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1747,6 +1807,7 @@ mod tests {
                 id: "bd-2".to_string(),
                 reason: "blocked by: bd-3".to_string(),
             }],
+            vec![],
             vec![],
             vec![],
         )

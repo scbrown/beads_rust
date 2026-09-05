@@ -1073,6 +1073,116 @@ fn e2e_close_suggest_next_unblocks() {
     info!("e2e_close_suggest_next_unblocks: assertions passed");
 }
 
+/// A DEFERRED dependent whose blocker just closed must still be reported.
+///
+/// Two arms off ONE blocker, with the OPEN arm as the control: the control is
+/// what licenses the conclusion, because it proves the mechanism fired at all.
+/// Before the fix the deferred arm was dropped by an `is_active()` filter
+/// (Open|InProgress), so `--suggest-next` was structurally silent on exactly
+/// the population nothing else surfaces — `ready` excludes deferred by the same
+/// predicate, and an open-ended deferral cannot lapse (aegis-b3hcl0).
+#[test]
+fn e2e_close_suggest_next_reports_deferred_dependents() {
+    common::init_test_logging();
+    info!("e2e_close_suggest_next_reports_deferred_dependents: starting");
+    let workspace = BrWorkspace::new();
+
+    let init = run_br(&workspace, ["init"], "init");
+    assert!(init.status.success(), "init failed: {}", init.stderr);
+
+    let blocker = run_br(&workspace, ["create", "Blocker issue"], "create_blocker");
+    assert!(
+        blocker.status.success(),
+        "blocker create failed: {}",
+        blocker.stderr
+    );
+    let blocker_id = parse_created_id(&blocker.stdout);
+
+    let deferred = run_br(
+        &workspace,
+        ["create", "Deferred dependent"],
+        "create_deferred",
+    );
+    assert!(
+        deferred.status.success(),
+        "deferred create failed: {}",
+        deferred.stderr
+    );
+    let deferred_id = parse_created_id(&deferred.stdout);
+
+    let control = run_br(
+        &workspace,
+        ["create", "Open dependent CONTROL"],
+        "create_control",
+    );
+    assert!(
+        control.status.success(),
+        "control create failed: {}",
+        control.stderr
+    );
+    let control_id = parse_created_id(&control.stdout);
+
+    for (dependent, label) in [
+        (&deferred_id, "dep_add_deferred"),
+        (&control_id, "dep_add_control"),
+    ] {
+        let dep_add = run_br(&workspace, ["dep", "add", dependent, &blocker_id], label);
+        assert!(
+            dep_add.status.success(),
+            "dep add failed: {}",
+            dep_add.stderr
+        );
+    }
+
+    let defer = run_br(
+        &workspace,
+        ["update", &deferred_id, "--status", "deferred"],
+        "defer_dependent",
+    );
+    assert!(defer.status.success(), "defer failed: {}", defer.stderr);
+
+    let close = run_br(
+        &workspace,
+        ["close", &blocker_id, "--suggest-next", "--json"],
+        "close_suggest_next_deferred",
+    );
+    assert!(close.status.success(), "close failed: {}", close.stderr);
+
+    let payload = extract_json_payload(&close.stdout);
+    let close_json: serde_json::Value = serde_json::from_str(&payload).expect("close json");
+
+    // CONTROL: the mechanism fired. Without this, an empty deferred arm below
+    // would be indistinguishable from suggest-next not running at all.
+    let unblocked = close_json["unblocked"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        unblocked.iter().any(|item| item["id"] == control_id),
+        "control (open) dependent missing from `unblocked`: {close_json}"
+    );
+
+    // The arm this bead is about.
+    let deferred_reported = close_json["unblocked_deferred"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        deferred_reported
+            .iter()
+            .any(|item| item["id"] == deferred_id),
+        "deferred dependent missing from `unblocked_deferred`: {close_json}"
+    );
+
+    // The two arms stay separated: a deferred bead must not leak into
+    // `unblocked`, whose consumers read it as work that is pickable now.
+    assert!(
+        !unblocked.iter().any(|item| item["id"] == deferred_id),
+        "deferred dependent leaked into `unblocked`: {close_json}"
+    );
+    info!("e2e_close_suggest_next_reports_deferred_dependents: assertions passed");
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_close_blocked_requires_force() {

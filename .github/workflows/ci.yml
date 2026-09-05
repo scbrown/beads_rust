@@ -28,7 +28,12 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
+    # Raised from 15 (aegis-44vjem). Not failing — 12.8m of 15, 86% — which is
+    # exactly when to move it. The point of that bead is to stop meeting these
+    # one failure at a time; scripts/audit-workflow-timeout-headroom.sh is what
+    # surfaced this one before it crossed.
+
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -284,7 +289,14 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
+    # Raised from 30 (aegis-44vjem). `cancelled` at 30.2m on run 33950357551 —
+    # a TIMEOUT, not fail-fast collateral, and it had gone unnoticed because
+    # GitHub reports a job timeout as `cancelled`. One indivisible command
+    # (`cargo llvm-cov --all-features --workspace`) instruments and runs the
+    # whole workspace, so there is nothing here to split; 30 was simply under
+    # the real cost. 60 matches what 8fd81062 gave the other acceptance gates.
+
     # All three feature sets, not just the all-features one. Before the split
     # these were steps of a single `test` job, so depending on `test` meant
     # depending on all of them; naming only `test` now would quietly narrow
@@ -394,7 +406,34 @@ jobs:
     runs-on: ubuntu-latest
     # A cold single-job release build takes about 27 minutes on hosted runners;
     # leave enough wall time for Criterion to run after compilation completes.
-    timeout-minutes: 60
+    timeout-minutes: 120
+    # Raised from 60 (aegis-44vjem).
+    #
+    # THE 27.6m "SUCCESS" OF 2026-09-02 WAS VACUOUS — do not use it as evidence
+    # this job ever fit in 60 minutes. At that commit the step carried
+    # `continue-on-error: true` and chose, on a criterion cache hit:
+    #
+    #     cargo bench --bench storage_perf -- --baseline main --save-baseline main
+    #
+    # which criterion REFUSES: "the argument '--baseline <baseline>' cannot be
+    # used with '--save-baseline <save-baseline>'". It exited 2 after ~27m of
+    # compile, `continue-on-error` reported the step SUCCESS, and the regression
+    # check then compared the restored cache against itself and found nothing.
+    # Every layer reported green and no benchmark ran.
+    #
+    # That invalid invocation is gone (the command is now the unconditional
+    # `--save-baseline main`) and so is the continue-on-error. So benchmarks now
+    # actually RUN — and 60m has never been validated as enough for that, because
+    # until they ran nobody had a real duration to check it against.
+    #
+    # 120 is therefore a first honest budget, not a concession to a regression.
+    # There is NO measured evidence of a slowdown in the code under test: the
+    # only completed-looking data point was the vacuous one above.
+    #
+    # If it completes green near 120m, THAT is the signal to split or tune
+    # criterion sampling — do not simply raise this again. If it completes well
+    # under, record the real duration here so the next person has a number.
+
     env:
       # A cold release build exceeded the hosted runner's memory and was
       # killed with SIGTERM before Criterion started. Bound compilation

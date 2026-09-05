@@ -1304,6 +1304,95 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
     false
 }
 
+/// Runs the shell witness's `is_allowed_path` against one path.
+///
+/// The function is extracted from the script rather than sourcing the whole
+/// file, because sourcing it would run the harness.
+#[cfg(unix)]
+fn shell_allowlist_verdict(rel_path: &str) -> bool {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e_scripts/sync_safety_witness.sh");
+    let program = format!(
+        "source <(sed -n '/^is_allowed_path()/,/^}}/p' {}); is_allowed_path \"$1\"",
+        script.display()
+    );
+    let status = std::process::Command::new("bash")
+        .args(["-c", &program, "--", rel_path])
+        .status()
+        .expect("bash is required to check the shell mirror");
+    status.success()
+}
+
+/// The shell witness carries a hand-maintained MIRROR of `is_allowed_sync_file`,
+/// and until this test existed the only thing keeping the two in step was a
+/// comment saying so — which cannot fail.
+///
+/// It drifted exactly as you would expect. The Rust side gained the br
+/// write-lock prefixes and the fsqlite durability sidecars; the shell copy did
+/// not, and the gate began failing main on files the Rust allowlist considers
+/// legal:
+///
+/// ```text
+/// .beads/.br-jsonl-write-92253594e94ac9e6173f92b6.lock  not in allowlist
+/// ```
+///
+/// Both directions matter. An allowlist that drifts PERMISSIVE stops catching
+/// the regressions it exists for, and one that drifts RESTRICTIVE fails main on
+/// legitimate files — which is the one that happened, and is the more expensive
+/// of the two because it blocks everybody.
+#[cfg(unix)]
+#[test]
+fn shell_witness_allowlist_agrees_with_the_rust_one() {
+    const CASES: &[&str] = &[
+        // Allowed: the core store files.
+        ".beads/.manifest.json",
+        ".beads/metadata.json",
+        ".beads/last-touched",
+        ".beads/beads.jsonl",
+        ".beads/beads.jsonl.tmp",
+        ".beads/beads.db",
+        ".beads/beads.db-wal",
+        ".beads/beads.db-shm",
+        ".beads/beads.db-journal",
+        // Allowed: fsqlite durability sidecars — the drift this test was written for.
+        ".beads/beads.db-wal-cert",
+        ".beads/beads.db-wal-cert-head",
+        ".beads/beads.db-fsqlite-ns-gate",
+        ".beads/beads.db-fsqlite-ns-use",
+        // Allowed: br's transient write locks — the drift that failed main.
+        ".beads/.br-jsonl-write-92253594e94ac9e6173f92b6.lock",
+        ".beads/.br-db-write-b62fb38617d9245d87e43cec.lock",
+        // Allowed: pid-suffixed atomic temp files, history and recovery artifacts.
+        ".beads/beads.jsonl.1234.tmp",
+        ".beads/.br_history/snapshot.meta.json",
+        ".beads/.br_recovery/beads.db.20260101.bak",
+        ".beads/.br_recovery/beads.db.20260101.rebuild-failed",
+        ".beads/.br_recovery/beads.db-wal.20260101.truncated-wal",
+        // NOT allowed: the negative controls. A lock whose digest is the wrong
+        // length or not hex must still be refused, or the rule is a bare glob.
+        ".beads/.br-jsonl-write-short.lock",
+        ".beads/.br-jsonl-write-ZZ253594e94ac9e6173f92b6.lock",
+        ".beads/beads.jsonl.notapid.tmp",
+        ".beads/.br_recovery/unrelated.txt",
+        ".beads/evil.txt",
+        ".beads/nested/other.db",
+        "outside/.beads-like.jsonl",
+    ];
+
+    let mut disagreements = Vec::new();
+    for case in CASES {
+        let rust = is_allowed_sync_file(case);
+        let shell = shell_allowlist_verdict(case);
+        if rust != shell {
+            disagreements.push(format!("  {case}: rust={rust} shell={shell}"));
+        }
+    }
+    assert!(
+        disagreements.is_empty(),
+        "the shell witness allowlist and is_allowed_sync_file disagree — update BOTH:\n{}",
+        disagreements.join("\n")
+    );
+}
+
 /// Represents a complete file tree snapshot for comparison.
 #[derive(Debug)]
 struct FileTreeSnapshot {

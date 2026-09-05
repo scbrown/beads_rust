@@ -20,6 +20,16 @@
 
 set -euo pipefail
 
+# Phase 5 compares two sorted file lists with `comm`, which assumes both were
+# sorted under the SAME collation it uses. Inherit the ambient locale and on a
+# non-C one `sort` orders differently, `comm` refuses with "file 1 is not in
+# sorted order", and under `set -e` the script dies mid-phase having emitted NO
+# summary and NO verdict — a gate that fails opaquely rather than reporting
+# violations. Observed locally 2026-09-05; CI runners happen to use C, which is
+# why it never surfaced there. Pin it so the gate is deterministic wherever it
+# runs.
+export LC_ALL=C
+
 LOG_TS=$(date -u +%Y%m%dT%H%M%SZ)
 EVENT_LOG="/tmp/sync_safety_witness_${LOG_TS}.jsonl"
 PASS_FAIL_LOG="/tmp/sync_safety_witness_${LOG_TS}.summary.txt"
@@ -36,12 +46,26 @@ emit_event() {
         >> "$EVENT_LOG"
 }
 
-# Mirror of is_allowed_sync_file in tests/e2e_sync_git_safety.rs
+# Mirror of is_allowed_sync_file in tests/e2e_sync_git_safety.rs.
+#
+# THIS COPY HAS DRIFTED BEFORE. It is a hand-maintained mirror of a Rust
+# function, and the only thing keeping the two in step is the line above, which
+# is a comment and cannot fail. When the Rust side gained the br write-lock
+# prefixes and the fsqlite sidecar extensions, this copy did not, and the gate
+# began failing main on files the Rust allowlist considered perfectly legal:
+#
+#   .beads/.br-jsonl-write-<24 hex>.lock   not in allowlist   (run 33935185228)
+#
+# If you add a case to either implementation, add it to BOTH. The parity test
+# in tests/e2e_sync_git_safety.rs runs this function against the Rust one and
+# fails when they disagree, which is what should have caught the drift above.
 is_allowed_path() {
     local rel="$1"
     case "$rel" in
         .beads/.manifest.json|.beads/metadata.json|.beads/last-touched) return 0 ;;
         .beads/*.jsonl|.beads/*.jsonl.tmp|.beads/*.db|.beads/*.db-wal|.beads/*.db-shm|.beads/*.db-journal) return 0 ;;
+        # fsqlite durability sidecars, written beside the DB during sync.
+        .beads/*.db-wal-cert|.beads/*.db-wal-cert-head|.beads/*.db-fsqlite-ns-gate|.beads/*.db-fsqlite-ns-use) return 0 ;;
         .beads/.br_history/*.meta.json) return 0 ;;
         .beads/.br_recovery/*.bak|.beads/.br_recovery/*.rebuild-failed|.beads/.br_recovery/*.truncated-wal) return 0 ;;
     esac
@@ -50,6 +74,15 @@ is_allowed_path() {
             local pid="${rel##*.jsonl.}"
             pid="${pid%.tmp}"
             [[ "$pid" =~ ^[0-9]+$ ]] && return 0
+            ;;
+        # br's own transient write locks. The digest length and hex check are
+        # part of the rule, not decoration: a bare glob would let anything
+        # named .br-*-write-*.lock through and weaken the gate this script is.
+        .beads/.br-db-write-*.lock|.beads/.br-jsonl-write-*.lock)
+            local digest="${rel##*/}"
+            digest="${digest#*-write-}"
+            digest="${digest%.lock}"
+            [[ ${#digest} -eq 24 && "$digest" =~ ^[0-9a-fA-F]+$ ]] && return 0
             ;;
     esac
     return 1

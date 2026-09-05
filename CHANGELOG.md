@@ -63,6 +63,10 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## v0.5.8-aegis.1 -- 2026-09-05 (Unreleased)
+
+- (describe the changes in this release)
+
 ## v0.5.7 -- 2026-08-29 (Release)
 
 A doctor-consistency fix for agents plus the FrankenSQLite **0.3.13** engine

@@ -538,8 +538,18 @@ fn test_version_metadata_matches_cargo() {
         .filter_map(|line| line.trim().strip_prefix("# br "))
         .map(str::trim)
         .find(|value| {
-            !value.is_empty()
-                && value
+            // A release version may carry a semver pre-release or build suffix.
+            // scripts/bump-version.sh explicitly accepts one
+            // (`^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.]+)?$`), so a version
+            // like `0.5.8-aegis.1` is a legal thing to have bumped to — and this
+            // finder used to SKIP such a line as if it were prose, then panic
+            // reporting the heading as missing. That reads as "the README lost
+            // its version heading" when the heading is present and correct.
+            // Match on the numeric core; compare the whole value below.
+            let core = value.split(['-', '+']).next().unwrap_or(value);
+            !core.is_empty()
+                && core.split('.').count() == 3
+                && core
                     .split('.')
                     .all(|component| component.parse::<u64>().is_ok())
         })

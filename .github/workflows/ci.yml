@@ -407,28 +407,32 @@ jobs:
     # A cold single-job release build takes about 27 minutes on hosted runners;
     # leave enough wall time for Criterion to run after compilation completes.
     timeout-minutes: 120
-    # Raised from 60 (aegis-44vjem). NOT because 60 was ungenerous: this job
-    # SUCCEEDED IN 27.6m on 2026-09-02 (run 33691253474) and every main run
-    # since is `cancelled` at exactly 60.2m. benches/ and Cargo.toml are
-    # UNCHANGED across that span and this budget has been 60 throughout, so the
-    # workload DEFINITION did not grow. Two explanations remain and this change
-    # does not decide between them, deliberately:
+    # Raised from 60 (aegis-44vjem).
     #
-    #   (a) the code under test got slower — which is precisely what this gate
-    #       exists to catch, and
-    #   (b) compile time grew, or that 27.6m run had a warm cargo cache while the
-    #       ones since did not. The comment above budgets ~27m for a COLD build,
-    #       so (b) is live and cannot be dismissed from run metadata alone.
+    # THE 27.6m "SUCCESS" OF 2026-09-02 WAS VACUOUS — do not use it as evidence
+    # this job ever fit in 60 minutes. At that commit the step carried
+    # `continue-on-error: true` and chose, on a criterion cache hit:
     #
-    # Under (a) the timeout is what stops the gate saying so.
-    # `cargo bench` never reaches the 10% regression check, so the signal is
-    # discarded at the moment it becomes interesting. Raising the budget here
-    # is a DIAGNOSTIC move, not a concession — it lets the gate report. If a
-    # real regression is present the job should then FAIL on the threshold
-    # check, which is the correct outcome and the one we cannot currently get.
+    #     cargo bench --bench storage_perf -- --baseline main --save-baseline main
+    #
+    # which criterion REFUSES: "the argument '--baseline <baseline>' cannot be
+    # used with '--save-baseline <save-baseline>'". It exited 2 after ~27m of
+    # compile, `continue-on-error` reported the step SUCCESS, and the regression
+    # check then compared the restored cache against itself and found nothing.
+    # Every layer reported green and no benchmark ran.
+    #
+    # That invalid invocation is gone (the command is now the unconditional
+    # `--save-baseline main`) and so is the continue-on-error. So benchmarks now
+    # actually RUN — and 60m has never been validated as enough for that, because
+    # until they ran nobody had a real duration to check it against.
+    #
+    # 120 is therefore a first honest budget, not a concession to a regression.
+    # There is NO measured evidence of a slowdown in the code under test: the
+    # only completed-looking data point was the vacuous one above.
     #
     # If it completes green near 120m, THAT is the signal to split or tune
-    # criterion sampling — do not simply raise this again.
+    # criterion sampling — do not simply raise this again. If it completes well
+    # under, record the real duration here so the next person has a number.
 
     env:
       # A cold release build exceeded the hosted runner's memory and was

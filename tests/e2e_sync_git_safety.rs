@@ -1310,7 +1310,8 @@ fn is_allowed_sync_file(rel_path: &str) -> bool {
 /// file, because sourcing it would run the harness.
 #[cfg(unix)]
 fn shell_allowlist_verdict(rel_path: &str) -> bool {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e_scripts/sync_safety_witness.sh");
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/e2e_scripts/sync_safety_witness.sh");
     let program = format!(
         "source <(sed -n '/^is_allowed_path()/,/^}}/p' {}); is_allowed_path \"$1\"",
         script.display()

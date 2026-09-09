@@ -654,9 +654,17 @@ fn apply_client_filters(
     let notes_needle = args.notes_contains.as_deref().map(str::to_lowercase);
     // Deferred issues are included by default when no status filter is specified,
     // except `--overdue` keeps deferred work hidden unless requested.
+    // `--status all` is the same meta-value `build_filters` honours by setting
+    // `statuses = None`. This is a SECOND derivation of the same decision from the
+    // RAW strings, and it had no term for that meta-value: "all" is neither empty
+    // nor equal to "deferred", so `--status all` computed `false` here and the
+    // guard below dropped every deferred issue (aegis-0nxvz6). Measured on the
+    // live store: `--priority-min 2 --priority-max 2` returns 48 deferred rows,
+    // and the same command plus `--status all` returns 0.
     let include_deferred = args.deferred
         || args.all
-        || (!args.overdue && args.status.is_empty())
+        || (!args.overdue
+            && (args.status.is_empty() || super::status_filter_requests_all(&args.status)))
         || args
             .status
             .iter()
@@ -1028,6 +1036,74 @@ mod tests {
             .expect("apply client filters");
         let ids: Vec<_> = filtered.iter().map(|issue| issue.id.as_str()).collect();
         assert_eq!(ids, vec!["bd-2"]);
+    }
+
+    #[test]
+    fn test_apply_client_filters_status_all_includes_deferred() {
+        init_logging();
+        // `--status all` is a meta-value meaning "no status filter, every status".
+        // `build_filters` honours it by setting `statuses = None`; this function
+        // re-derives `include_deferred` from the RAW strings and used to miss it,
+        // so `--status all` combined with any client-side filter silently dropped
+        // every deferred issue and returned a clean empty result (aegis-0nxvz6).
+        let open = issue_with_id("bd-1", "open");
+        let mut deferred = issue_with_id("bd-2", "deferred");
+        deferred.status = Status::Deferred;
+
+        // CONTROL FIRST: with no status filter the deferred issue IS returned.
+        // Without this arm a passing assertion below could mean the fixture is
+        // simply invisible to the filter, which looks identical to a fix.
+        let control = apply_client_filters(
+            vec![open.clone(), deferred.clone()],
+            &ListArgs {
+                id: vec!["bd-2".to_string()],
+                ..Default::default()
+            },
+        )
+        .expect("control: id filter, no status filter");
+        let control_ids: Vec<_> = control.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(
+            control_ids,
+            vec!["bd-2"],
+            "control: no status filter must return the deferred issue"
+        );
+
+        let with_all = apply_client_filters(
+            vec![open.clone(), deferred.clone()],
+            &ListArgs {
+                status: vec!["all".to_string()],
+                id: vec!["bd-2".to_string()],
+                ..Default::default()
+            },
+        )
+        .expect("--status all with an id filter");
+        let all_ids: Vec<_> = with_all.iter().map(|issue| issue.id.as_str()).collect();
+        assert_eq!(
+            all_ids,
+            vec!["bd-2"],
+            "--status all must not exclude a deferred issue"
+        );
+
+        // The blast radius is not only `--id`: every client-side filter runs the
+        // same path. `--desc-contains` is the second arm because a resolver that
+        // searches prose is exactly the caller that must not miss deferred work.
+        let mut described = issue_with_id("bd-3", "deferred with a description");
+        described.status = Status::Deferred;
+        described.description = Some("gated on the forge".to_string());
+        let with_desc = apply_client_filters(
+            vec![described],
+            &ListArgs {
+                status: vec!["all".to_string()],
+                desc_contains: Some("forge".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("--status all with a description filter");
+        assert_eq!(
+            with_desc.len(),
+            1,
+            "--status all must not exclude a deferred issue under --desc-contains"
+        );
     }
 
     #[test]

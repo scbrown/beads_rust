@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      calibrate_benchmarks:
+        description: Run three benchmark passes on one runner (up to six hours)
+        type: boolean
+        default: false
 
 # Cancel in-progress runs for the same branch
 concurrency:
@@ -406,7 +411,7 @@ jobs:
     runs-on: ubuntu-latest
     # A cold single-job release build takes about 27 minutes on hosted runners;
     # leave enough wall time for Criterion to run after compilation completes.
-    timeout-minutes: 120
+    timeout-minutes: ${{ inputs.calibrate_benchmarks && 360 || 120 }}
     # Raised from 60 (aegis-44vjem).
     #
     # THE 27.6m "SUCCESS" OF 2026-09-02 WAS VACUOUS — do not use it as evidence
@@ -447,7 +452,7 @@ jobs:
     # second cold release build in the initial fan-out. Two cold benchmark
     # runners were preempted before Criterion started.
     needs: [check, build]
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || inputs.calibrate_benchmarks
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
@@ -462,6 +467,7 @@ jobs:
           shared-key: ci-native
 
       - name: Restore criterion baseline cache
+        if: ${{ !inputs.calibrate_benchmarks }}
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: target/criterion/
@@ -470,6 +476,7 @@ jobs:
             ${{ runner.os }}-${{ runner.arch }}-criterion-
 
       - name: Snapshot benchmark baseline (if present)
+        if: ${{ !inputs.calibrate_benchmarks }}
         run: |
           if [ -d target/criterion ]; then
             mkdir -p target/criterion_prev
@@ -477,10 +484,15 @@ jobs:
           fi
 
       - name: Run benchmarks
+        if: ${{ !inputs.calibrate_benchmarks }}
         # The previous baseline was copied aside above, so this run only needs
         # to replace `main`. Criterion rejects --baseline and --save-baseline
         # together; allowing that exit to continue made a non-run look green.
         run: cargo bench --bench storage_perf -- --save-baseline main
+
+      - name: Calibrate three passes on this runner
+        if: inputs.calibrate_benchmarks
+        run: python3 scripts/calibrate_benchmarks.py
 
       # ADVISORY, NOT A GATE — deliberately, until the noise band is MEASURED.
       #
@@ -504,6 +516,7 @@ jobs:
       #   4. pin benches to a single runner so the comparison is like-for-like.
       # Until (1)-(4) exist, this reports and never fails.
       - name: Check benchmark regressions (ADVISORY — never fails, see comment)
+        if: ${{ !inputs.calibrate_benchmarks }}
         run: |
           python3 - <<'PY'
           import glob
@@ -578,14 +591,17 @@ jobs:
           PY
 
       - name: Upload benchmark results
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: benchmark-results
-          path: target/criterion/
+          path: |
+            target/criterion/
+            target/benchmark-calibration/
           if-no-files-found: ignore
 
       - name: Save criterion baseline cache
-        if: always()
+        if: ${{ always() && !inputs.calibrate_benchmarks }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: target/criterion/

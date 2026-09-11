@@ -63,6 +63,24 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## v0.5.8-aegis.2 -- 2026-09-11 (Unreleased)
+
+**Fixes a temp-file leak that could exhaust `/tmp` inodes on a busy host.**
+
+- **Scratch databases now remove their opener lease.** Every `br` invocation
+  opens a private reconcile snapshot under `$TMPDIR`; registering it created a
+  `.br-db-openers-<digest>.lock` sidecar that teardown never removed, leaking
+  one zero-byte file per invocation. On the aegis fleet 164,991 accumulated,
+  roughly 8 days from exhausting tmpfs's 1,048,576-inode cap — at which point
+  every temp-file open on the host fails while `df -h` still reports gigabytes
+  free. The lease is named for a digest of the canonical database path rather
+  than a `<db><suffix>` sidecar, so the existing suffix sweep was structurally
+  unable to see it (same family as #299). A *persistent* store's lease is
+  stable and correctly reused, and is deliberately still never unlinked:
+  removing one under a live peer would let the next opener believe it is the
+  sole opener and checkpoint a WAL another process is still reading
+  (#457/#460/#461).
+
 ## v0.5.8-aegis.1 -- 2026-09-05 (Unreleased)
 
 - (describe the changes in this release)

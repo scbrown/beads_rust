@@ -398,7 +398,7 @@ The resource surface is `beads://project/info`, `beads://issues/{id}`,
 
 ```bash
 br --version
-# br 0.5.8-aegis.1
+# br 0.5.8-aegis.2
 ```
 
 ### Verify Release Signatures

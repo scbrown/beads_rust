@@ -9,9 +9,77 @@ from pathlib import Path
 from unittest.mock import patch
 
 from calibrate_benchmarks import main, noise_band, read_means
+from compare_benchmarks import compare
 
 
 class CalibrationTests(unittest.TestCase):
+    def test_gate_accepts_measured_noise_and_rejects_slowdown(self):
+        self.assertEqual(compare({"a": 100}, {"a": 117.693405})["regressions"], {})
+        self.assertEqual(compare({"a": 100}, {"a": 119})["regressions"], {})
+        self.assertIn("a", compare({"a": 100}, {"a": 120})["regressions"])
+
+    def test_gate_refuses_missing_inventory(self):
+        for base, candidate in (
+            ({}, {}),
+            ({"a": 100.0}, {}),
+            ({"a": 100.0}, {"b": 100.0}),
+        ):
+            with self.subTest(base=base), self.assertRaises(ValueError):
+                compare(base, candidate)
+
+    def test_paired_gate_runs_both_commits_and_exits_on_regression(self):
+        from compare_benchmarks import main as paired_main
+
+        for fail_base, ratio in ((False, 1.17), (False, 1.20), (True, 1.0)):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                calls = []
+
+                def run(
+                    command, calls=calls, fail_base=fail_base, ratio=ratio, **kwargs
+                ):
+                    calls.append(command)
+                    if command[0] == "git":
+                        return subprocess.CompletedProcess(command, 0)
+                    self.assertEqual(command[-2:], ["--save-baseline", "paired"])
+                    criterion = Path(kwargs["env"]["CRITERION_HOME"])
+                    if fail_base:
+                        return subprocess.CompletedProcess(command, 9)
+                    path = criterion / "test" / "paired" / "estimates.json"
+                    path.parent.mkdir(parents=True)
+                    value = 100 if criterion.name == "base" else 100 * ratio
+                    path.write_text(json.dumps({"mean": {"point_estimate": value}}))
+                    return subprocess.CompletedProcess(command, 0)
+
+                previous = Path.cwd()
+                try:
+                    os.chdir(root)
+                    with (
+                        patch.dict(os.environ, {"BENCH_BASE": "a" * 40}, clear=True),
+                        patch("compare_benchmarks.subprocess.run", side_effect=run),
+                        patch(
+                            "compare_benchmarks.subprocess.check_output",
+                            return_value="b" * 40,
+                        ),
+                    ):
+                        if fail_base:
+                            with self.assertRaises(subprocess.CalledProcessError):
+                                paired_main()
+                            self.assertEqual(len(calls), 2)
+                            self.assertEqual(
+                                list(
+                                    (root / "target/benchmark-comparison").glob(
+                                        "*/report.json"
+                                    )
+                                ),
+                                [],
+                            )
+                        else:
+                            self.assertEqual(paired_main(), int(ratio > 1.19))
+                            self.assertEqual(len(calls), 3)
+                finally:
+                    os.chdir(previous)
+
     def test_worst_pair_is_not_only_first_versus_last(self):
         result = noise_band(
             [{"a": 100, "b": 200}, {"a": 127, "b": 150}, {"a": 110, "b": 180}]

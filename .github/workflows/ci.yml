@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      calibrate_benchmarks:
+        description: Run three benchmark passes on one runner (up to six hours)
+        type: boolean
+        default: false
+      benchmark_base:
+        description: Exact base commit for a paired benchmark comparison
+        type: string
+        default: ''
 
 # Cancel in-progress runs for the same branch
 concurrency:
@@ -433,9 +442,9 @@ jobs:
   bench:
     name: Benchmarks
     runs-on: ubuntu-latest
-    # A cold single-job release build takes about 27 minutes on hosted runners;
-    # leave enough wall time for Criterion to run after compilation completes.
-    timeout-minutes: 120
+    # Calibration took 201 minutes for one build and three passes. Paired
+    # comparisons build two revisions and measure both on this same runner.
+    timeout-minutes: 360
     # Raised from 60 (aegis-44vjem).
     #
     # THE 27.6m "SUCCESS" OF 2026-09-02 WAS VACUOUS — do not use it as evidence
@@ -455,13 +464,11 @@ jobs:
     # actually RUN — and 60m has never been validated as enough for that, because
     # until they ran nobody had a real duration to check it against.
     #
-    # 120 is therefore a first honest budget, not a concession to a regression.
+    # 120 was therefore a first honest single-pass budget.
     # There is NO measured evidence of a slowdown in the code under test: the
     # only completed-looking data point was the vacuous one above.
     #
-    # If it completes green near 120m, THAT is the signal to split or tune
-    # criterion sampling — do not simply raise this again. If it completes well
-    # under, record the real duration here so the next person has a number.
+    # The current 360m budget is for multiple passes, not a slower single pass.
 
     env:
       # A cold release build exceeded the hosted runner's memory and was
@@ -476,9 +483,11 @@ jobs:
     # second cold release build in the initial fan-out. Two cold benchmark
     # runners were preempted before Criterion started.
     needs: [check, build]
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || inputs.calibrate_benchmarks || inputs.benchmark_base != ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -490,135 +499,32 @@ jobs:
         with:
           shared-key: ci-native
 
-      - name: Restore criterion baseline cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: target/criterion/
-          key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-${{ runner.arch }}-criterion-
+      - name: Prove benchmark gate controls
+        run: python3 -m unittest discover -s scripts -p test_calibrate_benchmarks.py
 
-      - name: Snapshot benchmark baseline (if present)
-        run: |
-          if [ -d target/criterion ]; then
-            mkdir -p target/criterion_prev
-            cp -a target/criterion/. target/criterion_prev/
-          fi
+      - name: Enforce same-runner benchmark regression gate
+        if: ${{ !inputs.calibrate_benchmarks }}
+        env:
+          BENCH_BASE: ${{ github.event.pull_request.base.sha || github.event.before || inputs.benchmark_base }}
+        run: python3 scripts/compare_benchmarks.py
 
-      - name: Run benchmarks
-        # The previous baseline was copied aside above, so this run only needs
-        # to replace `main`. Criterion rejects --baseline and --save-baseline
-        # together; allowing that exit to continue made a non-run look green.
-        run: cargo bench --bench storage_perf -- --save-baseline main
-
-      # ADVISORY, NOT A GATE — deliberately, until the noise band is MEASURED.
-      #
-      # A hard 10% threshold at BENCH_SAMPLE_SIZE=10, comparing across two
-      # different hosted runner instances, is a coin flip rather than a gate.
-      # Measured on run 33964789751: it failed `sync_export/10000` at ratio 1.11
-      # on a commit that changed ZERO .rs files — only ci.yml and a shell script
-      # — so no code change could have caused it. In that same run criterion
-      # reported a swing of [-10.266% .. -2.1501%] on another benchmark, i.e. a
-      # noise band as wide as the threshold it is being compared against.
-      #
-      # That was the check's FIRST real comparison: before the timeout raise it
-      # had never had a saved baseline and always printed "skipping".  Its first
-      # verdict was a false positive, and a gate whose first act is to red main
-      # for no reason is one people learn to route around.
-      #
-      # TO MAKE IT A GATE AGAIN, in this order:
-      #   1. run the suite 3x on ONE commit on ONE runner,
-      #   2. take the maximum observed swing,
-      #   3. set the threshold above it,
-      #   4. pin benches to a single runner so the comparison is like-for-like.
-      # Until (1)-(4) exist, this reports and never fails.
-      - name: Check benchmark regressions (ADVISORY — never fails, see comment)
-        run: |
-          python3 - <<'PY'
-          import glob
-          import json
-          import os
-          import sys
-
-          # A REPORTING threshold now, not a gate. See the step comment.
-          threshold = 1.10
-
-          def emit(kind, message):
-              """Print for the log, annotate for the UI, and record in the summary.
-
-              A step that can only ever exit 0 is invisible in the checks list, so
-              every outcome below is annotated. Otherwise "advisory" degrades into
-              "nobody ever hears about it", which is a worse failure than the
-              flaky gate this replaces.
-              """
-              print(message)
-              print(f"::{kind}::benchmark_regression: {message}")
-              summary = os.environ.get("GITHUB_STEP_SUMMARY")
-              if summary:
-                  with open(summary, "a", encoding="utf-8") as fh:
-                      fh.write(f"**benchmark_regression ({kind}):** {message}\n\n")
-          prev_root = "target/criterion_prev"
-          curr_root = "target/criterion"
-
-          if not os.path.isdir(prev_root):
-              # NOT the same as passing. "Could not compare" and "compared and
-              # found nothing" were both a bare exit 0 with a printed line, so a
-              # green step meant either. Say which.
-              emit("warning", "NO COMPARISON MADE — no previous baseline directory")
-              sys.exit(0)
-
-          prev_files = glob.glob(os.path.join(prev_root, "**", "main", "estimates.json"), recursive=True)
-          if not prev_files:
-              emit("warning", "NO COMPARISON MADE — baseline directory holds no estimates")
-              sys.exit(0)
-
-          regressions = []
-          for prev_path in prev_files:
-              rel = os.path.relpath(prev_path, prev_root)
-              curr_path = os.path.join(curr_root, rel)
-              if not os.path.exists(curr_path):
-                  continue
-              with open(prev_path, "r", encoding="utf-8") as fh:
-                  prev = json.load(fh)
-              with open(curr_path, "r", encoding="utf-8") as fh:
-                  curr = json.load(fh)
-              prev_mean = prev.get("mean", {}).get("point_estimate", 0.0)
-              curr_mean = curr.get("mean", {}).get("point_estimate", 0.0)
-              if prev_mean <= 0:
-                  continue
-              ratio = curr_mean / prev_mean
-              if ratio > threshold:
-                  regressions.append((rel, prev_mean, curr_mean, ratio))
-
-          if regressions:
-              detail = "; ".join(
-                  f"{rel} prev={prev_mean:.2f} curr={curr_mean:.2f} ratio={ratio:.2f}"
-                  for rel, prev_mean, curr_mean, ratio in regressions
-              )
-              emit(
-                  "warning",
-                  f"{len(regressions)} benchmark(s) over {threshold:.2f}x — {detail}. "
-                  "ADVISORY: this does not fail the build, and at the current "
-                  "sample size it may be runner noise rather than a regression.",
-              )
-              sys.exit(0)
-
-          emit("notice", f"compared {len(prev_files)} benchmark(s), none over {threshold:.2f}x")
-          PY
+      - name: Calibrate three passes on this runner
+        if: inputs.calibrate_benchmarks
+        run: python3 scripts/calibrate_benchmarks.py
 
       - name: Upload benchmark results
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: benchmark-results
-          path: target/criterion/
+          path: |
+            target/criterion/
+            target/benchmark-calibration/
+            target/benchmark-comparison/*/*.json
+            target/benchmark-comparison/*/*.log
+            target/benchmark-comparison/*/base/
+            target/benchmark-comparison/*/candidate/
           if-no-files-found: ignore
-
-      - name: Save criterion baseline cache
-        if: always()
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
-        with:
-          path: target/criterion/
-          key: ${{ runner.os }}-${{ runner.arch }}-criterion-${{ github.run_id }}
 
   # Verify version auditing info is correctly embedded
   version-audit:

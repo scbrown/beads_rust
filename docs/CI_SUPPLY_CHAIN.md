@@ -141,3 +141,27 @@ When changing or adding an external action:
 8. Run `ubs` on the changed workflow, inventory, script, test, and docs files before committing.
 
 This repository's integration branch is `main`. Any legacy branch mirroring is an explicit release/operator responsibility and should not be reintroduced as a workflow trigger target.
+
+## Benchmark regression measurement
+
+The Benchmarks job measures base and candidate in the same hosted job, with the
+candidate toolchain and ten samples for both. PRs use their base SHA; main pushes
+use the preceding SHA. A manual comparison requires `benchmark_base` as a full
+commit SHA. Each comparison uses fresh result directories; Criterion estimates
+from other jobs are never restored. Missing, invalid, or mismatched inventories
+fail the job, as does any mean exceeding 1.19 times its base mean.
+
+Calibration provenance: [run 34308045723](https://github.com/scbrown/beads_rust/actions/runs/34308045723),
+commit `ec3b492dde8bc98b01cd1e0ea6d1637853a305de`, three complete passes of one
+binary (SHA256 `6948e3495533c9c3fb2ac354fee14615d08aca266a3167f4a96ef9d5bd8a094b`)
+on one runner boot. All three inventories contained 54 benchmarks. Recomputing
+max(mean)/min(mean) from the raw estimates gives 1.1769340490939943, or
+17.693404909399433%, at `storage_add_dep/single`. Rounding up and adding one
+percentage point gives the 19% gate. This is an observed band, not a statistical
+guarantee against future runner noise. Recalibrate when the runner or suite changes.
+
+`calibrate_benchmarks=true` remains available for three passes of one binary.
+The six-hour budget accommodates either calibration or two revision builds and
+measurements. Artifacts include logs, revision/runner metadata, raw estimates,
+and reports, including partial artifacts on failure. The job runs the Python
+control tests before measurement; a green gate requires a real comparison.

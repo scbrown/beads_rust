@@ -41,7 +41,25 @@ import json
 import subprocess
 import sys
 
+import re
+
 import yaml
+
+# `${{ matrix.some-key }}` — the key may contain hyphens, which is exactly why a
+# workflow cannot reference it as `matrix.some-key` in an expression (that parses
+# as subtraction) but CAN carry it as a matrix entry field.
+_MATRIX_REF = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
+
+
+def _matrix_key(value: str) -> str | None:
+    """The single matrix field a `${{ matrix.X }}` expression names, else None."""
+    m = _MATRIX_REF.fullmatch(value.strip())
+    return m.group(1) if m else None
+
+
+def _expand_matrix(template: str, entry: dict) -> str:
+    """Render a job-name template such as `Build (${{ matrix.name }})` for one entry."""
+    return _MATRIX_REF.sub(lambda m: str(entry.get(m.group(1), m.group(0))), template)
 
 
 def gh(*args: str) -> str:
@@ -90,6 +108,21 @@ def main() -> int:
         for jid, j in (ci.get("jobs") or {}).items():
             name = j.get("name", jid)
             t = j.get("timeout-minutes")
+            # A matrix job may set its budget PER ENTRY —
+            # `timeout-minutes: ${{ matrix.build-timeout }}` — because one number
+            # across platforms whose durations differ by 4x is both too loose and
+            # too tight (aegis-g9gu2b). Resolve it per include entry, or this
+            # reads a string where it expects minutes and dies on `mins / t`,
+            # blinding the very instrument that catches these.
+            if isinstance(t, str):
+                key = _matrix_key(t)
+                includes = (((j.get("strategy") or {}).get("matrix") or {}).get("include")) or []
+                if key and includes:
+                    for entry in includes:
+                        if key in entry:
+                            budget[_expand_matrix(name, entry)] = entry[key]
+                    continue                        # resolved; no scalar to record
+                t = None                            # unresolvable expression is UNKNOWN, never a string
             budget[name] = t
             budget[name.split(" (")[0]] = t          # matrix jobs render as "Name (variant)"
 

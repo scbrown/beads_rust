@@ -1350,6 +1350,31 @@ fn database_opener_lease_path(database_path: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!(".br-db-openers-{}.lock", &digest[..24])))
 }
 
+/// Resolve the opener-lease sidecar [`DatabaseOpenerLease::register`] uses for
+/// `database_path`.
+///
+/// Exposed so that a **private, per-process** scratch database family can
+/// remove its own lease when it is torn down. The lease filename is a digest of
+/// the canonical database path rather than a `<db><suffix>` sidecar, so
+/// suffix-based teardown cannot see it — which is how these accumulated one per
+/// invocation until `/tmp` ran out of inodes (aegis-x53s1i).
+///
+/// # Safety of unlinking
+///
+/// Only a lease whose database is private to this process may be removed. A
+/// shared database's lease is deliberately long-lived and reused by every
+/// opener; unlinking it while a peer holds it shared would let the next opener
+/// create a fresh file, take it exclusively, conclude it is the sole opener,
+/// and checkpoint a WAL another process is still reading — the corruption this
+/// lease exists to prevent (GitHub #457/#460/#461).
+///
+/// # Errors
+///
+/// Returns an error when the lease path cannot be derived from `database_path`.
+pub fn database_opener_lease_sidecar_path(database_path: &Path) -> Result<PathBuf> {
+    database_opener_lease_path(database_path)
+}
+
 /// Upper bound on waiting for a peer's exclusive (checkpointing) hold of the
 /// opener lease. A checkpoint is short; a longer wait means the lease is
 /// degraded and the caller proceeds without it rather than hanging br.

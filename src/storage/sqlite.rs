@@ -16528,6 +16528,28 @@ fn finish_issue_mutation_write_probe(
 /// open, so errors are intentionally swallowed (logged at debug level).
 fn remove_temp_db_files(path: &Path) {
     let mut targets = vec![path.to_path_buf()];
+    // The opener lease is named for a DIGEST of the canonical database path,
+    // not a `<db><suffix>` sidecar, so the suffix sweep below is structurally
+    // unable to see it and every scratch open leaked one (aegis-x53s1i).
+    //
+    // Derive it BEFORE anything is unlinked, so the canonicalization sees the
+    // same on-disk state `DatabaseOpenerLease::register` saw and reproduces the
+    // identical name.
+    //
+    // Safe here, and only here: every caller owns a private per-process scratch
+    // family (`beads_mem_<pid>_<n>.db` / `beads_reconcile_snapshot_<pid>_<n>.db`),
+    // so no peer can hold this lease. A shared database's lease must NEVER be
+    // unlinked — see `database_opener_lease_sidecar_path`.
+    match crate::sync::database_opener_lease_sidecar_path(path) {
+        Ok(lease) => targets.push(lease),
+        Err(e) => {
+            tracing::debug!(
+                path = %path.display(),
+                error = %e,
+                "could not derive the opener lease path for temp db cleanup"
+            );
+        }
+    }
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
         for &suffix in crate::config::db_sidecar_suffixes() {
             targets.push(path.with_file_name(format!("{name}{suffix}")));
@@ -24326,6 +24348,90 @@ mod tests {
         }
         // Idempotent / tolerant of already-missing files.
         remove_temp_db_files(&base);
+    }
+
+    /// Regression for aegis-x53s1i: the opener lease is named for a DIGEST of
+    /// the canonical database path, not a `<db><suffix>` sidecar, so the suffix
+    /// sweep above was structurally blind to it and every scratch open leaked
+    /// one zero-byte file into `TMPDIR` — 165,000 of them before `/tmp` inodes
+    /// were noticed. Same family as #299, one filename shape further out.
+    #[test]
+    fn remove_temp_db_files_clears_the_opener_lease_sidecar() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("beads_mem_lease_test_0.db");
+        fs::write(&base, b"x").unwrap();
+
+        // Register a REAL lease, so this asserts on the name br actually
+        // creates rather than on a hand-built guess that could drift.
+        let lease_path = crate::sync::database_opener_lease_sidecar_path(&base).unwrap();
+        {
+            let lease = crate::sync::DatabaseOpenerLease::register(&base).unwrap();
+            assert!(
+                lease.is_registered(),
+                "lease should register on a free file"
+            );
+            assert!(
+                lease_path.exists(),
+                "register must create {}",
+                lease_path.display()
+            );
+        }
+        // Dropping the lease deliberately does NOT unlink it — a shared
+        // database's lease is reused by every opener. Teardown of a PRIVATE
+        // scratch family is what removes it.
+        assert!(
+            lease_path.exists(),
+            "dropping a lease must not unlink it; only scratch teardown may"
+        );
+
+        remove_temp_db_files(&base);
+
+        assert!(!base.exists(), "temp db should have been removed");
+        assert!(
+            !lease_path.exists(),
+            "opener lease leaked: {}",
+            lease_path.display()
+        );
+        // Idempotent / tolerant of already-missing files.
+        remove_temp_db_files(&base);
+    }
+
+    /// End-to-end form of the above: the reconcile snapshot every `br`
+    /// invocation opens must leave no opener lease behind. This asserts on the
+    /// exact snapshot path the call used, so it is unaffected by concurrent
+    /// `br` processes writing into the same shared `TMPDIR`.
+    #[test]
+    fn reconcile_snapshot_removes_its_opener_lease_on_drop() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("beads.db");
+        drop(SqliteStorage::open(&db_path).unwrap());
+
+        let snapshot = SqliteStorage::open_current_read_only_snapshot(&db_path)
+            .unwrap()
+            .expect("a freshly created database must be snapshot-able");
+        let snapshot_path = snapshot
+            .temp_db_path
+            .clone()
+            .expect("a snapshot must record its temp db path");
+        let lease_path = crate::sync::database_opener_lease_sidecar_path(&snapshot_path).unwrap();
+        assert!(
+            lease_path.exists(),
+            "the snapshot open should have registered {}",
+            lease_path.display()
+        );
+
+        drop(snapshot);
+
+        assert!(
+            !snapshot_path.exists(),
+            "snapshot db leaked: {}",
+            snapshot_path.display()
+        );
+        assert!(
+            !lease_path.exists(),
+            "snapshot opener lease leaked: {}",
+            lease_path.display()
+        );
     }
 
     #[test]

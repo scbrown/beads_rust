@@ -338,10 +338,32 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  # ONE budget across five platforms whose durations differ by 4x does not work:
+  # it is simultaneously too loose for linux (8m of work under a 30m wall) and
+  # too tight for the slowest entry. macos-x64 crossed it and cancelled the whole
+  # main run on 2026-09-09 (34329136447) while every other job in that run
+  # SUCCEEDED — measured: linux-x64 8.3m, linux-arm64 8.2m, windows-x64 15.1m,
+  # macos-arm64 19.9m, macos-x64 30.4m against the shared 30. The identical sha
+  # had passed on its PR branch, so it read as flaky rather than as a wall
+  # (aegis-g9gu2b).
+  #
+  # Budgets are therefore PER ENTRY. This is deliberately not the blanket raise
+  # the Test Suite comment above argues against: that job was doing N growing
+  # compiles and needed splitting, because one number for it would keep growing
+  # and keep masking. A single-target release build cannot be split, and the
+  # reason macos-x64 is slow is the runner — the Intel image is ~1.5x its Apple
+  # Silicon sibling for the same work. Giving that ONE entry headroom keeps a
+  # tight, meaningful wall on the other four rather than loosening all five to
+  # the slowest.
+  #
+  # Keep these honest with scripts/audit-workflow-timeout-headroom.sh, which
+  # reads each job against the budget in the commit that ran and flags anything
+  # near its ceiling — a timeout surfaces as `cancelled`, which otherwise reads
+  # as fail-fast collateral from a sibling.
   build:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: ${{ matrix.build-timeout }}
     needs: check
     strategy:
       fail-fast: false
@@ -351,22 +373,29 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: linux-x64
+            build-timeout: 30
           # Linux ARM64 (native runner - 10x faster than QEMU)
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             name: linux-arm64
+            build-timeout: 30
           # macOS Apple Silicon (native)
           - os: macos-14
             target: aarch64-apple-darwin
             name: macos-arm64
-          # macOS Intel
+            build-timeout: 40
+          # macOS Intel — the slowest entry by far; 30.4m was a WALL, not a
+          # duration, so its true cost is unknown and >= that. 60 buys real
+          # headroom while still failing a genuine runaway.
           - os: macos-15-intel
             target: x86_64-apple-darwin
             name: macos-x64
+            build-timeout: 60
           # Windows x64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: windows-x64
+            build-timeout: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 

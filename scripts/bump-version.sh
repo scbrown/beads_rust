@@ -14,6 +14,8 @@
 #   Cargo.lock                    via `cargo update -p beads_rust --offline`
 #   README.md                     the `# br <version>` line under "Verify Installation"
 #   .claude-plugin/plugin.json    "version": "…"
+#   flake.nix                     version = "…";        (test-bound to Cargo.toml)
+#   agent_baseline/examples/version.json   "version": "…"
 #   packaging/homebrew/br.rb      version "…"
 #   packaging/scoop/br.json       "version": "…" and the release download URLs
 #   packaging/aur/PKGBUILD        pkgver=…
@@ -68,6 +70,13 @@ replace_line .claude-plugin/plugin.json '^[[:space:]]*"version": "[^"]+",?$' "\"
 replace_line packaging/homebrew/br.rb '^[[:space:]]*version "[^"]+"$' "version \"$NEW\""
 replace_line packaging/aur/PKGBUILD '^pkgver=' "pkgver=$NEW"
 replace_line packaging/scoop/br.json '^[[:space:]]*"version": "[^"]+",?$' "\"version\": \"$NEW\","
+# flake.nix and the agent baseline are version-bearing and TEST-BOUND, but were
+# missing here: tests/package_manifests.rs asserts flake.nix == Cargo.toml, so a
+# bump without them fails the suite. Both had to be hand-patched after the
+# 0.5.8-aegis.1 cut (3519683e); doing that by hand is what this script exists to
+# stop.
+replace_line flake.nix '^[[:space:]]*version = "[^"]+";$' "version = \"$NEW\";"
+replace_line agent_baseline/examples/version.json '^[[:space:]]*"version": "[^"]+",?$' "\"version\": \"$NEW\","
 
 # Scoop URLs embed the tag and asset version literally. The manifest may lag
 # Cargo.toml (it is refreshed after release assets exist), so the version to
@@ -108,4 +117,4 @@ if [ -z "$DRY" ]; then
   fi
 fi
 
-echo "bump-version: done. Review with: git diff -- Cargo.toml Cargo.lock README.md .claude-plugin/plugin.json packaging CHANGELOG.md"
+echo "bump-version: done. Review with: git diff -- Cargo.toml Cargo.lock README.md .claude-plugin/plugin.json flake.nix agent_baseline/examples/version.json packaging CHANGELOG.md"

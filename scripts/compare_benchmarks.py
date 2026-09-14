@@ -14,13 +14,27 @@ THRESHOLD = 1.19
 
 
 def compare(base: dict[str, float], candidate: dict[str, float]) -> dict:
-    if not base or base.keys() != candidate.keys():
-        raise ValueError("NO COMPARISON MADE: nonempty matching inventories required")
-    ratios = {name: candidate[name] / value for name, value in base.items()}
+    """Compare the benchmarks both revisions have, and name the ones only one has.
+
+    Requiring identical inventories (aegis-pjcpza) red a required gate for any PR
+    that adds or removes a benchmark, with `NO COMPARISON MADE` and no remedy. We
+    compare the intersection instead, but the fail-closed guarantee is unchanged:
+    an empty intersection still raises, so a vacuous comparison can never report
+    success. A benchmark present in base and absent in candidate is its own
+    finding — a deletion can hide a regression — so it is reported, not dropped.
+    """
+    shared = base.keys() & candidate.keys()
+    if not shared:
+        raise ValueError(
+            "NO COMPARISON MADE: the base and candidate inventories share no benchmark"
+        )
+    ratios = {name: candidate[name] / base[name] for name in sorted(shared)}
     return {
         "benchmarks_compared": len(ratios),
         "threshold": THRESHOLD,
         "ratios": ratios,
+        "added": sorted(candidate.keys() - base.keys()),
+        "removed": sorted(base.keys() - candidate.keys()),
         "regressions": {
             name: ratio for name, ratio in ratios.items() if ratio > THRESHOLD
         },
@@ -96,7 +110,16 @@ def main() -> int:
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     failures = report["regressions"]
     message = f"Compared {report['benchmarks_compared']} benchmarks on one runner; {len(failures)} over {THRESHOLD}x. {failures}"
-    print(f"::{'error' if failures else 'notice'}::{message}")
+    if report["added"]:
+        message += f" Added, so not compared: {report['added']}."
+    if report["removed"]:
+        message += (
+            " Removed, so not compared — a deleted benchmark can hide a regression: "
+            f"{report['removed']}."
+        )
+    inventory_changed = bool(report["added"] or report["removed"])
+    level = "error" if failures else "warning" if inventory_changed else "notice"
+    print(f"::{level}::{message}")
     if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
         with Path(summary).open("a") as stream:
             stream.write(f"## Benchmark regression gate\n\n{message}\n")

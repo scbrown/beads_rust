@@ -1,5 +1,6 @@
 """Calibration must measure the worst pair and refuse incomplete measurements."""
 
+import io
 import json
 import os
 import subprocess
@@ -22,10 +23,44 @@ class CalibrationTests(unittest.TestCase):
         for base, candidate in (
             ({}, {}),
             ({"a": 100.0}, {}),
+            ({}, {"a": 100.0}),
             ({"a": 100.0}, {"b": 100.0}),
         ):
-            with self.subTest(base=base), self.assertRaises(ValueError):
-                compare(base, candidate)
+            with self.subTest(base=base, candidate=candidate):
+                with self.assertRaises(ValueError) as caught:
+                    compare(base, candidate)
+                self.assertIn("NO COMPARISON MADE", str(caught.exception))
+
+    def test_added_benchmark_compares_the_intersection_and_names_the_addition(self):
+        report = compare({"a": 100.0}, {"a": 100.0, "b": 100.0})
+        self.assertEqual(report["benchmarks_compared"], 1)
+        self.assertEqual(report["ratios"], {"a": 1.0})
+        self.assertEqual(report["added"], ["b"])
+        self.assertEqual(report["removed"], [])
+        self.assertEqual(report["regressions"], {})
+
+    def test_removed_benchmark_compares_the_intersection_and_names_the_removal(self):
+        report = compare({"a": 100.0, "b": 100.0}, {"a": 100.0})
+        self.assertEqual(report["benchmarks_compared"], 1)
+        self.assertEqual(report["ratios"], {"a": 1.0})
+        self.assertEqual(report["added"], [])
+        self.assertEqual(report["removed"], ["b"])
+        self.assertEqual(report["regressions"], {})
+
+    def test_inventory_change_never_masks_a_regression_in_the_shared_set(self):
+        report = compare({"a": 100.0, "gone": 100.0}, {"a": 120.0, "new": 100.0})
+        self.assertIn("a", report["regressions"])
+        self.assertEqual(report["added"], ["new"])
+        self.assertEqual(report["removed"], ["gone"])
+        self.assertEqual(report["benchmarks_compared"], 1)
+
+    def test_intersection_boundary_is_the_same_measured_noise_band(self):
+        extra = {"only-in-candidate": 1.0}
+        self.assertEqual(
+            compare({"a": 100}, {"a": 117.693405, **extra})["regressions"], {}
+        )
+        self.assertEqual(compare({"a": 100}, {"a": 119, **extra})["regressions"], {})
+        self.assertIn("a", compare({"a": 100}, {"a": 120, **extra})["regressions"])
 
     def test_paired_gate_runs_both_commits_and_exits_on_regression(self):
         from compare_benchmarks import main as paired_main
@@ -79,6 +114,61 @@ class CalibrationTests(unittest.TestCase):
                             self.assertEqual(len(calls), 3)
                 finally:
                     os.chdir(previous)
+
+    def test_inventory_change_is_reported_in_the_annotation_and_step_summary(self):
+        """An added benchmark must land the gate green AND name itself (aegis-pjcpza).
+
+        The report keys are covered above; this drives main() so the operator-facing
+        half — the ::warning:: annotation and the step summary a PR author actually
+        reads — is proven rather than assumed.
+        """
+        from compare_benchmarks import main as paired_main
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            summary = root / "step-summary.md"
+
+            def run(command, **kwargs):
+                if command[0] == "git":
+                    return subprocess.CompletedProcess(command, 0)
+                criterion = Path(kwargs["env"]["CRITERION_HOME"])
+                names = ["shared"] if criterion.name == "base" else ["shared", "fresh"]
+                for name in names:
+                    path = criterion / name / "paired" / "estimates.json"
+                    path.parent.mkdir(parents=True)
+                    path.write_text(json.dumps({"mean": {"point_estimate": 100}}))
+                return subprocess.CompletedProcess(command, 0)
+
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                with (
+                    patch.dict(
+                        os.environ,
+                        {
+                            "BENCH_BASE": "a" * 40,
+                            "GITHUB_STEP_SUMMARY": str(summary),
+                        },
+                        clear=True,
+                    ),
+                    patch("compare_benchmarks.subprocess.run", side_effect=run),
+                    patch(
+                        "compare_benchmarks.subprocess.check_output",
+                        return_value="b" * 40,
+                    ),
+                    patch("sys.stdout", new_callable=io.StringIO) as stream,
+                ):
+                    self.assertEqual(paired_main(), 0)
+                    annotation = stream.getvalue()
+            finally:
+                os.chdir(previous)
+
+            # Green, but loud: an inventory change is a warning, never a silent pass.
+            self.assertIn("::warning::", annotation)
+            self.assertNotIn("::error::", annotation)
+            self.assertIn("fresh", annotation)
+            self.assertIn("Compared 1 benchmarks", annotation)
+            self.assertIn("fresh", summary.read_text())
 
     def test_worst_pair_is_not_only_first_versus_last(self):
         result = noise_band(

@@ -1572,13 +1572,15 @@ enum SearchIssueProjection {
 /// Matches the issue's title, description, and id, plus the bodies of its
 /// comments (beads_rust#416): agent workflows put durable handoffs and
 /// decisions in comments, so a comment-only token must still be findable.
+/// Materialize matching comment IDs once: a correlated EXISTS rescans comments
+/// for each issue on engines without a correlated-subquery index plan. LIMIT
+/// cannot bound that work when the outer query must sort the matching issues.
 /// Binds four identical lowercase needle parameters.
 const SEARCH_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
      OR instr(lower(description), ?) > 0 \
      OR instr(lower(id), ?) > 0 \
-     OR EXISTS (SELECT 1 FROM comments \
-                WHERE comments.issue_id = issues.id \
-                  AND instr(lower(comments.text), ?) > 0))";
+     OR issues.id IN (SELECT comments.issue_id FROM comments \
+                      WHERE instr(lower(comments.text), ?) > 0))";
 
 /// Equivalent search predicate for whole-corpus counts.
 ///
@@ -1586,11 +1588,7 @@ const SEARCH_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
 /// closed issue. Materializing the matching comment issue IDs once avoids
 /// rerunning the comment lookup for every outer issue while preserving the
 /// exact substring and deduplication semantics of `SEARCH_NEEDLE_PREDICATE`.
-const SEARCH_COUNT_NEEDLE_PREDICATE: &str = "(instr(lower(title), ?) > 0 \
-     OR instr(lower(description), ?) > 0 \
-     OR instr(lower(id), ?) > 0 \
-     OR issues.id IN (SELECT comments.issue_id FROM comments \
-                      WHERE instr(lower(comments.text), ?) > 0))";
+const SEARCH_COUNT_NEEDLE_PREDICATE: &str = SEARCH_NEEDLE_PREDICATE;
 
 #[derive(Clone, Copy)]
 enum BlockedIssueProjection {
@@ -33292,6 +33290,51 @@ mod tests {
             vec!["bd-high-new", "bd-high-old", "bd-low"]
         );
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_search_all_common_comment_bounded_and_deduplicated() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+        for batch in 0..30 {
+            let mut issues = Vec::new();
+            let mut comments = Vec::new();
+            for offset in 0..100 {
+                let n = batch * 100 + offset;
+                issues.push(format!(
+                    "('probe-{n:04}', 'ordinary', 'closed', '2026-01-01T00:00:00Z', \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+                ));
+                comments.push(format!("('probe-{n:04}', 'test', 'Recovered fixture')"));
+            }
+            storage.conn.execute(&format!(
+                "INSERT INTO issues (id,title,status,created_at,updated_at,closed_at) VALUES {}",
+                issues.join(",")
+            )).unwrap();
+            storage
+                .conn
+                .execute(&format!(
+                    "INSERT INTO comments (issue_id,author,text) VALUES {}",
+                    comments.join(",")
+                ))
+                .unwrap();
+        }
+        storage.conn.execute(
+            "INSERT INTO comments (issue_id,author,text) VALUES ('probe-0000','test','recovered twice')"
+        ).unwrap();
+        storage.conn.execute("COMMIT").unwrap();
+        let filters = ListFilters {
+            include_closed: true,
+            limit: Some(10),
+            ..ListFilters::default()
+        };
+        let started = std::time::Instant::now();
+        let issues = storage.search_issues("RECOVERED", &filters).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(issues.len(), 10);
+        for (n, issue) in issues.iter().enumerate() {
+            assert_eq!(issue.id, format!("probe-{n:04}"));
+        }
     }
 
     #[test]

@@ -4200,6 +4200,31 @@ pub struct OpenStorageResult {
 }
 
 impl OpenStorageResult {
+    /// Finish startup mutation work before a potentially long read operation.
+    ///
+    /// Reopen while authority is still held so schema/recovery cannot race the
+    /// transition. Never simply unlock a writable engine connection: its Drop
+    /// may checkpoint. Callers must also drop their own authority clones.
+    ///
+    /// # Errors
+    /// Returns an error if current-schema read-only storage cannot be opened.
+    pub fn finish_startup_for_read(&mut self) -> Result<()> {
+        if self.no_db {
+            return Ok(());
+        }
+        // The authority may be borrowed from main rather than owned here.
+        // An empty owned authority field does not prove a read-only connection.
+        let mut read_only = SqliteStorage::open_current_read_only(&self.paths.db_path)?
+            .ok_or_else(|| {
+                BeadsError::Config("Cannot open read-only storage after startup".into())
+            })?;
+        read_only.set_workflow_policy(self.storage.workflow_policy());
+        let writable = std::mem::replace(&mut self.storage, read_only);
+        drop(writable);
+        self.write_authority = None;
+        Ok(())
+    }
+
     /// Clone the database-family authority retained by a writable startup
     /// fallback, if any.
     ///

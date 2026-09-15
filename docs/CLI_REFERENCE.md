@@ -920,6 +920,14 @@ JSON/TOON output always uses the stable wrapper
 selected corpus already includes closed issues. Pass `--all` (or a terminal
 `--status` such as `closed`) to include closed issues.
 
+CLI search execution has a ten-second deadline, including hidden-match counts
+and output. An expired search exits with status **124**, without an additional
+diagnostic (output may itself be blocked). Discard partial output on nonzero exit;
+narrow the query or filters before retrying. Startup recovery and automatic import may
+still require the workspace write lock, but release it before the read-only
+search and output phase. A slow search therefore does not retain startup write
+authority. The deadline does not bound startup recovery or library API calls.
+
 **Examples:**
 ```bash
 # Search in all fields

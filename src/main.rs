@@ -154,7 +154,7 @@ fn main() {
         no_db_jsonl_write,
         pending_merge_mutation_gate_required,
     );
-    let write_lock = if startup_database_authority_required && ctx.is_initialized() {
+    let mut write_lock = if startup_database_authority_required && ctx.is_initialized() {
         let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
         match ctx
             .beads_dir
@@ -364,7 +364,7 @@ fn main() {
     // workspace writer. The gate verdict is final here, so release both the
     // guard and the marked `Arc` clone before dispatch.
     #[cfg(feature = "mcp")]
-    let write_lock = if matches!(cli.command, Commands::Serve(_)) {
+    let mut write_lock = if matches!(cli.command, Commands::Serve(_)) {
         overrides.clear_database_family_lock_marker();
         ctx.overrides.clear_database_family_lock_marker();
         // Shadowing alone would keep the old binding — and its flock — alive
@@ -580,6 +580,45 @@ fn main() {
             // sync_lock drops here, releasing the advisory lock before command execution
         }
     }
+
+    // Search may have needed writable recovery or auto-import at startup.
+    // Retain those gates, but do not hold their authority during the scan.
+    let search_deadline = if matches!(cli.command, Commands::Search(_)) {
+        // A failed optional pre-open must not defer writable startup until
+        // after the watchdog is armed in the command's fallback path.
+        if storage_result.is_none() {
+            storage_result = match open_storage_from_ctx(&mut ctx, write_lock.as_ref()) {
+                Ok(res) => Some(res),
+                Err(error) => handle_error(&error, json_error_mode, color_error_mode),
+            };
+        }
+        if let Some(res) = storage_result.as_mut()
+            && let Err(error) = res.finish_startup_for_read()
+        {
+            handle_error(&error, json_error_mode, color_error_mode);
+        }
+        overrides.clear_database_family_lock_marker();
+        ctx.overrides.clear_database_family_lock_marker();
+        drop(write_lock.take());
+        // Only arm after all persistent write authority has been released.
+        // Engine cancellation is cooperative and cannot bound every SQL path.
+        // Exit without Drop is safe here: search now owns only read-only storage
+        // (or a disposable --no-db scratch database), never pending writes.
+        let (finished, receiver) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if matches!(
+                receiver.recv_timeout(std::time::Duration::from_secs(10)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                // Do not acquire stdout/stderr locks here: output itself may
+                // be blocked. Exit 124 is the documented timeout diagnostic.
+                std::process::exit(124);
+            }
+        });
+        Some(finished)
+    } else {
+        None
+    };
 
     // Phase 4: Command Execution
     let result = match cli.command {
@@ -916,6 +955,8 @@ fn main() {
             commands::agents::execute(&agents_args, &output_ctx)
         }
     };
+
+    drop(search_deadline);
 
     // Handle command result
     if let Err(e) = result {

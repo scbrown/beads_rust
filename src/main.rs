@@ -68,6 +68,31 @@ fn main() {
         }
     };
 
+    // ── EXPORT GATE (aegis-6yksbj) ─────────────────────────────────────────────────
+    // Placed HERE deliberately: `ctx` carries the merged startup config, and nothing has been
+    // opened, locked or auto-imported yet, so a refusal costs nothing and cannot half-mutate.
+    //
+    // The predicate is the UNION of the two that exist, which is WIDER than `is_mutating_command`
+    // alone — on purpose, and the reason is `br init`. init is absent from `is_mutating_command`
+    // and present in `command_must_refuse_during_pending_merge`, and init is precisely the command
+    // that turns an export directory into the local store this gate exists to prevent. Gating on
+    // the narrow predicate would refuse `br create` while permitting the command that makes
+    // `br create` succeed.
+    //
+    // An absent `store.role` — every workspace that exists today — changes nothing.
+    if let Some(layer) = ctx.config.as_ref()
+        && config::store_is_export(layer)
+        && (is_mutating || command_must_refuse_during_pending_merge(&cli.command))
+    {
+        let beads_dir = ctx.beads_dir.clone().unwrap_or_else(|| PathBuf::from(".beads"));
+        let authority = config::store_authority_from_layer(layer).map(String::as_str);
+        handle_error(
+            &export_store_refusal_error(&beads_dir, authority),
+            json_error_mode,
+            color_error_mode,
+        );
+    }
+
     let storage_enabled = ctx.is_initialized() && !ctx.no_db();
     let mut should_auto_import_now =
         command_supports_auto_import && !cli.allow_stale && !ctx.no_auto_import();
@@ -1395,6 +1420,26 @@ fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeSt
             state.diagnostic
         ),
     }
+}
+
+/// Refuse a write against a workspace that declares itself an EXPORT (aegis-6yksbj).
+///
+/// Modelled on `pending_sync_merge_refusal_error`: a workspace-state condition that makes writes
+/// illegal, refused before anything is opened or locked so it cannot half-mutate.
+///
+/// The message must NAME THE AUTHORITY and the `--db` form, because the person who hits this has
+/// done nothing wrong — git tracks the export and ignores the local redirect, so a fresh clone
+/// arrives looking exactly like a store. A refusal that only says "no" sends them to restore a
+/// redirect and conclude the rule was fussiness.
+fn export_store_refusal_error(beads_dir: &Path, authority: Option<&str>) -> BeadsError {
+    let where_it_lives = authority.map_or_else(
+        || "Set `store.authority` in that file to say where the real store is.".to_string(),
+        |a| format!("The store lives at: {a}\n  Write to it explicitly: br --db <that path> <your command>"),
+    );
+    BeadsError::Config(format!(
+        "Refusing to write: {} declares `store.role = export` in config.yaml, so it is a tracked EXPORT of a store that lives elsewhere, not a store.\n  Writing here would mint a local database and put the record where nobody looks.\n  {where_it_lives}",
+        beads_dir.display()
+    ))
 }
 
 fn reviewed_schema_migration_required(source: BeadsError) -> BeadsError {

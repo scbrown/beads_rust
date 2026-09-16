@@ -122,6 +122,33 @@ fn auto_flush_mcp_error(
     )
 }
 
+/// Refuse an MCP mutation against a workspace that declares itself an EXPORT (aegis-6yksbj).
+///
+/// Structured like `sync_lock_mcp_error`: a machine-readable payload plus a message a human can
+/// act on. It names the authority, because the caller has done nothing wrong — git tracks the
+/// export and ignores the local redirect, so a fresh checkout arrives looking exactly like a store.
+fn export_store_mcp_error(beads_dir: &Path, authority: Option<&str>) -> McpError {
+    let mut message = format!(
+        "Refusing to write: {} declares `store.role = export`, so it is a tracked export of a store that lives elsewhere, not a store. Writing here would mint a local database and put the record where nobody looks.",
+        beads_dir.display()
+    );
+    if let Some(a) = authority {
+        message.push_str(&format!(" The store lives at: {a}"));
+    }
+    McpError::with_data(
+        McpErrorCode::ToolExecutionError,
+        message.clone(),
+        json!({
+            "error_type": "STORE_ROLE_EXPORT",
+            "recoverable": false,
+            "message": message,
+            "beads_dir": beads_dir.display().to_string(),
+            "authority": authority,
+            "recovery": "Write to the store named by store.authority, or flip store.role to \"store\" at cutover.",
+        }),
+    )
+}
+
 fn sync_lock_mcp_error(
     beads_dir: &Path,
     jsonl_path: &Path,
@@ -510,6 +537,25 @@ impl BeadsState {
     where
         F: FnMut(&mut SqliteStorage) -> fastmcp_rust::McpResult<R>,
     {
+        // 0. EXPORT GATE (aegis-6yksbj). MCP does not go through `main`'s dispatch, so a gate
+        //    that only covered the CLI would look complete while leaving half the traffic open —
+        //    agents reach beads through MCP at least as often as through the shell.
+        //
+        //    Read per-mutation rather than cached at construction, deliberately: `br serve` is
+        //    long-lived, and the marker FLIPS to `role = "store"` at cutover. A cached value
+        //    would keep refusing after the flip until somebody thought to restart the server,
+        //    which is the kind of stale refusal nobody connects back to its cause. The read is a
+        //    small YAML file and it sits in front of a cross-process lock acquisition, so it is
+        //    not the expensive part of this function.
+        if let Ok(layer) = crate::config::load_startup_config(&self.beads_dir)
+            && crate::config::store_is_export(&layer)
+        {
+            return Err(export_store_mcp_error(
+                &self.beads_dir,
+                crate::config::store_authority_from_layer(&layer).map(String::as_str),
+            ));
+        }
+
         // 1. Acquire the cross-process write lock.
         let write_authority = Arc::new(
             crate::sync::blocking_database_family_write_lock_with_timeout(

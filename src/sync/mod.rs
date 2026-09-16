@@ -15293,15 +15293,11 @@ pub(crate) fn save_base_snapshot_from_jsonl_snapshot(
     save_base_snapshot(&issues, jsonl_dir)
 }
 
-/// Refresh `beads.base.jsonl` with the exact bytes of a finalized flush
-/// export (issue #378).
+/// Replace `beads.base.jsonl` with an explicitly accepted snapshot.
 ///
-/// After a clean `br sync --flush-only`, the database and the JSONL agree, so
-/// the JSONL that just reached disk IS the new common state future 3-way
-/// merges should diff against. Historically only the merge path wrote the
-/// anchor, which left flush-only workspaces (the common agent workflow)
-/// permanently anchor-less: `br doctor` warned `base_jsonl.missing_post_flush`
-/// forever while `br sync --status` reported "In sync".
+/// Callers must establish common history before using this replacement
+/// primitive. A local flush does not establish agreement with another
+/// replica and instead initializes only a missing ancestor.
 ///
 /// This is a byte copy (not a parse + re-serialize) so the anchor matches the
 /// on-disk export exactly. The write goes through the same validated
@@ -15317,6 +15313,26 @@ pub(crate) fn save_base_snapshot_from_jsonl_snapshot(
 pub fn refresh_base_snapshot_from_flushed_jsonl(jsonl_path: &Path, jsonl_dir: &Path) -> Result<()> {
     let source = capture_jsonl_source_snapshot(jsonl_path)?;
     refresh_base_snapshot_from_flushed_jsonl_snapshot(&source, jsonl_dir)
+}
+
+/// Seed a missing merge ancestor without advancing an existing one.
+/// A local export is not evidence that another replica accepted our changes.
+pub(crate) fn initialize_base_snapshot_from_flushed_jsonl_snapshot(
+    source: &JsonlSourceSnapshot,
+    jsonl_dir: &Path,
+) -> Result<()> {
+    let snapshot_path = jsonl_dir.join("beads.base.jsonl");
+    let authority = blocking_jsonl_family_write_lock_with_timeout(&snapshot_path, None)?;
+    if authority.capture_optional_target()?.is_some() {
+        return Ok(());
+    }
+    refresh_base_snapshot_from_flushed_jsonl_snapshot_under_authority(
+        source,
+        jsonl_dir,
+        &JsonlSourceStateWitness::Missing,
+        &authority,
+    )?;
+    Ok(())
 }
 
 pub(crate) fn refresh_base_snapshot_from_flushed_jsonl_snapshot(

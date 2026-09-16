@@ -3,9 +3,8 @@
 # FM: fm-state_files-base-jsonl-missing-or-stale (P2, STALE subset)
 #
 # Initialises a workspace with a seed issue, writes a hand-crafted
-# stale `.beads/beads.base.jsonl` whose mtime predates the live
-# `.beads/issues.jsonl`, then backdates the anchor's mtime so the
-# detector's `base_mtime < live_mtime` predicate fires.
+# prior `.beads/beads.base.jsonl` whose mtime predates the live export.
+# This is valid history, despite the fixture's historical name.
 
 set -euo pipefail
 target_dir="${1:?usage: corrupt.sh <target_dir>}"
@@ -19,10 +18,8 @@ cd "$target_dir"
 "$tool_bin" sync --flush-only >/dev/null 2>&1
 
 # Plant a hand-crafted "stale" anchor with content that's recognisably
-# different from the live JSONL so the post_repair byte-equality check
-# is meaningful. Content is also stored at .fixture_baseline_stale so
-# the post_undo check can verify the chokepoint backup round-trips
-# byte-for-byte.
+# different from the live JSONL so the preservation check is meaningful.
+# Content is also stored at .fixture_baseline_stale for read-back.
 cat > .beads/beads.base.jsonl <<'STALE'
 {"id":"br-stale-fixture-snapshot","title":"stale anchor placeholder","status":"open","priority":2,"issue_type":"task"}
 STALE

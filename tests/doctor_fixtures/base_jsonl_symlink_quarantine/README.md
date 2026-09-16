@@ -28,9 +28,9 @@
   one `rename` op under `fixer_id =
   doctor.base_jsonl_symlink_quarantine`.
 
-The stale-anchor case (`kind: "stale"`) is a separate fixer
-(`doctor.base_jsonl_regen`, cycle 6) and would warrant its own
-fixture; that's deferred.
+Older regular ancestors are valid common history. The historical
+`base_jsonl_stale_regen` fixture now verifies their preservation; Doctor
+must not rewrite them from the local export.
 
 TOCTOU defense: the fixer re-runs `fs::symlink_metadata` at
 fix time to confirm the anchor is still a symlink. If the
@@ -67,4 +67,3 @@ backup+undo (e.g., by adding a `copy_verbatim_preserving_symlinks`
 variant that uses `symlink_metadata` + `read_link` + `symlink_create`),
 the fixture's `[ -L ... ]` branch will take precedence and the
 test still passes.
-

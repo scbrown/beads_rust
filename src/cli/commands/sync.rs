@@ -32,8 +32,8 @@ use crate::sync::{
     export_to_jsonl_with_policy_expected_under_authorities,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     get_issue_ids_from_jsonl_snapshot, id_matches_expected_prefix, import_from_jsonl_snapshot,
-    load_base_snapshot_from_source, plan_reviewed_additive_reconcile, plan_sync_reconcile,
-    read_issues_from_jsonl_snapshot, refresh_base_snapshot_from_flushed_jsonl_snapshot,
+    initialize_base_snapshot_from_flushed_jsonl_snapshot, load_base_snapshot_from_source,
+    plan_reviewed_additive_reconcile, plan_sync_reconcile, read_issues_from_jsonl_snapshot,
     refresh_base_snapshot_from_flushed_jsonl_snapshot_under_authority,
     require_safe_sync_overwrite_path, require_valid_sync_path, restore_tombstones_after_rebuild,
     salvage_invalid_jsonl_records_under_authority, scan_jsonl_snapshot_for_tombstone_filter,
@@ -2599,11 +2599,9 @@ fn execute_flush(
             }
         }
 
-        // Even with nothing to export, maintain the merge anchor from the
-        // clean JSONL (issues #378/#394): a missing anchor is materialized
-        // and a stale anchor is replaced, making `br sync --flush-only` an
-        // idempotent recovery command for the doctor's
-        // `base_jsonl.missing_post_flush` / stale-anchor findings.
+        // A missing merge anchor can be initialized from certified JSONL.
+        // An existing ancestor must survive local exports: replacing it
+        // would make a later merge mistake local edits for unchanged state.
         //
         // IDs/counts alone cannot prove that a same-ID JSONL record still
         // matches the database. Immediately before touching the merge
@@ -2648,25 +2646,7 @@ fn execute_flush(
             }
         }
 
-        // Certified: ensure the anchor holds the exact snapshot bytes (also
-        // covers the missing-anchor case). A byte-identical regular-file
-        // anchor is left untouched so an idempotent no-op flush keeps its
-        // inode; anything else (missing, symlinked, byte-divergent — even
-        // whitespace-only drift the content hash cannot see) is replaced
-        // with the exact snapshot bytes.
-        let anchor_path = path_policy.beads_dir.join("beads.base.jsonl");
-        let snapshot_bytes = {
-            let mut bytes = Vec::with_capacity(usize::try_from(noop_source.size()).unwrap_or(0));
-            std::io::copy(&mut noop_source.reader(), &mut bytes).map_err(BeadsError::Io)?;
-            bytes
-        };
-        let anchor_is_exact = fs::symlink_metadata(&anchor_path)
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
-            && fs::read(&anchor_path).is_ok_and(|bytes| bytes == snapshot_bytes);
-        if !anchor_is_exact {
-            refresh_base_snapshot_from_flushed_jsonl_snapshot(noop_source, &path_policy.beads_dir)?;
-        }
+        initialize_base_snapshot_from_flushed_jsonl_snapshot(noop_source, &path_policy.beads_dir)?;
 
         if use_json {
             let result = FlushResult {
@@ -2737,23 +2717,12 @@ fn execute_flush(
         "Exported issues to JSONL"
     );
 
-    // A clean flush leaves DB == JSONL, so the JSONL that just reached disk
-    // is the new common state future 3-way merges should diff against.
-    // Refresh the merge anchor to match (issue #378): historically only the
-    // merge path wrote `beads.base.jsonl`, leaving flush-only workspaces
-    // permanently anchor-less and tripping the doctor's
-    // `base_jsonl.missing_post_flush` warning while `br sync --status`
-    // reported "In sync". Skip when the export had per-record errors — a
-    // partial export must not become the merge base. Publish the anchor
-    // BEFORE clearing dirty/export metadata so an anchor publication failure
-    // keeps the workspace dirty and remains recoverable by a later explicit
-    // flush: certifying "In sync" over a stale anchor would hand future
-    // 3-way merges the wrong ancestor. (This fail-closed ordering shipped in
-    // 5414143b alongside the failure-injection coverage; the 77ae88ff
-    // tree-preference merge silently reverted it to the older best-effort
-    // wording while keeping the test.)
+    // Bootstrap a missing ancestor only after a clean export. Existing bases
+    // are common history, not a mirror of local state, even with --force.
+    // Keep initialization before finalization so a failed publication leaves
+    // dirty/export metadata available for a safe retry.
     if !report.has_errors() {
-        refresh_base_snapshot_from_flushed_jsonl_snapshot(
+        initialize_base_snapshot_from_flushed_jsonl_snapshot(
             export_result.published_source()?,
             &path_policy.beads_dir,
         )

@@ -2100,7 +2100,6 @@ struct EarlyRepairSummary {
     recovery_aged: bool,
     export_hash: bool,
     base_jsonl_symlink: bool,
-    base_jsonl_stale: bool,
     orphan_tmp: bool,
     jsonl_eof_newline: bool,
     jsonl_bom: bool,
@@ -2125,7 +2124,6 @@ impl EarlyRepairSummary {
             || self.recovery_aged
             || self.export_hash
             || self.base_jsonl_symlink
-            || self.base_jsonl_stale
             || self.orphan_tmp
             || self.jsonl_eof_newline
             || self.jsonl_bom
@@ -2161,9 +2159,6 @@ impl EarlyRepairSummary {
         }
         if self.base_jsonl_symlink {
             actions.push("base_jsonl_symlink_quarantined".to_string());
-        }
-        if self.base_jsonl_stale {
-            actions.push("base_jsonl_anchor_regenerated".to_string());
         }
         if self.orphan_tmp {
             actions.push("orphan_tmp_quarantined".to_string());
@@ -2229,9 +2224,6 @@ impl EarlyRepairSummary {
         }
         if self.base_jsonl_symlink {
             messages.push("Quarantined symlinked merge anchor.".to_string());
-        }
-        if self.base_jsonl_stale {
-            messages.push("Regenerated stale merge anchor from current JSONL.".to_string());
         }
         if self.orphan_tmp {
             messages.push("Quarantined orphan tmp files.".to_string());
@@ -8168,22 +8160,8 @@ fn check_merge_artifacts(
     Ok(())
 }
 
-/// Pass-5 cycle 4: detector for `fm-state_files-base-jsonl-missing-or-stale`.
-///
-/// The `.beads/beads.base.jsonl` file is the canonical 3-way merge anchor
-/// `br sync --merge` reads when reconciling a remote with a local
-/// workspace. The pass-1 archaeology covers three failure shapes:
-/// (a) symlinked anchor (security risk — an attacker shape per
-///     git_sha:401c0495);
-/// (b) anchor older than the live `.beads/issues.jsonl` (stale anchor
-///     produces incorrect 3-way merges);
-/// (c) anchor missing despite a prior sync flush (post-flush
-///     workspaces should have an anchor).
-///
-/// Pass-5 cycle 4 implements (a) and (b). Case (c) requires reading
-/// `metadata.last_export` from the DB which couples the detector to the
-/// DB open path; deferred to a later cycle. The symlink and stale subsets
-/// are repaired by the pass-5 fixers below.
+/// Reject unsafe merge-anchor paths. An ancestor normally predates local
+/// exports; neither its age nor different bytes makes it stale.
 fn check_base_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
     let base_path = beads_dir.join("beads.base.jsonl");
     let meta = match fs::symlink_metadata(&base_path) {
@@ -8226,41 +8204,6 @@ fn check_base_jsonl(beads_dir: &Path, checks: &mut Vec<CheckResult>) {
             Some(serde_json::json!({
                 "path": base_path.display().to_string(),
                 "kind": "symlink",
-            })),
-        );
-        return;
-    }
-
-    // (b) Stale anchor: base mtime older than live JSONL mtime AND the
-    // live JSONL is non-empty. A stale anchor leaks the wrong base into
-    // 3-way merges. We compare only file mtimes (no content hash) at
-    // this layer to keep the detector pure-stat.
-    let live = beads_dir.join("issues.jsonl");
-    let Ok(live_meta) = fs::symlink_metadata(&live) else {
-        push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
-        return;
-    };
-    if !live_meta.is_file() || live_meta.len() == 0 {
-        push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
-        return;
-    }
-    let (Ok(base_mtime), Ok(live_mtime)) = (meta.modified(), live_meta.modified()) else {
-        push_check(checks, "base_jsonl", CheckStatus::Ok, None, None);
-        return;
-    };
-    if base_mtime < live_mtime {
-        push_check(
-            checks,
-            "base_jsonl",
-            CheckStatus::Warn,
-            Some(format!(
-                "Merge anchor {} is older than the live JSONL — 3-way merges will diff against stale state",
-                base_path.display()
-            )),
-            Some(serde_json::json!({
-                "path": base_path.display().to_string(),
-                "kind": "stale",
-                "live_jsonl": live.display().to_string(),
             })),
         );
         return;
@@ -10404,12 +10347,8 @@ fn fix_export_hash_cache_divergence_if_warned(
 /// the attacker-controlled symlink out of the merge path) is correct
 /// regardless.
 ///
-/// Scope of this cycle: SYMLINK case only. The stale-anchor case stays
-/// detect-only because regenerating the anchor is operationally what
-/// `br sync --flush-only` already does — having the doctor duplicate
-/// that behavior would add a second authoritative path for the same
-/// derivation, complicating the chokepoint's "fix did not eliminate
-/// the finding" verify step under partial filesystems.
+/// Only unsafe symlinks are repaired. Older regular ancestors are expected
+/// and must not be replaced with the current local export.
 ///
 /// Returns `true` if the symlinked anchor was quarantined.
 fn fix_base_jsonl_symlink_if_warned(
@@ -10470,111 +10409,6 @@ fn fix_base_jsonl_symlink_if_warned(
         Err(err) => {
             if !ctx.is_json() {
                 ctx.warning(&format!("Failed to quarantine base.jsonl symlink: {err}"));
-            }
-            false
-        }
-    }
-}
-
-/// Pass-5 cycle 6 — fixer for the STALE subset of
-/// `fm-state_files-base-jsonl-missing-or-stale`.
-///
-/// When the doctor's `base_jsonl` check warns with `details.kind ==
-/// "stale"`, regenerate `.beads/beads.base.jsonl` from the current
-/// `.beads/issues.jsonl` bytes via [`chokepoint::mutate(Op::WriteFile)`].
-/// This is exactly what `br sync --flush-only` produces as a side
-/// effect of a clean export; the doctor surfaces it as a named repair
-/// so operators don't need to remember which sync command rewrites
-/// the merge anchor.
-///
-/// Combined with cycle 5's symlink quarantine, this completes
-/// Tier B → Tier A for both detector-emitted subsets of the FM. The
-/// chokepoint snapshots the pre-fix anchor bytes as the verbatim
-/// backup so `doctor undo` restores the stale anchor byte-for-byte
-/// (occasionally useful when the operator wants to compare against
-/// the prior anchor for forensics).
-///
-/// Returns `true` if the stale anchor was regenerated.
-fn fix_base_jsonl_stale_if_warned(
-    beads_dir: &Path,
-    report: &DoctorReport,
-    ctx: &OutputContext,
-    session: Option<&mut DoctorRepairSession>,
-) -> bool {
-    let stale_finding = report.checks.iter().find(|c| {
-        c.name == "base_jsonl"
-            && c.status == CheckStatus::Warn
-            && c.details
-                .as_ref()
-                .and_then(|d| d.get("kind"))
-                .and_then(|v| v.as_str())
-                == Some("stale")
-    });
-    if stale_finding.is_none() {
-        return false;
-    }
-    let Some(session) = session else {
-        if !ctx.is_json() {
-            ctx.warning(
-                "Skipping base-jsonl regeneration: no doctor repair session (run-dir creation failed)",
-            );
-        }
-        return false;
-    };
-
-    let live = beads_dir.join("issues.jsonl");
-    let anchor = beads_dir.join("beads.base.jsonl");
-    let live_bytes = match fs::read(&live) {
-        Ok(b) => b,
-        Err(err) => {
-            if !ctx.is_json() {
-                ctx.warning(&format!(
-                    "Skipping base-jsonl regeneration: cannot read {}: {err}",
-                    live.display()
-                ));
-            }
-            return false;
-        }
-    };
-    // Defensive: never regenerate from an empty JSONL (would silently
-    // truncate the anchor and lose any forensic value). The detector
-    // already skips when live is empty, but re-check at fix time
-    // (TOCTOU defense).
-    if live_bytes.is_empty() {
-        return false;
-    }
-
-    // The detector deliberately uses only mtimes so its common path stays
-    // stat-only. A later write can therefore make issues.jsonl newer even
-    // when its bytes still match the anchor. Do not turn that harmless
-    // timestamp drift into a recorded mutation: repair must be idempotent,
-    // and an identical anchor is already the exact desired state.
-    if fs::read(&anchor).is_ok_and(|anchor_bytes| anchor_bytes == live_bytes) {
-        return false;
-    }
-
-    session.set_fixer("doctor.base_jsonl_regen");
-    match chokepoint::mutate(
-        &session.ctx,
-        &anchor,
-        Op::WriteFile {
-            content: live_bytes,
-            mode: None,
-        },
-    ) {
-        Ok(result) if result.ok => {
-            if !ctx.is_json() {
-                ctx.info(&format!(
-                    "Regenerated merge anchor {} from current JSONL",
-                    anchor.display()
-                ));
-            }
-            true
-        }
-        Ok(_) => false,
-        Err(err) => {
-            if !ctx.is_json() {
-                ctx.warning(&format!("Failed to regenerate base.jsonl anchor: {err}"));
             }
             false
         }
@@ -13139,9 +12973,8 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         };
 
     // Pass-5 cycle 5: quarantine symlinked merge anchor under --repair.
-    // Only the SYMLINK subset of fm-state_files-base-jsonl-missing-or-stale
-    // is auto-fixed; the stale-anchor subset is regenerated from the
-    // live JSONL bytes by cycle 6's fixer below.
+    // Only the SYMLINK subset is unsafe. Existing regular ancestors must
+    // survive local edits, regardless of age or difference from live JSONL.
     let base_jsonl_symlink_repaired = if args.repair
         && fixer_filter.allows("fm-state_files-base-jsonl-missing-or-stale")
     {
@@ -13222,25 +13055,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
             false
         };
     let _ = jsonl_crlf_repaired;
-
-    // Pass-5 cycle 6: regenerate the derived merge anchor only after
-    // every content-normalizing JSONL fixer has run. If the live JSONL
-    // contains a BOM, CRLF endings, or lacks its final newline, writing
-    // the anchor first captures the malformed bytes; the normalization
-    // then immediately makes that new anchor stale and forces a second
-    // repair pass. Source-before-derived ordering keeps the repair
-    // idempotent and ensures undo records only one anchor mutation.
-    let base_jsonl_stale_repaired =
-        if args.repair && fixer_filter.allows("fm-state_files-base-jsonl-missing-or-stale") {
-            let repaired =
-                fix_base_jsonl_stale_if_warned(&beads_dir, &initial.report, ctx, session.as_mut());
-            if repaired {
-                initial = collect_doctor_report_for_cli(&beads_dir, &paths, cli)?;
-            }
-            repaired
-        } else {
-            false
-        };
 
     // Pass-5 cycle 25: strip world-write bit from issues.jsonl via Op::Chmod.
     let jsonl_world_writable_repaired =
@@ -13501,7 +13315,6 @@ pub fn execute(args: &DoctorArgs, cli: &config::CliOverrides, ctx: &OutputContex
         recovery_aged: recovery_aged_repaired,
         export_hash: export_hash_repaired,
         base_jsonl_symlink: base_jsonl_symlink_repaired,
-        base_jsonl_stale: base_jsonl_stale_repaired,
         orphan_tmp: orphan_tmp_repaired,
         jsonl_eof_newline: jsonl_eof_newline_repaired,
         jsonl_bom: jsonl_bom_repaired,
@@ -16151,8 +15964,8 @@ mod tests {
     }
 
     #[test]
-    fn test_check_base_jsonl_stale_anchor_warns() {
-        // base.jsonl mtime < live JSONL mtime → warn stale.
+    fn test_check_base_jsonl_older_ancestor_is_valid() {
+        // A base older than live JSONL is expected after local edits.
         // Use std::fs::FileTimes to deterministically backdate the base
         // anchor rather than relying on real-time sleeps (which are
         // flaky on coarse-mtime filesystems).
@@ -16176,15 +15989,15 @@ mod tests {
         check_base_jsonl(&beads_dir, &mut checks);
         let check = find_check(&checks, "base_jsonl").expect("check present");
         assert!(
-            matches!(check.status, CheckStatus::Warn),
-            "{check:?} should be Warn for stale anchor"
+            matches!(check.status, CheckStatus::Ok),
+            "{check:?} must accept an ancestor older than local state"
         );
         let kind = check
             .details
             .as_ref()
             .and_then(|d| d.get("kind"))
             .and_then(|v| v.as_str());
-        assert_eq!(kind, Some("stale"));
+        assert_eq!(kind, None);
     }
 
     #[cfg(unix)]
@@ -16338,9 +16151,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_base_jsonl_stale_regen_writes_live_bytes() {
-        // Pass-5 cycle 6: stale anchor (older mtime, regular file)
-        // gets regenerated from current JSONL bytes via Op::WriteFile.
+    fn test_check_base_jsonl_different_ancestor_is_preserved() {
+        // A different ancestor is required to distinguish local edits.
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
@@ -16349,7 +16161,7 @@ mod tests {
         fs::write(&anchor, b"{\"id\":\"bd-old\"}\n").unwrap();
         fs::write(&live, b"{\"id\":\"bd-new-1\"}\n{\"id\":\"bd-new-2\"}\n").unwrap();
 
-        // Backdate the anchor so the detector flags it stale.
+        // Backdate the ancestor to exercise the retired mtime heuristic.
         let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
         let anchor_file = std::fs::OpenOptions::new()
             .write(true)
@@ -16368,42 +16180,23 @@ mod tests {
         };
         check_base_jsonl(&beads_dir, &mut report.checks);
         let check = find_check(&report.checks, "base_jsonl").expect("check present");
-        assert!(matches!(check.status, CheckStatus::Warn));
+        assert!(matches!(check.status, CheckStatus::Ok));
         let kind = check
             .details
             .as_ref()
             .and_then(|d| d.get("kind"))
             .and_then(|v| v.as_str());
-        assert_eq!(kind, Some("stale"));
+        assert_eq!(kind, None);
 
-        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
-            .expect("session must build");
-        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
-        assert!(fix_base_jsonl_stale_if_warned(
-            &beads_dir,
-            &report,
-            &ctx,
-            Some(&mut session),
-        ));
-
-        // Anchor now contains the live JSONL bytes.
         assert_eq!(
             fs::read(&anchor).unwrap(),
-            fs::read(&live).unwrap(),
-            "regenerated anchor must equal live JSONL bytes"
+            b"{\"id\":\"bd-old\"}\n",
+            "doctor must preserve common history"
         );
-
-        // actions.jsonl records one write_file op.
-        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
-        let write_count = actions
-            .lines()
-            .filter(|l| l.contains("\"op\":\"write_file\""))
-            .count();
-        assert_eq!(write_count, 1, "actions.jsonl: {actions}");
     }
 
     #[test]
-    fn test_fix_base_jsonl_stale_skips_byte_identical_anchor() {
+    fn test_check_base_jsonl_accepts_byte_identical_older_anchor() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
@@ -16431,24 +16224,9 @@ mod tests {
         };
         check_base_jsonl(&beads_dir, &mut report.checks);
         let check = find_check(&report.checks, "base_jsonl").expect("check present");
-        assert!(matches!(check.status, CheckStatus::Warn));
-
-        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
-            .expect("session must build");
-        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
-        assert!(!fix_base_jsonl_stale_if_warned(
-            &beads_dir,
-            &report,
-            &ctx,
-            Some(&mut session),
-        ));
+        assert!(matches!(check.status, CheckStatus::Ok));
 
         assert_eq!(fs::read(&anchor).unwrap(), content);
-        let actions = fs::read_to_string(&session.run.actions_file).unwrap();
-        assert!(
-            actions.is_empty(),
-            "identical anchor must be a no-op: {actions}"
-        );
     }
 
     #[test]
@@ -16482,9 +16260,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fix_base_jsonl_stale_refuses_empty_live_jsonl() {
-        // TOCTOU defense: never regenerate from an empty live JSONL
-        // (would silently truncate the anchor).
+    fn test_check_base_jsonl_preserves_ancestor_with_empty_live_jsonl() {
         let temp = TempDir::new().unwrap();
         let beads_dir = temp.path().join(".beads");
         fs::create_dir_all(&beads_dir).unwrap();
@@ -16493,30 +16269,15 @@ mod tests {
         // Live JSONL is empty (could happen mid-restore).
         fs::write(beads_dir.join("issues.jsonl"), b"").unwrap();
 
-        // Synthesize a stale-finding report so the fixer is invoked.
         let mut report = DoctorReport {
             ok: false,
             workspace_health: Some("degraded".to_string()),
             reliability_audit: None,
             checks: Vec::new(),
         };
-        push_check(
-            &mut report.checks,
-            "base_jsonl",
-            CheckStatus::Warn,
-            Some("synthetic stale".to_string()),
-            Some(serde_json::json!({"kind": "stale"})),
-        );
-
-        let mut session = DoctorRepairSession::new(temp.path(), /* dry_run = */ false)
-            .expect("session must build");
-        let ctx = OutputContext::from_output_format(crate::cli::OutputFormat::Text, false, true);
-        assert!(!fix_base_jsonl_stale_if_warned(
-            &beads_dir,
-            &report,
-            &ctx,
-            Some(&mut session),
-        ));
+        check_base_jsonl(&beads_dir, &mut report.checks);
+        let check = find_check(&report.checks, "base_jsonl").expect("check present");
+        assert!(matches!(check.status, CheckStatus::Ok));
         // Anchor preserved.
         assert_eq!(fs::read(&anchor).unwrap(), b"{\"id\":\"bd-anchor\"}\n");
     }
@@ -20281,7 +20042,6 @@ mod tests {
             recovery_aged: false,
             export_hash: true,
             base_jsonl_symlink: false,
-            base_jsonl_stale: false,
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
@@ -20343,7 +20103,6 @@ mod tests {
             recovery_aged: false,
             export_hash: false,
             base_jsonl_symlink: false,
-            base_jsonl_stale: false,
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
@@ -20384,7 +20143,6 @@ mod tests {
             recovery_aged: false,
             export_hash: false,
             base_jsonl_symlink: false,
-            base_jsonl_stale: false,
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
@@ -20428,7 +20186,6 @@ mod tests {
             recovery_aged: false,
             export_hash: false,
             base_jsonl_symlink: true,
-            base_jsonl_stale: false,
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
@@ -20464,7 +20221,7 @@ mod tests {
     }
 
     #[test]
-    fn test_early_repair_summary_reports_base_jsonl_stale_regen() {
+    fn test_early_repair_summary_without_repairs_has_no_actions() {
         let summary = EarlyRepairSummary {
             gitignore: false,
             merge_artifacts: false,
@@ -20472,7 +20229,6 @@ mod tests {
             recovery_aged: false,
             export_hash: false,
             base_jsonl_symlink: false,
-            base_jsonl_stale: true,
             orphan_tmp: false,
             jsonl_eof_newline: false,
             jsonl_bom: false,
@@ -20489,22 +20245,12 @@ mod tests {
             db_bloat_vacuum: false,
         };
 
-        assert!(summary.applied());
-        assert_eq!(
-            summary.action_labels(),
-            vec!["base_jsonl_anchor_regenerated".to_string()]
-        );
-        assert_eq!(
-            repair_outcome_message_from_parts(summary.messages(), None, None),
-            "Regenerated stale merge anchor from current JSONL."
-        );
+        assert!(!summary.applied());
+        assert!(summary.action_labels().is_empty());
+        assert!(summary.messages().is_empty());
         let audit = summary.audit_record();
         assert_eq!(audit.phase, "doctor.early_repair");
-        assert_eq!(audit.outcome, "base_jsonl_anchor_regenerated");
-        assert_eq!(
-            audit.applied_actions,
-            vec!["base_jsonl_anchor_regenerated".to_string()]
-        );
+        assert!(audit.applied_actions.is_empty());
     }
 
     #[test]
@@ -20516,7 +20262,6 @@ mod tests {
             recovery_aged: false,
             export_hash: false,
             base_jsonl_symlink: false,
-            base_jsonl_stale: false,
             orphan_tmp: true,
             jsonl_eof_newline: false,
             jsonl_bom: false,

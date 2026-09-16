@@ -303,17 +303,87 @@ fn e2e_sync_status_reports_workspace_health_and_reliability_audit() {
     );
 }
 
-/// Issue #378: `br sync --flush-only` maintains the merge anchor
-/// (`beads.base.jsonl`) so `br doctor` and `br sync --status` agree.
-///
-/// Historically only the merge path wrote the anchor: flush-only workspaces
-/// (the common agent workflow) accumulated `metadata.last_export_time`
-/// without ever growing an anchor, so `br doctor` warned
-/// `base_jsonl.missing_post_flush` forever while `br sync --status` reported
-/// a fully healthy "In sync". The flush path now (a) refreshes the anchor
-/// from the finalized export and (b) materializes a missing anchor even on a
-/// no-op flush, making `br sync --flush-only` the idempotent recovery
-/// command the doctor warning names.
+#[test]
+fn e2e_flush_preserves_both_replicas_edits_during_later_merge() {
+    for mode in ["noflush", "noop", "dirty", "force"] {
+        let local = BrWorkspace::new();
+        let remote = BrWorkspace::new();
+        for workspace in [&local, &remote] {
+            let init = run_br(workspace, ["init", "--prefix", "ar"], "init");
+            assert!(init.status.success(), "{}", init.stderr);
+        }
+        let mut ids = Vec::new();
+        for title in ["alpha", "beta"] {
+            let created = run_br(&local, ["create", title, "--json"], title);
+            assert!(created.status.success(), "{}", created.stderr);
+            let value: Value =
+                serde_json::from_str(&extract_json_payload(&created.stdout)).unwrap();
+            ids.push(value["id"].as_str().unwrap().to_string());
+        }
+        let flush = run_br(&local, ["sync", "--flush-only"], "baseline");
+        assert!(flush.status.success(), "{}", flush.stderr);
+        let local_dir = local.root.join(".beads");
+        let remote_dir = remote.root.join(".beads");
+        let ancestor = std::fs::read(local_dir.join("beads.base.jsonl")).unwrap();
+        std::fs::copy(
+            local_dir.join("issues.jsonl"),
+            remote_dir.join("issues.jsonl"),
+        )
+        .unwrap();
+        let import = run_br(&remote, ["sync", "--import-only"], "import");
+        assert!(import.status.success(), "{}", import.stderr);
+        std::fs::write(remote_dir.join("beads.base.jsonl"), &ancestor).unwrap();
+
+        let mut close_args = vec!["close", ids[0].as_str(), "--reason", "local close"];
+        if mode == "dirty" {
+            close_args.push("--no-auto-flush");
+        }
+        let closed = run_br(&local, close_args, "close_local");
+        assert!(closed.status.success(), "{}", closed.stderr);
+        if mode != "noflush" {
+            let mut args = vec!["sync", "--flush-only"];
+            if mode == "force" {
+                args.push("--force");
+            }
+            let flushed = run_br(&local, args, "flush_local");
+            assert!(flushed.status.success(), "{mode}: {}", flushed.stderr);
+        }
+        assert_eq!(
+            std::fs::read(local_dir.join("beads.base.jsonl")).unwrap(),
+            ancestor,
+            "{mode}: exporting local edits must not advance the common ancestor"
+        );
+
+        let closed = run_br(
+            &remote,
+            ["close", &ids[1], "--reason", "remote close"],
+            "close_remote",
+        );
+        assert!(closed.status.success(), "{}", closed.stderr);
+        let flushed = run_br(&remote, ["sync", "--flush-only"], "flush_remote");
+        assert!(flushed.status.success(), "{}", flushed.stderr);
+        std::fs::copy(
+            remote_dir.join("issues.jsonl"),
+            local_dir.join("issues.jsonl"),
+        )
+        .unwrap();
+        let merged = run_br(&local, ["sync", "--merge"], "merge");
+        assert!(merged.status.success(), "{mode}: {}", merged.stderr);
+        for id in &ids {
+            let shown = run_br(&local, ["show", id, "--json"], "verify");
+            assert!(shown.status.success(), "{}", shown.stderr);
+            let value: Value = serde_json::from_str(&extract_json_payload(&shown.stdout)).unwrap();
+            assert_eq!(value[0]["status"], "closed", "{mode}: {value}");
+        }
+        assert_eq!(
+            std::fs::read(local_dir.join("beads.base.jsonl")).unwrap(),
+            std::fs::read(local_dir.join("issues.jsonl")).unwrap(),
+            "a completed merge, unlike a local flush, must advance the ancestor"
+        );
+    }
+}
+
+/// Flush initializes a missing anchor, but preserves existing common history.
 #[test]
 fn e2e_flush_only_maintains_merge_anchor_and_doctor_agrees() {
     let workspace = BrWorkspace::new();
@@ -367,11 +437,10 @@ fn e2e_flush_only_maintains_merge_anchor_and_doctor_agrees() {
         "an exact anchor must keep its inode across an idempotent no-op flush"
     );
 
-    // Stale-anchor no-op path: the same recovery command must replace stale
-    // bytes even though there is still nothing to export from the database.
+    // A different ancestor is not stale merely because the export changed.
     std::fs::write(
         &anchor_path,
-        b"{\"id\":\"stale-anchor\",\"title\":\"must be replaced\"}\n",
+        b"{\"id\":\"prior-anchor\",\"title\":\"common history\"}\n",
     )
     .expect("write stale anchor");
     let flush_stale = run_br(&workspace, ["sync", "--flush-only"], "flush_stale");
@@ -382,12 +451,11 @@ fn e2e_flush_only_maintains_merge_anchor_and_doctor_agrees() {
     );
     assert_eq!(
         std::fs::read(&anchor_path).expect("read repaired anchor"),
-        std::fs::read(&jsonl_path).expect("read jsonl after stale repair"),
-        "a no-op flush must replace a stale merge anchor with exact JSONL bytes"
+        b"{\"id\":\"prior-anchor\",\"title\":\"common history\"}\n",
+        "a no-op flush must preserve the existing merge ancestor"
     );
 
-    // Real export path: a dirty issue forces an actual export, which must
-    // refresh the anchor to the newly finalized JSONL.
+    // Even a forced real export cannot establish new common history.
     let create2 = run_br(&workspace, ["create", "Second issue"], "create2");
     assert!(
         create2.status.success(),
@@ -406,8 +474,8 @@ fn e2e_flush_only_maintains_merge_anchor_and_doctor_agrees() {
     );
     assert_eq!(
         std::fs::read(&anchor_path).expect("read anchor"),
-        std::fs::read(&jsonl_path).expect("read jsonl"),
-        "anchor must track the finalized JSONL after a real export"
+        b"{\"id\":\"prior-anchor\",\"title\":\"common history\"}\n",
+        "forced export must preserve the existing ancestor"
     );
 
     // Doctor must agree with sync --status: no missing-anchor warning.
@@ -636,7 +704,7 @@ fn e2e_reconcile_additive_dry_run_emits_bounded_plan() {
 }
 
 #[test]
-fn e2e_noop_anchor_accepts_whitespace_only_change_and_copies_exact_bytes() {
+fn e2e_noop_anchor_accepts_whitespace_only_change_and_preserves_ancestor() {
     let (workspace, _issue_id) = setup_certified_anchor_workspace("whitespace_only");
     let beads_dir = workspace.root.join(".beads");
     let jsonl_path = beads_dir.join("issues.jsonl");
@@ -677,8 +745,8 @@ fn e2e_noop_anchor_accepts_whitespace_only_change_and_copies_exact_bytes() {
         "successful certification must not rewrite the source JSONL"
     );
     assert_eq!(
-        after.anchor, before.jsonl,
-        "successful certification must copy the exact whitespace-changed bytes"
+        after.anchor, before.anchor,
+        "successful certification must preserve the ancestor bytes"
     );
     assert_eq!(
         after.metadata, before.metadata,

@@ -5468,7 +5468,10 @@ pub fn store_role_from_layer(layer: &ConfigLayer) -> Option<&String> {
 /// acquiring any knowledge of that deployment.
 #[must_use]
 pub fn store_authority_from_layer(layer: &ConfigLayer) -> Option<&String> {
-    get_startup_value(layer, &["store.authority", "store-authority", "store_authority"])
+    get_startup_value(
+        layer,
+        &["store.authority", "store-authority", "store_authority"],
+    )
 }
 
 /// True when this workspace declares itself an export and must refuse writes.

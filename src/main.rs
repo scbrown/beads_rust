@@ -84,7 +84,10 @@ fn main() {
         && config::store_is_export(layer)
         && (is_mutating || command_must_refuse_during_pending_merge(&cli.command))
     {
-        let beads_dir = ctx.beads_dir.clone().unwrap_or_else(|| PathBuf::from(".beads"));
+        let beads_dir = ctx
+            .beads_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".beads"));
         let authority = config::store_authority_from_layer(layer).map(String::as_str);
         handle_error(
             &export_store_refusal_error(&beads_dir, authority),

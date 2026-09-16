@@ -56,7 +56,11 @@ fn export_marker_refuses_create_and_control_still_creates() {
     // ARM 2 (CONTROL): same command, same shape of workspace, no marker -> must still work.
     // This is what makes arm 1 evidence about the marker rather than about br being broken.
     let ordinary = workspace_with_role(None);
-    let created = run_br(&ordinary, ["create", "ordinary workspace"], "create-control");
+    let created = run_br(
+        &ordinary,
+        ["create", "ordinary workspace"],
+        "create-control",
+    );
     assert!(
         created.status.success(),
         "CONTROL FAILED: create refused without the marker, so arm 1 proves nothing: {}",
@@ -109,7 +113,11 @@ fn role_store_is_explicitly_permitted_so_the_cutover_flip_is_testable() {
     // At cutover the marker flips to `role = "store"` in one commit. That flip must be a working
     // workspace, not merely a non-export one, or the cutover is untested until it happens.
     let flipped = workspace_with_role(Some("store"));
-    let created = run_br(&flipped, ["create", "after the cutover flip"], "create-role-store");
+    let created = run_br(
+        &flipped,
+        ["create", "after the cutover flip"],
+        "create-role-store",
+    );
     assert!(
         created.status.success(),
         "role=store refused a write, so the cutover flip would not work: {}",

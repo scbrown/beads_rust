@@ -63,6 +63,32 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## v0.5.8-aegis.3 -- 2026-09-16 (Unreleased)
+
+**Why this version exists at all:** the export gate below is a BEHAVIOURAL change that shipped
+under an unchanged version string, so `br --version` returned the same answer whether or not a
+host had it. Any fleet currency check keyed on the version string was therefore blind to it —
+and such a check would have looked like it was working. The bump is the discriminator.
+
+### Refuse writes to a workspace that declares `store.role = export`
+
+A git-tracked EXPORT of a store is indistinguishable from a store: the export
+(`.beads/issues.jsonl`) is tracked, while the thing that says "the real store is elsewhere"
+(`.beads/redirect`) holds an absolute local path and is ignored. So a fresh clone, a
+`git clean -xfd` and a new worktree all arrive looking like a store, and the first write mints a
+local database and puts the record where nobody looks.
+
+`store.role = export` in `.beads/config.yaml` makes br refuse mutating commands and name
+`store.authority` instead. Reads are never gated. An absent `store.role` — every workspace that
+exists today — changes nothing, and an unrecognized value fails open, because the cost of a wrong
+refusal here is a user who cannot write anything and no obvious cause.
+
+Enforced at three choke points, because one is not a guarantee: the CLI (before any open, lock or
+auto-import), the routed-workspace write lock (a routed write targets a different workspace whose
+config `main` never loaded), and MCP `with_mutation` (which does not go through `main`'s dispatch
+at all). The MCP check reads the marker per-mutation rather than caching it, so the cutover flip to
+`role = "store"` takes effect without restarting a long-lived `br serve`.
+
 ## v0.5.8-aegis.2 -- 2026-09-11 (Unreleased)
 
 **Fixes a temp-file leak that could exhaust `/tmp` inodes on a busy host.**

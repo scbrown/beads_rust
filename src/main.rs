@@ -1502,7 +1502,11 @@ fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeSt
 fn export_store_read_refusal_error(beads_dir: &Path, authority: Option<&str>) -> BeadsError {
     let where_it_lives = authority.map_or_else(
         || "Set `store.authority` in that file to say where the real store is.".to_string(),
-        |a| format!("The store lives at: {a}\n  Read it explicitly: br --db <that path> <your command>"),
+        |a| {
+            format!(
+                "The store lives at: {a}\n  Read it explicitly: br --db <that path> <your command>"
+            )
+        },
     );
     BeadsError::Config(format!(
         "Refusing to import: {} declares `store.role = export` in config.yaml, so it is a tracked EXPORT of a store that lives elsewhere, not a store.\n  Answering this read would auto-import the whole export into a newly minted local database — the fork this marker exists to prevent, reached through a read instead of a write.\n  {where_it_lives}",

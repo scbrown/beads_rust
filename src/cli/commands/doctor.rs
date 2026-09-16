@@ -20249,7 +20249,8 @@ mod tests {
         assert!(summary.action_labels().is_empty());
         assert!(summary.messages().is_empty());
         let audit = summary.audit_record();
-        assert_eq!(audit.phase, "doctor.early_repair");
+        assert_eq!(audit.phase, "doctor.noop");
+        assert_eq!(audit.outcome, "nothing_to_repair");
         assert!(audit.applied_actions.is_empty());
     }
 

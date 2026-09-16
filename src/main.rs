@@ -96,6 +96,62 @@ fn main() {
         );
     }
 
+    // ── EXPORT READ GATE (aegis-prtadm) ───────────────────────────────────────────
+    // The gate above covers mutations. A READ in an export-role workspace falls straight
+    // through it into auto-import, which mints the local store the marker exists to
+    // prevent — measured on a fresh clone of aegis.git (16,987 records): `br list
+    // --limit 3` cost 80s of CPU and left 8 files behind, and `br show <id>` did the same.
+    // The marker guarded `create` and nothing else.
+    //
+    // CONTROL, so nobody re-derives this: the identical tree with the marker REMOVED cost
+    // 82.37s and minted too — the 80s is NOT caused by the export role. It is what
+    // importing this many records costs today (aegis-q3q97d, superlinear). This gate
+    // therefore does not make br fast; it makes br not do the work in a directory where
+    // the work has no legitimate destination.
+    //
+    // Scoped to "would MINT", not to "is a read":
+    //   * an export clone that already has a beads.db is left alone — refusing there
+    //     would break the recovery path for anyone who minted one before this shipped;
+    //   * `doctor` is excluded, because reporting the missing database IS its job and it
+    //     does not mint (verified: doctor on an export tree leaves .beads untouched);
+    //   * a workspace with no `store.role` — every workspace that exists today — is
+    //     unaffected, exactly as with the write gate.
+    //   * and it fires only when the database that WOULD be minted is this workspace's own.
+    //     `br --db <some other store> list` from inside an export clone is a legitimate way
+    //     to read the real store — it is the escape the refusal text itself recommends — and
+    //     refusing it would make the marker look broken to the one person following the
+    //     instructions. An EXISTING `--db` target is already covered by `db_absent`; this
+    //     also covers a `--db` at a path that does not exist yet, which is somebody electing
+    //     to create a store somewhere else and is none of this gate's business.
+    let export_role = ctx.config.as_ref().is_some_and(config::store_is_export);
+    let export_would_mint_here = ctx.paths.as_ref().is_some_and(|paths| {
+        !paths.db_path.exists()
+            && ctx
+                .beads_dir
+                .as_ref()
+                .is_some_and(|beads_dir| paths.db_path.starts_with(beads_dir))
+    });
+    if export_role
+        && export_would_mint_here
+        && command_supports_auto_import
+        && !matches!(cli.command, Commands::Doctor(_))
+    {
+        let beads_dir = ctx
+            .beads_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(".beads"));
+        let authority = ctx
+            .config
+            .as_ref()
+            .and_then(config::store_authority_from_layer)
+            .map(String::as_str);
+        handle_error(
+            &export_store_read_refusal_error(&beads_dir, authority),
+            json_error_mode,
+            color_error_mode,
+        );
+    }
+
     let storage_enabled = ctx.is_initialized() && !ctx.no_db();
     let mut should_auto_import_now =
         command_supports_auto_import && !cli.allow_stale && !ctx.no_auto_import();
@@ -1434,6 +1490,26 @@ fn pending_sync_merge_refusal_error(state: &commands::doctor::PendingSyncMergeSt
 /// done nothing wrong — git tracks the export and ignores the local redirect, so a fresh clone
 /// arrives looking exactly like a store. A refusal that only says "no" sends them to restore a
 /// redirect and conclude the rule was fussiness.
+/// The export-role refusal for a READ that would auto-import and mint a local store
+/// (aegis-prtadm).
+///
+/// Separate from the write refusal because the reason differs and a reader who is told
+/// "Refusing to write" while running `br list` will reasonably conclude the message is a
+/// bug and look for a way around it. Measured cost of NOT refusing, on a fresh clone of
+/// aegis.git carrying the 16,987-record export: `br list --limit 3` -> 80s of CPU and a
+/// minted 8-file local store; `br show <id>` -> the same. The store it mints is the fork
+/// that `store.role = export` exists to prevent, arrived at through a read.
+fn export_store_read_refusal_error(beads_dir: &Path, authority: Option<&str>) -> BeadsError {
+    let where_it_lives = authority.map_or_else(
+        || "Set `store.authority` in that file to say where the real store is.".to_string(),
+        |a| format!("The store lives at: {a}\n  Read it explicitly: br --db <that path> <your command>"),
+    );
+    BeadsError::Config(format!(
+        "Refusing to import: {} declares `store.role = export` in config.yaml, so it is a tracked EXPORT of a store that lives elsewhere, not a store.\n  Answering this read would auto-import the whole export into a newly minted local database — the fork this marker exists to prevent, reached through a read instead of a write.\n  {where_it_lives}",
+        beads_dir.display()
+    ))
+}
+
 fn export_store_refusal_error(beads_dir: &Path, authority: Option<&str>) -> BeadsError {
     let where_it_lives = authority.map_or_else(
         || "Set `store.authority` in that file to say where the real store is.".to_string(),

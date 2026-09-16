@@ -72,9 +72,9 @@ fsqlite-observability = "0.3.14"
 
 # Current-thread runtime that drives fsqlite 0.3's async (!Send) futures to
 # completion behind the synchronous `franken_sync::Connection` bridge.
-# Pinned =0.4.9 to match both the fsqlite family's requirement
-# (>=0.4.3,<0.5) and fastmcp-rust 0.7.0's exact =0.4.9 pin, so `--features
-# mcp` builds carry a single asupersync version (beads_rust-fiop).
+# Pinned =0.4.9 for the fsqlite family's requirement (>=0.4.3,<0.5).
+# MCP uses its transport-compatible runtime independently; its TLS stack
+# requires the maintained PEM support in asupersync 0.5.
 # default-features = false mirrors fsqlite's own spec.
 asupersync = { version = "=0.4.9", default-features = false }
 
@@ -126,7 +126,8 @@ unicode-width = "0.2.2"
 semver = "1.0.28"
 
 # MCP server (optional; gated behind the `mcp` feature)
-fastmcp-rust = { version = "=0.7.1", optional = true }
+fastmcp-rust = { version = "=0.10.0", optional = true }
+asupersync-mcp = { package = "asupersync", version = "=0.5.0", default-features = false, optional = true }
 
 # Self-update (optional; gated behind the `self_update` feature)
 self_update = { version = "1.0.0-rc.4", features = ["reqwest", "rustls", "github", "progress-bar", "archive-tar", "compression-tar-gz"], default-features = false, optional = true }
@@ -164,6 +165,8 @@ vergen-gix = { version = "10.0", features = ["build", "cargo", "rustc"] }
 # test builds; asupersync 0.4.8 gates those constructors behind
 # `test-internals` so production consumers cannot mint ambient authority.
 asupersync = { version = "=0.4.9", default-features = false, features = ["test-internals"] }
+# MCP fixtures mint contexts from the transport runtime, never the storage one.
+asupersync-mcp = { package = "asupersync", version = "=0.5.0", default-features = false, features = ["test-internals"] }
 assert_cmd = "2.2.2"
 flate2 = "1.1"
 predicates = "3.1.4"
@@ -172,7 +175,7 @@ walkdir = "2.5"
 insta = { version = "1.48", features = ["json", "yaml"] }
 proptest = "1.11"
 rand = "0.10"
-toml = "=1.1.4"
+toml = "=1.1.6"
 
 [[bench]]
 name = "storage_perf"
@@ -203,7 +206,7 @@ opt-level = 1
 
 [features]
 default = ["self_update"]
-mcp = ["dep:fastmcp-rust"]
+mcp = ["dep:fastmcp-rust", "dep:asupersync-mcp"]
 self_update = [
     "dep:self_update",
     "dep:self-replace",
@@ -216,8 +219,8 @@ self_update = [
 
 # NOTE: no `[patch.crates-io]` here.
 #
-# All dependencies — fsqlite 0.3.13, its fsqlite-* transitive crates, and
-# fastmcp-rust 0.7.0 — are published on crates.io, so this crate
+# All dependencies — fsqlite 0.3.14, its fsqlite-* transitive crates, and
+# fastmcp-rust 0.10.0 — are published on crates.io, so this crate
 # resolves everything from the registry out of the box.  That makes
 # `cargo install --git https://github.com/Dicklesworthstone/beads_rust.git beads_rust --locked`
 # work without requiring sibling `frankensqlite` or `fastmcp_rust`

@@ -5444,6 +5444,42 @@ pub fn open_storage_with_cli_deferred_jsonl_recovery(
     open_storage_with_cli_impl(beads_dir, cli, true)
 }
 
+/// The declared ROLE of this `.beads` directory, from `store.role` in `.beads/config.yaml`.
+///
+/// `export` means the directory is a git-tracked EXPORT of a store that lives elsewhere, not a
+/// store in its own right. br refuses mutating commands against it and names the authority
+/// instead (aegis-6yksbj). `store` — or an absent key, which is every existing workspace — means
+/// an ordinary store and changes nothing.
+///
+/// This exists because git can carry the trigger but not the antidote: `.beads/issues.jsonl` is
+/// tracked while `.beads/redirect` holds an absolute local path and is ignored, so a fresh clone,
+/// a `git clean -xfd` and a new worktree all arrive looking exactly like a store. A marker IN the
+/// export travels with it, which an environment variable cannot do — not to a laptop checkout,
+/// not to a cron.
+#[must_use]
+pub fn store_role_from_layer(layer: &ConfigLayer) -> Option<&String> {
+    get_startup_value(layer, &["store.role", "store-role", "store_role"])
+}
+
+/// Where the real store lives, from `store.authority` in `.beads/config.yaml`.
+///
+/// Free-form on purpose: it is printed to a human in the refusal, never parsed or connected to.
+/// Keeping it inert is what lets the aegis deployment put a host-specific path in it without br
+/// acquiring any knowledge of that deployment.
+#[must_use]
+pub fn store_authority_from_layer(layer: &ConfigLayer) -> Option<&String> {
+    get_startup_value(
+        layer,
+        &["store.authority", "store-authority", "store_authority"],
+    )
+}
+
+/// True when this workspace declares itself an export and must refuse writes.
+#[must_use]
+pub fn store_is_export(layer: &ConfigLayer) -> bool {
+    store_role_from_layer(layer).is_some_and(|role| role.trim().eq_ignore_ascii_case("export"))
+}
+
 #[must_use]
 pub fn no_db_from_layer(layer: &ConfigLayer) -> Option<bool> {
     get_startup_value(layer, &["no-db", "no_db", "no.db"]).and_then(|value| parse_bool(value))
@@ -6988,6 +7024,11 @@ pub fn is_startup_key(key: &str) -> bool {
         || normalized.starts_with("sync.")
         || normalized.starts_with("display.")
         || normalized.starts_with("external-projects.")
+        // `store.*` must be STARTUP, not runtime (aegis-6yksbj). A runtime key is only
+        // readable out of SQLite, and the whole job of `store.role` is to refuse BEFORE the
+        // store is opened — a marker readable only from the store it is meant to protect
+        // protects nothing.
+        || normalized.starts_with("store.")
     {
         return true;
     }

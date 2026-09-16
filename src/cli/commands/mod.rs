@@ -500,6 +500,26 @@ pub(super) fn acquire_routed_workspace_write_lock(
     }
 
     let startup = crate::config::load_startup_config_with_paths(beads_dir, None)?;
+
+    // EXPORT GATE, third of three (aegis-6yksbj). `main`'s gate reads the config of the LOCAL
+    // workspace; a routed write targets a DIFFERENT one, whose config main never loaded. Without
+    // this, `br close --workspace <an export>` would sail past a gate that looks complete.
+    //
+    // This is the cheapest of the three to get right: the target's startup config is already
+    // loaded on the line above, for the db path — so the check costs a map lookup and still
+    // happens BEFORE the write lock is acquired.
+    if crate::config::store_is_export(&startup.merged_config) {
+        let authority = crate::config::store_authority_from_layer(&startup.merged_config)
+            .map_or_else(
+                || "Set `store.authority` in that file to say where the real store is.".to_string(),
+                |a| format!("The store lives at: {a}"),
+            );
+        return Err(BeadsError::Config(format!(
+            "Refusing to write: routed workspace {} declares `store.role = export`, so it is a tracked export of a store that lives elsewhere, not a store. {authority}",
+            beads_dir.display()
+        )));
+    }
+
     let lock_path = beads_dir.join(".write.lock");
     let lock = crate::sync::blocking_database_family_write_lock_with_timeout(
         beads_dir,

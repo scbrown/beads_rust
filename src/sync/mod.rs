@@ -13597,8 +13597,15 @@ fn stream_import_actions_in_tx(
     base_result: &ImportResult,
     progress: &indicatif::ProgressBar,
     fresh_relation_tables_proven_empty: bool,
+    timer: &mut ImportPhaseTimer,
 ) -> Result<ImportResult> {
     let mut tx_result = base_result.clone();
+    // Nanosecond accumulators, read only when BR_IMPORT_TIMING is set. Two
+    // `Instant::now()` calls per sub-step per record is ~0.08 us against a path that
+    // costs 1594 us/record at N=16,000, and they are skipped entirely when the timer
+    // is off, so this cannot be what it measures.
+    let timing = timer.enabled;
+    let (mut t_hash, mut t_collide, mut t_apply, mut t_export) = (0u128, 0u128, 0u128, 0u128);
     let mut seen_external_refs = HashSet::new();
     let mut export_hash_batch = Vec::with_capacity(IMPORT_EXPORT_HASH_BATCH_SIZE);
     let mut export_hash_ids = HashSet::new();
@@ -13627,7 +13634,13 @@ fn stream_import_actions_in_tx(
 
             handle_duplicate_external_ref(&mut issue, &mut seen_external_refs, config)?;
 
+            let mark = || timing.then(std::time::Instant::now);
+            let t0 = mark();
             let computed_hash = crate::util::content_hash(&issue);
+            if let Some(t) = t0 {
+                t_hash += t.elapsed().as_nanos();
+            }
+            let t1 = mark();
             let collision = detect_collision(
                 &issue,
                 &metadata.id_by_ext_ref,
@@ -13641,12 +13654,16 @@ fn stream_import_actions_in_tx(
                 &metadata.meta_by_id,
                 config.force_upsert,
             )?;
+            if let Some(t) = t1 {
+                t_collide += t.elapsed().as_nanos();
+            }
             let target_id = match &collision {
                 CollisionResult::Match { existing_id, .. } => existing_id.clone(),
                 CollisionResult::NewIssue => issue.id.clone(),
             };
 
             apply_collision_renames(&mut issue, collision_renames);
+            let t2 = mark();
             process_import_action(
                 storage,
                 &action,
@@ -13654,14 +13671,22 @@ fn stream_import_actions_in_tx(
                 &mut tx_result,
                 fresh_relation_tables_proven_empty,
             )?;
+            if let Some(t) = t2 {
+                t_apply += t.elapsed().as_nanos();
+            }
 
-            if let Some((export_id, export_hash)) = export_hash_entry_for_import_action(
+            let t3 = mark();
+            let export_entry = export_hash_entry_for_import_action(
                 storage,
                 &action,
                 &target_id,
                 &issue,
                 &computed_hash,
-            )? {
+            )?;
+            if let Some(t) = t3 {
+                t_export += t.elapsed().as_nanos();
+            }
+            if let Some((export_id, export_hash)) = export_entry {
                 export_hash_ids.insert(export_id.clone());
                 export_hash_batch.push((export_id, export_hash));
                 if export_hash_batch.len() >= IMPORT_EXPORT_HASH_BATCH_SIZE {
@@ -13677,6 +13702,13 @@ fn stream_import_actions_in_tx(
         },
     )?;
 
+    timer.phase_n("stream import actions", tx_result.applied_issues.len());
+    let streamed = tx_result.applied_issues.len();
+    timer.substep("content_hash", t_hash, streamed);
+    timer.substep("detect_collision + determine_action", t_collide, streamed);
+    timer.substep("process_import_action (the DB writes)", t_apply, streamed);
+    timer.substep("export_hash_entry_for_import_action", t_export, streamed);
+
     if !export_hash_batch.is_empty() {
         storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
     }
@@ -13689,6 +13721,8 @@ fn stream_import_actions_in_tx(
         storage.set_metadata_in_tx("needs_flush", "true")?;
     }
 
+    timer.phase("flush export hashes");
+
     let orphans_cleaned = cleanup_import_orphans_in_tx(storage)?;
     if orphans_cleaned > 0 {
         tracing::info!(
@@ -13698,9 +13732,14 @@ fn stream_import_actions_in_tx(
         tx_result.orphan_cleaned_count = orphans_cleaned;
     }
 
+    timer.phase("cleanup orphan FK rows");
+
     tx_result.blocked_cache_entries = storage.rebuild_blocked_cache_in_tx()?;
+    timer.phase("rebuild blocked cache");
     tx_result.child_counter_entries = storage.rebuild_child_counters_in_tx()?;
+    timer.phase("rebuild child counters");
     verify_applied_import_issue_semantics(storage, &tx_result.applied_issues)?;
+    timer.phase_n("verify applied semantics", tx_result.applied_issues.len());
 
     Ok(tx_result)
 }
@@ -13885,6 +13924,92 @@ pub(crate) fn import_from_jsonl_snapshot_into_fresh_replacement(
 // Taking ownership is deliberate: callers must relinquish the linear witness,
 // while the transaction closure may need to borrow it across internal BUSY retries.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+/// Per-phase import timing, enabled with `BR_IMPORT_TIMING=1`.
+///
+/// `br`'s first read in a clone with no database pays a whole JSONL import, and that cost
+/// is SUPERLINEAR in the record count (aegis-q3q97d): measured on the aegis export, with
+/// record size held constant, 1.56 ms/record at N=2,000 and 3.09 at N=16,000 — an
+/// exponent that RISES with N rather than a fixed power law. The process is pinned at
+/// 100% CPU throughout (cpu time equals wall time to two decimal places), so it is not
+/// I/O, and a naive Python parse of the same file is ~530x faster, so it is not the data.
+///
+/// This exists because the obvious instrument is unavailable where it matters:
+/// `perf_event_paranoid` is 4 on this fleet, so `perf record` cannot attach without
+/// CAP_PERFMON, and the shipped binary is stripped. A phase timer answers the question a
+/// flat profile would ("which phase grows?") from the binary anyone already has, needs no
+/// privilege, and keeps working after the next refactor renames the hot function.
+///
+/// It writes to stderr, never to stdout, so a timed run stays pipe-safe.
+struct ImportPhaseTimer {
+    enabled: bool,
+    started: std::time::Instant,
+    last: std::time::Instant,
+}
+
+impl ImportPhaseTimer {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            enabled: std::env::var_os("BR_IMPORT_TIMING").is_some_and(|v| v != "0" && v != ""),
+            started: now,
+            last: now,
+        }
+    }
+
+    /// Record the phase that just finished. A no-op unless the env var is set, so the
+    /// only cost on the normal path is one `Instant::now()` per phase.
+    fn phase(&mut self, name: &str) {
+        let now = std::time::Instant::now();
+        if self.enabled {
+            eprintln!(
+                "import-timing  {:>9.3}s  {:>9.3}s cumulative  {}",
+                now.duration_since(self.last).as_secs_f64(),
+                now.duration_since(self.started).as_secs_f64(),
+                name
+            );
+        }
+        self.last = now;
+    }
+
+    /// Report a per-record sub-step total accumulated inside the streaming loop.
+    ///
+    /// The loop is where the superlinearity lives — it grows at about n^1.87 while
+    /// every other phase is linear or better — so its INTERNAL split is the thing a
+    /// reader needs. Reported as one line per sub-step after the loop rather than
+    /// per record, because a per-record line would cost more than it measures.
+    fn substep(&self, name: &str, nanos: u128, n: usize) {
+        if !self.enabled {
+            return;
+        }
+        let secs = nanos as f64 / 1e9;
+        eprintln!(
+            "import-timing    substep {:>9.3}s  {}  (n={}, {:.3} ms/record)",
+            secs,
+            name,
+            n,
+            if n == 0 { 0.0 } else { secs * 1000.0 / n as f64 }
+        );
+    }
+
+    /// Phases inside the write transaction are reported with their record count so a
+    /// reader can divide rather than re-derive N from somewhere else.
+    fn phase_n(&mut self, name: &str, n: usize) {
+        let now = std::time::Instant::now();
+        if self.enabled {
+            let elapsed = now.duration_since(self.last).as_secs_f64();
+            eprintln!(
+                "import-timing  {:>9.3}s  {:>9.3}s cumulative  {} (n={}, {:.3} ms/record)",
+                elapsed,
+                now.duration_since(self.started).as_secs_f64(),
+                name,
+                n,
+                if n == 0 { 0.0 } else { elapsed * 1000.0 / n as f64 }
+            );
+        }
+        self.last = now;
+    }
+}
+
 fn import_from_jsonl_snapshot_impl(
     storage: &mut SqliteStorage,
     source: &JsonlSourceSnapshot,
@@ -13908,13 +14033,17 @@ fn import_from_jsonl_snapshot_impl(
         )?;
     }
 
+    let mut timer = ImportPhaseTimer::new();
+
     // Step 1: Conflict marker scan
     ensure_no_conflict_markers_snapshot(source)?;
+    timer.phase("conflict-marker scan");
 
     // Step 2: Parse, Normalize, Validate, and collect minimal rename state.
     let spinner = create_spinner("Parsing and validating issues", config.show_progress);
     let validation_plan = collect_import_validation_plan(source, config, expected_prefix)?;
     spinner.finish_with_message("Parsed and validated issues");
+    timer.phase_n("parse + validate", validation_plan.record_count);
 
     let mut result = ImportResult::default();
 
@@ -13929,6 +14058,7 @@ fn import_from_jsonl_snapshot_impl(
 
     // Preload metadata for O(1) collision detection while streaming the input.
     let metadata = load_import_metadata_maps(storage)?;
+    timer.phase("load collision metadata");
 
     // Phase 1: Scan and Resolve IDs
     let collision_plan = scan_import_collision_renames(
@@ -13939,9 +14069,11 @@ fn import_from_jsonl_snapshot_impl(
         &mut result,
         validation_plan.record_count,
     )?;
+    timer.phase_n("scan collision renames", validation_plan.record_count);
 
     let jsonl_hash = compute_jsonl_snapshot_content_hash(source)?;
     let observed_jsonl = observed_jsonl_snapshot_witness(source);
+    timer.phase("content hash");
 
     // Phase 2: Execute Actions
     //
@@ -13985,6 +14117,7 @@ fn import_from_jsonl_snapshot_impl(
             &result,
             &progress,
             fresh_relation_tables_proven_empty,
+            &mut timer,
         )?;
 
         storage.set_metadata_in_tx(METADATA_LAST_IMPORT_TIME, &chrono::Utc::now().to_rfc3339())?;
@@ -13993,9 +14126,11 @@ fn import_from_jsonl_snapshot_impl(
 
         Ok(tx_result)
     });
+    timer.phase("commit write transaction");
 
     let validate_foreign_keys = apply_result.is_ok();
     let fk_restore_result = restore_foreign_keys_after_import(storage, validate_foreign_keys);
+    timer.phase("restore + validate foreign keys");
 
     match finish_import_after_foreign_key_restore(apply_result, fk_restore_result) {
         Ok(import_result) => {

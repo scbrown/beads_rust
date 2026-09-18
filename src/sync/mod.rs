@@ -13586,6 +13586,10 @@ fn export_hash_entry_for_import_action(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Over the pedantic line budget since the aegis-q3q97d timing probes were added.
+// Splitting it to satisfy the lint would put the streaming loop and its accumulators
+// in different functions, which is the thing the probes measure.
+#[allow(clippy::too_many_lines)]
 fn stream_import_actions_in_tx(
     storage: &SqliteStorage,
     source: &JsonlSourceSnapshot,
@@ -13921,9 +13925,6 @@ pub(crate) fn import_from_jsonl_snapshot_into_fresh_replacement(
     import_from_jsonl_snapshot_impl(storage, source, config, expected_prefix, Some(witness))
 }
 
-// Taking ownership is deliberate: callers must relinquish the linear witness,
-// while the transaction closure may need to borrow it across internal BUSY retries.
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 /// Per-phase import timing, enabled with `BR_IMPORT_TIMING=1`.
 ///
 /// `br`'s first read in a clone with no database pays a whole JSONL import, and that cost
@@ -13950,7 +13951,8 @@ impl ImportPhaseTimer {
     fn new() -> Self {
         let now = std::time::Instant::now();
         Self {
-            enabled: std::env::var_os("BR_IMPORT_TIMING").is_some_and(|v| v != "0" && v != ""),
+            enabled: std::env::var_os("BR_IMPORT_TIMING")
+                .is_some_and(|v| v != "0" && !v.is_empty()),
             started: now,
             last: now,
         }
@@ -13987,7 +13989,11 @@ impl ImportPhaseTimer {
             secs,
             name,
             n,
-            if n == 0 { 0.0 } else { secs * 1000.0 / n as f64 }
+            if n == 0 {
+                0.0
+            } else {
+                secs * 1000.0 / n as f64
+            }
         );
     }
 
@@ -14003,13 +14009,20 @@ impl ImportPhaseTimer {
                 now.duration_since(self.started).as_secs_f64(),
                 name,
                 n,
-                if n == 0 { 0.0 } else { elapsed * 1000.0 / n as f64 }
+                if n == 0 {
+                    0.0
+                } else {
+                    elapsed * 1000.0 / n as f64
+                }
             );
         }
         self.last = now;
     }
 }
 
+// Taking ownership is deliberate: callers must relinquish the linear witness,
+// while the transaction closure may need to borrow it across internal BUSY retries.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 fn import_from_jsonl_snapshot_impl(
     storage: &mut SqliteStorage,
     source: &JsonlSourceSnapshot,

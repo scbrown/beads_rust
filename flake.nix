@@ -91,7 +91,7 @@
           src = combinedSrc;
 
           pname = "beads_rust";
-          version = "0.5.8-aegis.3";
+          version = "0.5.8-aegis.4";
 
           strictDeps = true;
 

@@ -63,6 +63,52 @@ this repo): commits `55c186682` + `5946b3b7c` in
 
 ---
 
+## v0.5.8-aegis.4 -- 2026-09-18 (Unreleased)
+
+**Why this version exists at all:** the read gate below is the second BEHAVIOURAL change in
+a row to reach `main` under an unchanged version string. The aegis.3 entry directly below says
+the bump is the discriminator; aegis.3's own successor then merged without one, so for two days
+`br --version` returned the same answer whether or not a host carried the gate.
+
+To be precise about how blind that actually leaves you, because the aegis.3 entry overstates it:
+`br version --json` also reports `commit`, so a currency check that reads that field can tell the
+builds apart without any bump at all. What the bump buys is that the CHEAP, obvious check --- the
+one a human types and the one most scripts reach for --- stops returning a confidently wrong
+answer. A discriminator that exists only in the field nobody queries is not much of one.
+
+### A READ in an export-role workspace must not auto-import or mint
+
+aegis.3 gated writes and stated "Reads are never gated." That is superseded here, and the
+measurement is why: in a fresh `git clone` of a repo carrying a tracked 16,987-record
+`issues.jsonl` and `store.role = export`, `br list --limit 3` auto-imported the entire export
+into a newly minted local database — 82.84s wall / 80.01s CPU, eight files created under
+`.beads/`. The marker existed precisely to stop that fork, and the read path walked around it.
+
+Neither documented escape hatch worked on that input: `--no-db` avoided the mint but ran 171s
+at 100% CPU without finishing, and `--no-auto-import` returned instantly from stale local rows.
+So all three doors were mint + 80s, hang, or a confidently wrong answer.
+
+A read that WOULD MINT is now refused with the authority pointer, the same shape as the write
+refusal. The gate is scoped to "the database that would be minted is inside THIS workspace's
+`.beads`", not to "is a read":
+
+- an export clone that ALREADY has a database is left alone — refusing there would break
+  recovery for anyone who minted one before this shipped, and that database is already the
+  fork, so refusing to read it un-forks nothing;
+- `br --db <path elsewhere>` — the escape the refusal text itself names — keeps working;
+- `doctor` is deliberately outside the gate: reporting the missing database is its job, it
+  mints nothing, and gagging it would remove the one command that can explain the refusal to
+  whoever just hit it.
+
+Measured on real clones: marker present `rc 7`, 0.00s, nothing minted; the same tree with the
+marker removed 91.79s and a minted database, which is what proves the change is the marker and
+not the binary.
+
+**This does not make br fast.** The control arm is the proof. The import cost is superlinear at
+roughly n^1.2 — 1.70 ms/record at 2,000 records, 4.85 ms/record at 16,987 — and is untracked
+here; this gate makes br not do the work in a directory where the work has no legitimate
+destination.
+
 ## v0.5.8-aegis.3 -- 2026-09-16 (Unreleased)
 
 **Why this version exists at all:** the export gate below is a BEHAVIOURAL change that shipped

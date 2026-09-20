@@ -1150,8 +1150,22 @@ pub(crate) fn apply_runtime_pragmas(conn: &Connection) -> Result<()> {
     conn.execute("PRAGMA synchronous = NORMAL")?;
     // Use memory for temp tables/indexes instead of disk
     conn.execute("PRAGMA temp_store = MEMORY")?;
-    // 8MB page cache (default is ~2MB), improves read-heavy workloads
-    conn.execute("PRAGMA cache_size = -8000")?;
+    // 8MB page cache (default is ~2MB), improves read-heavy workloads.
+    //
+    // ⚠ OVERRIDABLE FOR MEASUREMENT ONLY (aegis-q3q97d). A whole-file JSONL import runs
+    // as ONE write transaction with wal_autocheckpoint=0, so every dirty page it touches
+    // competes for this cache. Phase timing says `stream import actions` grows at about
+    // n^1.87 while every other phase is linear or sub-linear, and the per-record cost
+    // tracks (database size / cache size) closely — 0.263 ms/record while the database
+    // still fits in 8MB at N=2,000, 1.594 ms/record at N=16,000 where it is 7.3x the
+    // cache. This knob exists so that reading is a MEASUREMENT rather than an inference.
+    // It is not a tuning interface and nothing in the fleet sets it.
+    let cache_kib: i64 = std::env::var("BR_SQLITE_CACHE_KIB")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(8000);
+    conn.execute(&format!("PRAGMA cache_size = -{cache_kib}"))?;
 
     // Issue #219: Limit WAL file size to 32MB.  Without this, concurrent
     // writers can cause unbounded WAL growth, which slows reads and

@@ -13712,31 +13712,16 @@ fn stream_import_actions_in_tx(
     timer.substep("detect_collision + determine_action", t_collide, streamed);
     timer.substep("process_import_action (the DB writes)", t_apply, streamed);
     timer.substep("export_hash_entry_for_import_action", t_export, streamed);
-    timer.substep(
-        "  \\_ insert_new_import_issue",
-        substep_secs(&T_INSERT_ISSUE),
-        streamed,
-    );
-    timer.substep(
-        "  \\_ has_owned_relation_rows_for_import",
-        substep_secs(&T_HAS_OWNED_RELATIONS),
-        streamed,
-    );
-    timer.substep(
-        "  \\_ insert_new_issue_relations_for_import_in_tx",
-        substep_secs(&T_INSERT_RELATIONS),
-        streamed,
-    );
-    timer.substep(
-        "  \\_ sync_issue_relations",
-        substep_secs(&T_SYNC_RELATIONS),
-        streamed,
-    );
-    timer.substep(
-        "  \\_ applied_issues.push(issue.clone())",
-        substep_secs(&T_APPLIED_PUSH),
-        streamed,
-    );
+    // Reported from the registry rather than a hand-written list so a new
+    // accumulator appears in the profile by being declared, not by being
+    // remembered here as well (aegis-q3q97d).
+    for substep in import_timing::ALL {
+        timer.substep(
+            &format!("  \\_ {}", substep.label()),
+            substep.nanos(),
+            streamed,
+        );
+    }
 
     if !export_hash_batch.is_empty() {
         storage.insert_export_hashes_after_clear_in_tx(&export_hash_batch)?;
@@ -13959,33 +13944,7 @@ pub(crate) fn import_from_jsonl_snapshot_into_fresh_replacement(
 /// — and therefore both of its call sites — stay untouched. They are only ever written
 /// when `BR_IMPORT_TIMING` is set, and the import loop is single-threaded, so `Relaxed`
 /// is sufficient and costs nothing on the normal path.
-static IMPORT_SUBSTEP_TIMING: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static T_INSERT_ISSUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_HAS_OWNED_RELATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_INSERT_RELATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_SYNC_RELATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static T_APPLIED_PUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// `Some(now)` only while sub-step timing is armed.
-fn substep_mark() -> Option<std::time::Instant> {
-    IMPORT_SUBSTEP_TIMING
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .then(std::time::Instant::now)
-}
-
-/// Add the elapsed time since `started` to `acc`. A no-op when timing is off.
-fn substep_add(acc: &std::sync::atomic::AtomicU64, started: Option<std::time::Instant>) {
-    if let Some(started) = started {
-        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        acc.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-/// Read one accumulator as seconds.
-fn substep_secs(acc: &std::sync::atomic::AtomicU64) -> u128 {
-    u128::from(acc.load(std::sync::atomic::Ordering::Relaxed))
-}
+use crate::import_timing::{self, add as substep_add, mark as substep_mark};
 
 /// Per-phase import timing, enabled with `BR_IMPORT_TIMING=1`.
 ///
@@ -14014,16 +13973,7 @@ impl ImportPhaseTimer {
         let now = std::time::Instant::now();
         let enabled =
             std::env::var_os("BR_IMPORT_TIMING").is_some_and(|v| v != "0" && !v.is_empty());
-        IMPORT_SUBSTEP_TIMING.store(enabled, std::sync::atomic::Ordering::Relaxed);
-        for acc in [
-            &T_INSERT_ISSUE,
-            &T_HAS_OWNED_RELATIONS,
-            &T_INSERT_RELATIONS,
-            &T_SYNC_RELATIONS,
-            &T_APPLIED_PUSH,
-        ] {
-            acc.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
+        import_timing::arm(enabled);
         Self {
             enabled,
             started: now,
@@ -14260,28 +14210,28 @@ fn process_import_action(
         CollisionAction::Insert => {
             let t_ins = substep_mark();
             let inserted = insert_new_import_issue(storage, issue)?;
-            substep_add(&T_INSERT_ISSUE, t_ins);
+            substep_add(&import_timing::INSERT_ISSUE, t_ins);
 
             let t_owned = substep_mark();
             let needs_fresh_relations = inserted
                 && (fresh_relation_tables_proven_empty
                     || !storage.has_owned_relation_rows_for_import(&issue.id)?);
-            substep_add(&T_HAS_OWNED_RELATIONS, t_owned);
+            substep_add(&import_timing::HAS_OWNED_RELATIONS, t_owned);
 
             let t_rel = substep_mark();
             if needs_fresh_relations {
                 storage.insert_new_issue_relations_for_import_in_tx(issue)?;
-                substep_add(&T_INSERT_RELATIONS, t_rel);
+                substep_add(&import_timing::INSERT_RELATIONS, t_rel);
             } else {
                 sync_issue_relations(storage, issue)?;
-                substep_add(&T_SYNC_RELATIONS, t_rel);
+                substep_add(&import_timing::SYNC_RELATIONS, t_rel);
             }
             result.imported_count += 1;
             result.created_count += 1;
             record_imported_relation_counts(result, issue);
             let t_push = substep_mark();
             result.applied_issues.push(issue.clone());
-            substep_add(&T_APPLIED_PUSH, t_push);
+            substep_add(&import_timing::APPLIED_PUSH, t_push);
         }
         CollisionAction::Update { existing_id } => {
             // When updating by external_ref or content_hash, the incoming issue may have

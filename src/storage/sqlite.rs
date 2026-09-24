@@ -19207,8 +19207,17 @@ impl SqliteStorage {
     }
 
     pub(crate) fn insert_new_issue_for_import_in_tx(&self, issue: &Issue) -> Result<bool> {
+        // `from_issue` only formats timestamps and touches no database, so it is the
+        // control for this pair: if the 33% that `insert_new_import_issue` costs is
+        // superlinear, it has to be in the row write below (aegis-q3q97d).
+        let t_ts = import_timing::mark();
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
-        Ok(self.insert_issue_row_for_import(issue, &timestamps)? > 0)
+        import_timing::add(&import_timing::ISSUE_TIMESTAMPS, t_ts);
+
+        let t_row = import_timing::mark();
+        let inserted = self.insert_issue_row_for_import(issue, &timestamps)?;
+        import_timing::add(&import_timing::ISSUE_ROW, t_row);
+        Ok(inserted > 0)
     }
 
     /// Upsert an issue (create or update) for import operations.
@@ -19660,9 +19669,22 @@ impl SqliteStorage {
     }
 
     pub(crate) fn insert_new_issue_relations_for_import_in_tx(&self, issue: &Issue) -> Result<()> {
+        // Split three ways because this call is 67% of `process_import_action` and
+        // grows at ~n^1.87, and the three statements have very different row counts
+        // per issue — on the aegis export, 23,233 label rows and 14,977 comment rows
+        // against 909 dependency rows for 16k issues. Which of them carries the
+        // exponent is the open question this answers (aegis-q3q97d).
+        let t_labels = import_timing::mark();
         self.insert_labels_for_import(&issue.id, &issue.labels)?;
+        import_timing::add(&import_timing::INSERT_LABELS, t_labels);
+
+        let t_deps = import_timing::mark();
         self.insert_dependencies_for_import(&issue.id, &issue.dependencies)?;
+        import_timing::add(&import_timing::INSERT_DEPENDENCIES, t_deps);
+
+        let t_comments = import_timing::mark();
         self.insert_comments_for_import(&issue.id, &issue.comments)?;
+        import_timing::add(&import_timing::INSERT_COMMENTS, t_comments);
         Ok(())
     }
 

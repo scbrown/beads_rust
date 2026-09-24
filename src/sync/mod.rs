@@ -1813,6 +1813,7 @@ fn open_and_lock_regular_file(
                 &lock_path_display,
                 role,
                 timeout_ms,
+                describe_lock_holders(&file, redact_path).as_deref(),
             ));
         }
 
@@ -1963,12 +1964,100 @@ fn verify_database_authority_path_still_missing(path: &Path) -> Result<()> {
     }
 }
 
-fn write_lock_timeout_error(lock_path_display: &str, role: &str, timeout_ms: u64) -> BeadsError {
+fn write_lock_timeout_error(
+    lock_path_display: &str,
+    role: &str,
+    timeout_ms: u64,
+    holders: Option<&str>,
+) -> BeadsError {
+    // Name the holder when the platform can say who it is. "Another br process
+    // may be holding it" sent people hunting for a stuck WRITER when the holder
+    // was a read that had to auto-import, and the lock file's mtime (set once,
+    // at creation) made a live lock look weeks stale.
+    let holder = match holders {
+        Some(holders) => format!(
+            "Held by {holders}. A read can hold it while it auto-imports; retry after it exits."
+        ),
+        None => format!(
+            "Another br process may be holding that authority; retry after it exits or investigate \
+             a stuck process (`lsof {lock_path_display}` names the holder). The lock file's mtime \
+             is not a liveness signal."
+        ),
+    };
     BeadsError::Config(format!(
-        "Timed out after {timeout_ms}ms waiting for write lock ({role}) at {}. \
-         Another br process may be holding that authority; retry after it exits or investigate a stuck process.",
-        lock_path_display
+        "Timed out after {timeout_ms}ms waiting for write lock ({role}) at {lock_path_display}. {holder}"
     ))
+}
+
+/// Best-effort description of the processes holding the lock on `file`, read
+/// from `/proc/locks` on Linux. Diagnostics only: lock behaviour is unchanged,
+/// and any failure to read yields `None` (the generic message). With
+/// `redact`, only PIDs are named, because a command line can carry paths.
+fn describe_lock_holders(file: &File, redact: bool) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let inode = file.metadata().ok()?.ino();
+        let locks = fs::read_to_string("/proc/locks").ok()?;
+        let pids = lock_holders_from_proc_locks(&locks, inode, std::process::id());
+        if pids.is_empty() {
+            return None;
+        }
+        let described: Vec<String> = pids
+            .iter()
+            .map(|pid| {
+                let command = (!redact)
+                    .then(|| fs::read(format!("/proc/{pid}/cmdline")).ok())
+                    .flatten()
+                    .map(|raw| {
+                        raw.split(|byte| *byte == 0)
+                            .filter(|part| !part.is_empty())
+                            .map(|part| String::from_utf8_lossy(part).into_owned())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .filter(|command| !command.is_empty());
+                match command {
+                    Some(command) if command.chars().count() > 200 => format!(
+                        "pid {pid} ({}...)",
+                        command.chars().take(200).collect::<String>()
+                    ),
+                    Some(command) => format!("pid {pid} ({command})"),
+                    None => format!("pid {pid}"),
+                }
+            })
+            .collect();
+        Some(described.join("; "))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, redact);
+        None
+    }
+}
+
+/// PIDs that HOLD a lock on `inode`, per `/proc/locks` text. Blocked waiters
+/// (the ` -> ` continuation lines) are skipped, and so is `exclude_pid`, the
+/// caller itself. Pure, so it is tested without a real contended lock.
+fn lock_holders_from_proc_locks(text: &str, inode: u64, exclude_pid: u32) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // "<n>: FLOCK ADVISORY WRITE <pid> <maj>:<min>:<inode> <start> <end>"
+        if fields.get(1) == Some(&"->") || fields.len() < 6 {
+            continue;
+        }
+        let (Ok(pid), Some(Ok(locked_inode))) = (
+            fields[4].parse::<u32>(),
+            fields[5].rsplit(':').next().map(str::parse::<u64>),
+        ) else {
+            continue;
+        };
+        if locked_inode == inode && pid != exclude_pid && !pids.contains(&pid) {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 #[must_use]
@@ -24667,5 +24756,111 @@ mod tests {
         writer
             .checkpoint_full()
             .expect("the sole opener checkpoints normally");
+    }
+}
+
+#[cfg(test)]
+mod lock_holder_tests {
+    use super::*;
+
+    const PROC_LOCKS: &str = "\
+1: FLOCK  ADVISORY  WRITE 789427 08:02:5551 0 EOF
+1: -> FLOCK  ADVISORY  WRITE 833165 08:02:5551 0 EOF
+2: POSIX  ADVISORY  WRITE 4242 08:02:9999 0 EOF
+3: FLOCK  ADVISORY  WRITE 789427 08:02:5551 0 EOF
+4: FLOCK  ADVISORY  WRITE 1000 08:02:5551 0 EOF
+malformed line
+";
+
+    #[test]
+    fn holders_are_named_by_inode_and_waiters_are_not_holders() {
+        // 833165 is a blocked waiter (the `->` line), 4242 locks another inode,
+        // 789427 appears twice, and 1000 is the caller itself.
+        assert_eq!(
+            lock_holders_from_proc_locks(PROC_LOCKS, 5551, 1000),
+            vec![789_427]
+        );
+        assert!(lock_holders_from_proc_locks(PROC_LOCKS, 1, 1000).is_empty());
+    }
+
+    #[test]
+    fn the_timeout_message_names_the_holder_and_keeps_its_prefix() {
+        let named = write_lock_timeout_error(
+            ".beads/.write.lock",
+            "workspace write lock",
+            1,
+            Some("pid 42 (br list --limit 0)"),
+        )
+        .to_string();
+        assert!(
+            named.contains("Timed out after 1ms waiting for write lock"),
+            "{named}"
+        );
+        assert!(
+            named.contains("Held by pid 42 (br list --limit 0)"),
+            "{named}"
+        );
+
+        let unknown =
+            write_lock_timeout_error(".beads/.write.lock", "workspace write lock", 1, None)
+                .to_string();
+        assert!(unknown.contains("lsof .beads/.write.lock"), "{unknown}");
+        assert!(
+            unknown.contains("mtime is not a liveness signal"),
+            "{unknown}"
+        );
+    }
+
+    /// A real, separate process holds the lock; the timeout must name it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_contended_lock_names_the_process_holding_it() {
+        use std::process::{Command, Stdio};
+        let Ok(flock) = which_flock() else {
+            return; // util-linux `flock` absent: nothing to contend with
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".write.lock");
+        fs::write(&lock, b"").unwrap();
+        let mut holder = Command::new(flock)
+            .args(["-x", lock.to_str().unwrap(), "sleep", "30"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&lock).unwrap().ino()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lock_holders_from_proc_locks(
+            &fs::read_to_string("/proc/locks").unwrap_or_default(),
+            ino,
+            std::process::id(),
+        )
+        .is_empty()
+        {
+            assert!(Instant::now() < deadline, "holder never took the lock");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let error = blocking_write_lock_with_timeout(dir.path(), Some(100))
+            .expect_err("the lock is held elsewhere")
+            .to_string();
+        let _ = holder.kill();
+        let _ = holder.wait();
+        assert!(
+            error.contains(&format!("Held by pid {}", holder.id())),
+            "{error}"
+        );
+        assert!(error.contains("sleep 30"), "{error}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn which_flock() -> std::result::Result<std::path::PathBuf, ()> {
+        ["/usr/bin/flock", "/bin/flock"]
+            .iter()
+            .map(std::path::PathBuf::from)
+            .find(|path| path.is_file())
+            .ok_or(())
     }
 }

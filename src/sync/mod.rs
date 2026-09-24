@@ -11867,7 +11867,34 @@ fn exact_full_export_hash_mapping(
     Ok(expected)
 }
 
+/// Personal data must not reach an exported JSONL (aegis-gadyw4): `issues.jsonl` is committed
+/// into PUBLIC repositories, and legacy records carry an `owner` that is an email address
+/// (the old Go bd defaulted owner to `git config user.email`). An email-shaped owner is
+/// exported as its local part only. The database is untouched; every JSONL writer goes
+/// through `normalize_issue_for_export`, and the base snapshot is rebuilt from the exported
+/// JSONL, so the export, the incremental flush and `beads.base.jsonl` stay byte-consistent.
+fn redact_owner_email(issue: &mut Issue) {
+    let Some(owner) = issue.owner.as_mut() else {
+        return;
+    };
+    let Some((local, domain)) = owner.split_once('@') else {
+        return;
+    };
+    let is_email = !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !owner.chars().any(char::is_whitespace)
+        && !domain.contains('@');
+    if is_email {
+        *owner = local.to_string();
+    }
+}
+
 fn normalize_issue_for_export(issue: &mut Issue) {
+    redact_owner_email(issue);
+
     if !issue.labels.is_empty() {
         issue.labels.sort_unstable();
         issue.labels.dedup();
@@ -22465,6 +22492,30 @@ mod tests {
             PreparedExportEntry::SkippedTombstone(id) if id == "bd-0001"
         ));
         assert!(matches!(&serial[2], PreparedExportEntry::Issue(_)));
+    }
+
+    #[test]
+    fn test_normalize_issue_for_export_redacts_email_owner_to_local_part() {
+        // aegis-gadyw4: an email-shaped owner never reaches the exported JSONL.
+        for (owner, expected) in [
+            (Some("stiwi@example.com"), Some("stiwi")),
+            (
+                Some("first.last+tag@mail.example.org"),
+                Some("first.last+tag"),
+            ),
+            // not email-shaped: passed through unchanged
+            (Some("dearing"), Some("dearing")),
+            (Some("team@local"), Some("team@local")),
+            (Some("@example.com"), Some("@example.com")),
+            (Some("a b@example.com"), Some("a b@example.com")),
+            (Some(""), Some("")),
+            (None, None),
+        ] {
+            let mut issue = make_test_issue("bd-own", "owner");
+            issue.owner = owner.map(str::to_string);
+            normalize_issue_for_export(&mut issue);
+            assert_eq!(issue.owner.as_deref(), expected, "owner {owner:?}");
+        }
     }
 
     #[test]

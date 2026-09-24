@@ -11870,9 +11870,12 @@ fn exact_full_export_hash_mapping(
 /// Personal data must not reach an exported JSONL (aegis-gadyw4): `issues.jsonl` is committed
 /// into PUBLIC repositories, and legacy records carry an `owner` that is an email address
 /// (the old Go bd defaulted owner to `git config user.email`). An email-shaped owner is
-/// exported as its local part only. The database is untouched; every JSONL writer goes
+/// exported as the constant `redacted`: a local part next to an obvious consumer-mail domain
+/// reconstructs the address, so it is not a redaction (sattler's ruling on #21). The database is untouched; every JSONL writer goes
 /// through `normalize_issue_for_export`, and the base snapshot is rebuilt from the exported
 /// JSONL, so the export, the incremental flush and `beads.base.jsonl` stay byte-consistent.
+const REDACTED_OWNER: &str = "redacted";
+
 fn redact_owner_email(issue: &mut Issue) {
     let Some(owner) = issue.owner.as_mut() else {
         return;
@@ -11888,7 +11891,7 @@ fn redact_owner_email(issue: &mut Issue) {
         && !owner.chars().any(char::is_whitespace)
         && !domain.contains('@');
     if is_email {
-        *owner = local.to_string();
+        *owner = REDACTED_OWNER.to_string();
     }
 }
 
@@ -22495,14 +22498,11 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_issue_for_export_redacts_email_owner_to_local_part() {
+    fn test_normalize_issue_for_export_redacts_email_owner() {
         // aegis-gadyw4: an email-shaped owner never reaches the exported JSONL.
         for (owner, expected) in [
-            (Some("stiwi@example.com"), Some("stiwi")),
-            (
-                Some("first.last+tag@mail.example.org"),
-                Some("first.last+tag"),
-            ),
+            (Some("stiwi@example.com"), Some("redacted")),
+            (Some("first.last+tag@mail.example.org"), Some("redacted")),
             // not email-shaped: passed through unchanged
             (Some("dearing"), Some("dearing")),
             (Some("team@local"), Some("team@local")),

@@ -2,6 +2,7 @@
 
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
+use crate::import_timing;
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
 use crate::franken_sync::{Connection, Row};
 use crate::model::{

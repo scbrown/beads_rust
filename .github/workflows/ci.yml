@@ -299,6 +299,10 @@ jobs:
     name: Code Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Instrumented dependency builds have repeatedly lost the hosted runner.
+      # Bound concurrent compilers without changing the coverage target set.
+      CARGO_BUILD_JOBS: "1"
     # Raised from 30 (aegis-44vjem). `cancelled` at 30.2m on run 33950357551 —
     # a TIMEOUT, not fail-fast collateral, and it had gone unnoticed because
     # GitHub reports a job timeout as `cancelled`. One indivisible command
@@ -331,7 +335,20 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Generate coverage report
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+        run: |
+          # Keep resource evidence in the job log even if the runner disappears.
+          (
+            while true; do
+              date -u +%FT%TZ
+              free -m
+              df -m "$GITHUB_WORKSPACE"
+              ps -C rustc -o pid=,rss=,pcpu=,etime= || true
+              sleep 30
+            done
+          ) &
+          coverage_monitor_pid=$!
+          trap 'kill "$coverage_monitor_pid" 2>/dev/null || true; wait "$coverage_monitor_pid" 2>/dev/null || true' EXIT
+          /usr/bin/time -v cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
         continue-on-error: true
 
       - name: Upload coverage to Codecov

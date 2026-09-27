@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
+// Serve contexts belong to the transport runtime, not the storage bridge's pin.
+use asupersync_mcp as asupersync;
 use fastmcp_rust::{McpError, McpErrorCode, McpResult, StdioTransport};
 use serde_json::{Value, json};
 

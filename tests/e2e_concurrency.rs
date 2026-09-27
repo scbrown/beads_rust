@@ -626,8 +626,14 @@ fn e2e_write_lock_contention_respects_lock_timeout() {
         "write lock timeout should not block indefinitely; elapsed={elapsed:?}"
     );
     let combined = format!("{}{}", create.stdout, create.stderr);
+    // Routing validation consumes part of the common acquisition budget before
+    // this lock is attempted, so its diagnostic may report less than 75ms.
+    let remaining_ms = combined
+        .split_once("Timed out after ")
+        .and_then(|(_, rest)| rest.split_once("ms waiting for write lock"))
+        .and_then(|(milliseconds, _)| milliseconds.parse::<u64>().ok());
     assert!(
-        combined.contains("Timed out after 75ms")
+        matches!(remaining_ms, Some(0..=75))
             && combined.contains("write lock")
             && combined.contains(".write.lock"),
         "error should include bounded write-lock diagnostics: {combined}"

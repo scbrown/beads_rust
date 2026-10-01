@@ -4781,9 +4781,11 @@ fn build_source_repo_path_migration_plan(
             beads_dir.display()
         ))
     })?;
-    if !Path::new(&target_path).is_absolute() {
+    // aegis-19lsrv: the canonical value is the portable relative one; an
+    // absolute target would re-stamp every record with a local home path.
+    if target_path != crate::sync::PORTABLE_SOURCE_REPO_PATH {
         return Err(BeadsError::SyncConflict {
-            message: "Canonical source_repo_path migration target is not absolute".to_string(),
+            message: "Canonical source_repo_path migration target is not portable".to_string(),
         });
     }
 

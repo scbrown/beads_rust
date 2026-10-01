@@ -13,10 +13,10 @@ pub mod path;
 pub mod witness;
 
 pub use path::{
-    ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PathValidation, canonical_source_repo_path,
-    is_sync_path_allowed, require_safe_sync_overwrite_path, require_valid_sync_path,
-    validate_no_git_path, validate_sync_path, validate_sync_path_with_external,
-    validate_temp_file_path,
+    ALLOWED_EXACT_NAMES, ALLOWED_EXTENSIONS, PORTABLE_SOURCE_REPO_PATH, PathValidation,
+    canonical_source_repo_path, is_sync_path_allowed, portable_source_repo_path,
+    require_safe_sync_overwrite_path, require_valid_sync_path, validate_no_git_path,
+    validate_sync_path, validate_sync_path_with_external, validate_temp_file_path,
 };
 pub(crate) use path::{
     JsonlSourceSnapshot, PinnedJsonlName, authority_paths_equivalent,
@@ -10110,6 +10110,35 @@ pub fn scan_conflict_markers(path: &Path) -> Result<Vec<ConflictMarker>> {
     scan_conflict_markers_from_reader(path, BufReader::with_capacity(2 * 1024 * 1024, file))
 }
 
+/// The serialized key every exported record carries (serde writes no spaces).
+const SOURCE_REPO_PATH_KEY: &str = "\"source_repo_path\":\"";
+
+/// Whether any line of the JSONL still carries an ABSOLUTE `source_repo_path`,
+/// i.e. a record exported before the field became portable (aegis-19lsrv).
+///
+/// The incremental auto-flush rewrites only dirty records and carries every
+/// other line through verbatim, so a legacy line would keep publishing a home
+/// path for as long as its record stayed untouched. When this returns true the
+/// incremental path declines and the full export runs once, normalizing every
+/// record; after that the file holds none and incremental flushing resumes.
+/// It reads the raw JSON prefix of the value: no per-line deserialization.
+fn jsonl_has_absolute_source_repo_path(path: &Path) -> Result<bool> {
+    let file = File::open(path)?;
+    path::validate_jsonl_fd_metadata(&file, path)?;
+    let reader = BufReader::with_capacity(2 * 1024 * 1024, file);
+    for line in reader.lines() {
+        let line = line?;
+        if let Some(start) = line.find(SOURCE_REPO_PATH_KEY) {
+            let value = &line[start + SOURCE_REPO_PATH_KEY.len()..];
+            let prefix: String = value.chars().take(3).collect();
+            if path::is_any_platform_absolute(&prefix) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn scan_conflict_markers_snapshot(
     source: &JsonlSourceSnapshot,
 ) -> Result<Vec<ConflictMarker>> {
@@ -11986,6 +12015,12 @@ fn redact_owner_email(issue: &mut Issue) {
 
 fn normalize_issue_for_export(issue: &mut Issue) {
     redact_owner_email(issue);
+    // aegis-19lsrv: a record stamped before the field became relative carries
+    // the creator's absolute home path; it never reaches an exported JSONL.
+    issue.source_repo_path = issue
+        .source_repo_path
+        .as_deref()
+        .map(portable_source_repo_path);
 
     if !issue.labels.is_empty() {
         issue.labels.sort_unstable();
@@ -12689,6 +12724,13 @@ fn try_incremental_auto_flush(
     let dirty_metadata = storage.get_dirty_issue_metadata()?;
     if dirty_metadata.is_empty() {
         return Ok(Some(AutoFlushResult::default()));
+    }
+    if jsonl_has_absolute_source_repo_path(jsonl_path)? {
+        tracing::info!(
+            jsonl_path = %jsonl_path.display(),
+            "JSONL carries a legacy absolute source_repo_path; running a full export once",
+        );
+        return Ok(None);
     }
 
     let changes = collect_incremental_auto_flush_changes(storage, dirty_metadata)?;
@@ -22604,6 +22646,47 @@ mod tests {
             issue.owner = owner.map(str::to_string);
             normalize_issue_for_export(&mut issue);
             assert_eq!(issue.owner.as_deref(), expected, "owner {owner:?}");
+        }
+    }
+
+    #[test]
+    fn test_normalize_issue_for_export_makes_source_repo_path_portable() {
+        // aegis-19lsrv: a pre-upgrade absolute stamp never reaches the export.
+        let mut issue = make_test_issue("bd-src", "source path");
+        issue.source_repo_path = Some("/home/someone/gt/repo".to_string());
+        normalize_issue_for_export(&mut issue);
+        assert_eq!(issue.source_repo_path.as_deref(), Some("."));
+        let json = serde_json::to_string(&issue).expect("serialize");
+        assert!(
+            json.contains(SOURCE_REPO_PATH_KEY),
+            "the scan key must match serde's output"
+        );
+    }
+
+    #[test]
+    fn test_jsonl_absolute_source_repo_path_scan() {
+        // aegis-19lsrv: a legacy absolute line forces one full export.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("issues.jsonl");
+        for (body, expected) in [
+            ("{\"id\":\"a\",\"source_repo_path\":\".\"}\n", false),
+            ("{\"id\":\"a\"}\n", false),
+            ("{\"id\":\"a\",\"source_repo_path\":\"sub/repo\"}\n", false),
+            (
+                "{\"id\":\"a\",\"source_repo_path\":\".\"}\n{\"id\":\"b\",\"source_repo_path\":\"/Users/x/repo\"}\n",
+                true,
+            ),
+            (
+                "{\"id\":\"a\",\"source_repo_path\":\"C:\\\\Users\\\\x\"}\n",
+                true,
+            ),
+        ] {
+            std::fs::write(&path, body).expect("write");
+            assert_eq!(
+                jsonl_has_absolute_source_repo_path(&path).expect("scan"),
+                expected,
+                "{body}"
+            );
         }
     }
 

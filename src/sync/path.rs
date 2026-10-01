@@ -54,8 +54,46 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 use tracing::{debug, warn};
 
-/// Derive the absolute canonical path of the source repository (the parent of
-/// `.beads/`) for the `source_repo_path` field on an issue.
+/// The `source_repo_path` every record carries: the source repository (the
+/// parent of `.beads/`) relative to ITSELF, i.e. `"."`.
+///
+/// It used to be the ABSOLUTE canonical path, which put the creator's home
+/// directory (`/home/<user>/...`, `/Users/<user>/...`) into every exported
+/// record, and `issues.jsonl` is committed into public repositories
+/// (aegis-19lsrv). A relative value keeps the field's identity (it still names
+/// the store's own repository) and is byte-identical in every clone, so two
+/// clones at different paths export the same JSONL and never churn.
+pub const PORTABLE_SOURCE_REPO_PATH: &str = ".";
+
+/// The portable form of a stored `source_repo_path`: an absolute path (a
+/// record stamped before aegis-19lsrv) becomes [`PORTABLE_SOURCE_REPO_PATH`];
+/// a relative value is unchanged.
+#[must_use]
+pub fn portable_source_repo_path(path: &str) -> String {
+    if is_any_platform_absolute(path) {
+        PORTABLE_SOURCE_REPO_PATH.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// Absolute on ANY platform, not just this one: a JSONL written on macOS or
+/// Windows is read on Linux and vice versa, and `Path::is_absolute` only knows
+/// the host's own rules.
+pub(crate) fn is_any_platform_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    Path::new(path).is_absolute()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+}
+
+/// Derive the `source_repo_path` field for a record created in the store at
+/// `beads_dir`: [`PORTABLE_SOURCE_REPO_PATH`] when the source repository (the
+/// parent of `.beads/`) resolves, `None` otherwise.
 ///
 /// This lives in the process-free sync boundary because both issue creation
 /// and source-path migration need the same path identity without delegating
@@ -75,9 +113,10 @@ pub fn canonical_source_repo_path(beads_dir: &Path) -> Option<String> {
     } else {
         parent
     };
+    // Resolution still gates the value: a store whose repository cannot be
+    // resolved gets no source_repo_path, exactly as before.
     let canonical = parent.canonicalize().ok()?;
-    let path_str = canonical.to_string_lossy().into_owned();
-    (!path_str.is_empty()).then_some(path_str)
+    (!canonical.as_os_str().is_empty()).then(|| PORTABLE_SOURCE_REPO_PATH.to_string())
 }
 
 fn raw_os_str_sha256(value: &OsStr) -> String {
@@ -2893,6 +2932,38 @@ mod tests {
     fn canonical_temp_dir() -> TempDir {
         let root = dunce::canonicalize(std::env::temp_dir()).expect("canonicalize temp root");
         TempDir::new_in(root).expect("create temp dir")
+    }
+
+    // aegis-19lsrv: no clone's home path is stamped, and two clones agree.
+    #[test]
+    fn source_repo_path_is_portable_and_identical_across_clones() {
+        let (_a, beads_a) = setup_test_beads_dir();
+        let (_b, beads_b) = setup_test_beads_dir();
+        let a = canonical_source_repo_path(&beads_a);
+        assert_eq!(a.as_deref(), Some(PORTABLE_SOURCE_REPO_PATH));
+        assert_eq!(a, canonical_source_repo_path(&beads_b));
+        assert!(canonical_source_repo_path(Path::new("/nonexistent/x/.beads")).is_none());
+    }
+
+    #[test]
+    fn portable_source_repo_path_drops_every_platform_absolute_form() {
+        for (stored, exported) in [
+            (Some("/home/someone/gt/repo"), Some(".")),
+            (Some("/Users/someone/workspace/repo"), Some(".")),
+            (Some("C:\\Users\\someone\\repo"), Some(".")),
+            (Some("c:/Users/someone/repo"), Some(".")),
+            (Some("\\\\server\\share\\repo"), Some(".")),
+            (Some("."), Some(".")),
+            (Some("sub/repo"), Some("sub/repo")),
+            (Some(""), Some("")),
+            (None, None),
+        ] {
+            assert_eq!(
+                stored.map(portable_source_repo_path).as_deref(),
+                exported,
+                "stored {stored:?}"
+            );
+        }
     }
 
     fn setup_test_beads_dir() -> (TempDir, PathBuf) {

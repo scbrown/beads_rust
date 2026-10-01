@@ -426,10 +426,9 @@ fn source_repo_path_migration_reconciles_and_is_idempotent() {
     assert_eq!(plan["jsonl_rewrite_required"].as_bool(), Some(true));
     assert_eq!(plan["source_repo_preserved"].as_bool(), Some(true));
     assert_eq!(plan["vcs_status"].as_str(), Some("not_probed"));
-    let target = fs::canonicalize(&ws.root)
-        .expect("canonical workspace")
-        .to_string_lossy()
-        .into_owned();
+    // aegis-19lsrv: the migration target is the portable relative value, never
+    // the workspace's absolute path (which is the creator's home directory).
+    let target = ".".to_string();
     assert_eq!(plan["target_path"].as_str(), Some(target.as_str()));
     let token = plan["plan_sha256"]
         .as_str()

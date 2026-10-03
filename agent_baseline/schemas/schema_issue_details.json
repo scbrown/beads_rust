@@ -424,7 +424,8 @@
             "depends_on_id",
             "type",
             "created_at"
-          ]
+          ],
+          "additionalProperties": true
         },
         "DependencyType": {
           "description": "Dependency relationship type.",
@@ -478,7 +479,8 @@
             "author",
             "text",
             "created_at"
-          ]
+          ],
+          "additionalProperties": true
         },
         "IssueWithDependencyMetadata": {
           "type": "object",

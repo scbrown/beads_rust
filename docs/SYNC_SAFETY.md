@@ -16,6 +16,13 @@ sync equality and manual three-way conflict detection, but do not change the
 legacy deduplication hash. The additive `--reconcile` interface still refuses
 unknown source fields under its stricter reviewed schema contract.
 
+The reviewed schema-19 migration rebuilds legacy comment rows with an explicit
+column list, preserving index definitions and the allocated ID high-water mark.
+Before installation it compares both comment-index reads with table scans;
+an integrity banner alone does not prove that indexed readers see every comment.
+Keep the migration backup until a genuine fresh-destination export has been
+compared with the pre-migration snapshot, including nested metadata.
+
 This is semantic JSON preservation, not byte preservation. Existing policies
 for modeled fields still apply: timestamp/default normalization, owner-email
 redaction and portable repository paths. A cutover adapter must account for or

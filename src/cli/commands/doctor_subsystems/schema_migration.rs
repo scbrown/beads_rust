@@ -356,7 +356,7 @@ fn build_plan(db_path: &Path) -> Result<MigrationPlanReceipt> {
     }
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
-            "reviewed schema migration is available only from source schemas 13 through 17 \
+            "reviewed schema migration is available only from source schemas 13 through 18 \
              to {target}; observed unsupported source version {from}"
         )));
     }

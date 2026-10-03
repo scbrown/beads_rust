@@ -195,6 +195,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         }
 
         issue.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: parent_id.clone(),
             dep_type: DependencyType::ParentChild,

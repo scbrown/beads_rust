@@ -14661,6 +14661,7 @@ mod tests {
         issue.dependencies = blocked_by
             .iter()
             .map(|target| crate::model::Dependency {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 issue_id: id.to_string(),
                 depends_on_id: (*target).to_string(),
                 dep_type: crate::model::DependencyType::Blocks,

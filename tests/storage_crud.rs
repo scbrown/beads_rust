@@ -247,6 +247,7 @@ fn comments_with_same_timestamp_are_ordered_by_id() {
             &issue.id,
             &[
                 Comment {
+                    jsonl_extensions: std::collections::BTreeMap::new(),
                     id: 20,
                     issue_id: issue.id.clone(),
                     author: "reviewer".to_string(),
@@ -254,6 +255,7 @@ fn comments_with_same_timestamp_are_ordered_by_id() {
                     created_at,
                 },
                 Comment {
+                    jsonl_extensions: std::collections::BTreeMap::new(),
                     id: 10,
                     issue_id: issue.id.clone(),
                     author: "reviewer".to_string(),

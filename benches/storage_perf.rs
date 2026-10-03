@@ -173,6 +173,7 @@ fn setup_db_with_deps(issue_count: usize, dep_count: usize) -> (TempDir, SqliteS
         for to_idx in 0..from_idx {
             let to_id = format!("bench-{to_idx:06}");
             dependencies.push(Dependency {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 issue_id: from_id.clone(),
                 depends_on_id: to_id,
                 dep_type: DependencyType::Blocks,

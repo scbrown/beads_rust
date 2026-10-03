@@ -777,6 +777,7 @@ fn populate_relations(
     // Parent
     if let Some(parent_id) = ctx.resolved_parent {
         issue.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: parent_id.to_string(),
             dep_type: DependencyType::ParentChild,
@@ -793,6 +794,7 @@ fn populate_relations(
         let resolved_dep_id = resolve_dependency_id(&resolver, ctx.storage, &dep_id)?;
 
         issue.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: resolved_dep_id,
             dep_type,
@@ -1091,6 +1093,7 @@ fn execute_import(
             // Parent dependency is wired inline (parent must pre-exist or be CLI-provided).
             if let Some(parent_id) = resolved_parent.as_deref() {
                 issue.dependencies.push(Dependency {
+                    jsonl_extensions: std::collections::BTreeMap::new(),
                     issue_id: id.clone(),
                     depends_on_id: parent_id.to_string(),
                     dep_type: DependencyType::ParentChild,

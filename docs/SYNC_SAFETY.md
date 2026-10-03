@@ -6,7 +6,10 @@
 
 Import preserves unmodeled top-level JSONL fields, including nested objects,
 arrays and explicit nulls, in the issue's `jsonl_extensions` database column
-(schema 18). Full issue reads and actual exports restore those fields at their
+(schema 18). Schema 19 adds the same opaque maps to comments and dependencies,
+preserving unknown fields at their original nested keys across imports and native edits.
+Legacy NULL maps read as empty; malformed maps fail the read rather than silently
+dropping data. Full issue reads and actual exports restore issue fields at their
 original top-level keys. Native edits leave them intact; a newer imported full
 record replaces the extension map, including removals. Extensions participate in
 sync equality and manual three-way conflict detection, but do not change the

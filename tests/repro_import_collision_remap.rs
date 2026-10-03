@@ -77,6 +77,7 @@ fn test_import_collision_remaps_dependencies() {
 
     let mut jsonl_issue2 = make_issue("bd-3", "Dependent");
     jsonl_issue2.dependencies.push(Dependency {
+        jsonl_extensions: std::collections::BTreeMap::new(),
         issue_id: "bd-3".to_string(),
         depends_on_id: "bd-2".to_string(),
         dep_type: DependencyType::Blocks,

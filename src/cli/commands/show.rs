@@ -1693,6 +1693,7 @@ mod tests {
             }],
             dependents: Vec::new(),
             comments: vec![Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 1,
                 issue_id: "bd-001".to_string(),
                 author: "alice".to_string(),
@@ -1789,6 +1790,7 @@ mod tests {
         let mut child = make_test_issue("bd-child", "Child");
         child.labels = vec!["backend".to_string()];
         child.comments = vec![Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 7,
             issue_id: "bd-child".to_string(),
             author: "alice".to_string(),
@@ -1796,6 +1798,7 @@ mod tests {
             created_at: Utc.with_ymd_and_hms(2025, 1, 2, 3, 4, 0).unwrap(),
         }];
         child.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: "bd-child".to_string(),
             depends_on_id: "bd-parent".to_string(),
             dep_type: DependencyType::ParentChild,
@@ -1837,6 +1840,7 @@ mod tests {
 
         let mut target = make_test_issue("bd-target", "Target");
         target.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: target.id.clone(),
             depends_on_id: dependency.id.clone(),
             dep_type: DependencyType::Blocks,
@@ -1849,6 +1853,7 @@ mod tests {
         let mut dependent = make_test_issue("bd-dependent", "Dependent");
         dependent.priority = Priority::CRITICAL;
         dependent.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: dependent.id.clone(),
             depends_on_id: target.id.clone(),
             dep_type: DependencyType::Related,
@@ -1907,6 +1912,7 @@ mod tests {
 
         let mut issue = make_test_issue("bd-root", "Root");
         issue.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: "bd-root".to_string(),
             depends_on_id: "bd-missing".to_string(),
             dep_type: DependencyType::Blocks,

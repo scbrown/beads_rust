@@ -18,6 +18,7 @@ use crate::format::{format_status_label, truncate_title};
 use crate::model::{IssueType, Status};
 
 pub mod commands;
+pub mod effects;
 
 /// Default cap for work-surface listings (`br list`).
 ///
@@ -698,6 +699,10 @@ pub struct Cli {
     /// Database path (auto-discover .beads/*.db if not set)
     #[arg(long, global = true)]
     pub db: Option<PathBuf>,
+
+    /// Persist exact local before/after records for a supported native write
+    #[arg(long, global = true)]
+    pub effect_receipt: Option<PathBuf>,
 
     /// Actor name for audit trail
     #[arg(long, global = true)]
@@ -1932,6 +1937,10 @@ pub struct ShowArgs {
     #[arg(add = ArgValueCompleter::new(issue_id_completer))]
     pub ids: Vec<String>,
 
+    /// Emit canonical JSONL for exact local IDs, including all relation metadata
+    #[arg(long, conflicts_with_all = ["format", "wrap", "no_wrap", "stats"])]
+    pub lossless: bool,
+
     /// Output format (text, json, toon). Env: BR_OUTPUT_FORMAT, TOON_DEFAULT_FORMAT.
     #[arg(long, value_enum)]
     pub format: Option<OutputFormatBasic>,
@@ -2907,6 +2916,9 @@ pub const DEFAULT_WITNESS_PARALLELISM: usize = 64;
 #[derive(Args, Debug, Clone, Default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SyncArgs {
+    /// Apply selected canonical effects against exact native before-images
+    #[arg(long, value_name = "FILE")]
+    pub effects: Option<PathBuf>,
     /// Export database to JSONL (DB → .beads/issues.jsonl)
     ///
     /// Writes all issues from `SQLite` database to JSONL format.

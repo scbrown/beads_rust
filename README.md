@@ -1055,6 +1055,28 @@ same issue changed on both sides, br stops and asks for an explicit policy:
 `--force-db` keeps the local SQLite version, `--force-jsonl` keeps the JSONL
 version, and `--force` keeps the newer timestamp.
 
+### Completed effects on private migration copies
+
+`show --lossless <exact-id>...` emits selected canonical JSONL records, including
+unknown nested fields. Missing, duplicate, external and ephemeral selections
+refuse. This partial board must not replace a whole-board export.
+
+`--effect-receipt <new-file.json>` wraps supported native updates, comment adds,
+label adds and dependency adds with exact before/after records. It requires an
+explicit `--db`, `--no-auto-import` and `--no-auto-flush`. A durable prepared file
+precedes the command; a completion file is published only after successful native
+execution and read-back. An absent completion is **unknown**, not permission to
+retry the command. Existing receipt files refuse before the command runs.
+
+`sync --effects <file.json>` accepts versioned `before` and `after` selected
+record images on an explicitly selected private database. It checks exact
+preimages, native validation, workflow capacity, comment identities and dependency
+constraints in one transaction, then verifies canonical read-back before commit.
+It cannot delete identities and refuses pending sync merges. It does not perform
+fuzzy matching, advance a common cursor, publish JSONL or replay an agent command.
+The migration coordinator remains responsible for full-board proof, durable
+receipt continuity and publication. These primitives do not arm a migration.
+
 ### Command Output is Garbled
 
 ```bash

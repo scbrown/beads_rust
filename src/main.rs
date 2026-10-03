@@ -24,6 +24,16 @@ const DISABLE_READ_ONLY_FAST_OPEN_ENV: &str = "BR_DISABLE_READ_ONLY_FAST_OPEN";
 
 #[allow(clippy::too_many_lines)]
 fn main() {
+    let profile_started = std::time::Instant::now();
+    let profile_enabled = std::env::var_os("BR_EFFECT_TIMING").is_some();
+    let profile = |stage: &str| {
+        if profile_enabled {
+            eprintln!(
+                "BR_EFFECT_TIMING {stage} {:.6}",
+                profile_started.elapsed().as_secs_f64()
+            );
+        }
+    };
     CompleteEnv::with_factory(Cli::command).complete();
 
     // Install SIGINT/SIGTERM/SIGHUP handlers before any storage opens so
@@ -34,6 +44,7 @@ fn main() {
     beads_rust::shutdown::install();
 
     let cli = Cli::parse();
+    profile("parsed");
     let json_error_mode = should_render_errors_as_json(&cli);
     let color_error_mode = should_color_human_errors_for_cli(&cli);
     let output_ctx = OutputContext::from_args(&cli);
@@ -459,6 +470,7 @@ fn main() {
         write_lock
     };
 
+    profile("before_storage_open");
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
         match open_storage_from_ctx(&mut ctx, write_lock.as_ref()) {
@@ -474,6 +486,7 @@ fn main() {
         None
     };
 
+    profile("after_storage_open");
     // Phase 3: Auto-Import. Normal staleness probes can opportunistically
     // refresh JSONL witness metadata. Read-only startup probes skip that
     // refresh and reopen writable storage only when an import is actually
@@ -704,6 +717,36 @@ fn main() {
         None
     };
 
+    profile("before_receipt_prepare");
+    let effect_receipt = if cli.effect_receipt.is_some() {
+        let receipt = (|| -> Result<_> {
+            if ctx.no_db() || write_lock.is_none() {
+                return Err(BeadsError::Config(
+                    "effect receipt requires database-family write authority".into(),
+                ));
+            }
+            beads_rust::cli::effects::Receipt::prepare(
+                &cli,
+                &ctx.paths
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BeadsError::Config("effect receipt requires database path".into())
+                    })?
+                    .db_path,
+                ctx.beads_dir.as_deref().ok_or_else(|| {
+                    BeadsError::Config("effect receipt requires workspace".into())
+                })?,
+            )
+        })();
+        match receipt {
+            Ok(receipt) => Some(receipt),
+            Err(e) => handle_error(&e, json_error_mode, color_error_mode),
+        }
+    } else {
+        None
+    };
+
+    profile("after_receipt_prepare");
     // Phase 4: Command Execution
     let result = match cli.command {
         Commands::Init {
@@ -818,7 +861,9 @@ fn main() {
             commands::capacity::execute(&command, &overrides, &output_ctx)
         }
         Commands::Label { command } => {
-            if let Some(res) = storage_result.as_ref() {
+            if let Some(receipt) = effect_receipt.as_ref() {
+                commands::label::execute_with_receipt(&command, &overrides, &output_ctx, receipt)
+            } else if let Some(res) = storage_result.as_ref() {
                 match commands::label::execute_with_storage(
                     &command,
                     cli.json,
@@ -1040,12 +1085,19 @@ fn main() {
         }
     };
 
+    profile("after_command");
     drop(search_deadline);
 
     // Handle command result
     if let Err(e) = result {
         handle_error(&e, json_error_mode, color_error_mode);
     }
+    if let Some(receipt) = effect_receipt
+        && let Err(e) = receipt.finish()
+    {
+        handle_error(&e, json_error_mode, color_error_mode);
+    }
+    profile("after_receipt_finish");
 
     // Cooperative shutdown: if a SIGINT/SIGTERM/SIGHUP arrived while
     // the command was executing, skip the auto-flush phase and let
@@ -1133,6 +1185,7 @@ fn main() {
     // first so `SqliteStorage::Drop` checkpoints the WAL (#270).
     drop(storage_result);
     drop(write_lock);
+    profile("after_storage_teardown");
     beads_rust::shutdown::exit_process(0);
 }
 

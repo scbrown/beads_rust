@@ -79,6 +79,11 @@ fn execute_routed(
 ) -> Result<()> {
     let target_ids = requested_target_ids(args, beads_dir)?;
     let routed_batches = config::routing::group_issue_inputs_by_route(&target_ids, beads_dir)?;
+    if args.lossless && routed_batches.iter().any(|batch| batch.is_external) {
+        return Err(BeadsError::Config(
+            "lossless export requires exact local IDs".into(),
+        ));
+    }
     if !routed_batches.iter().any(|batch| batch.is_external) {
         return execute_inner(
             args,
@@ -288,6 +293,44 @@ fn attach_inherited_context(
     }
 }
 
+fn execute_lossless(
+    args: &ShowArgs,
+    cli: &config::CliOverrides,
+    beads_dir: &Path,
+    preloaded_storage: Option<&SqliteStorage>,
+    preloaded_storage_ctx: Option<&config::OpenStorageResult>,
+) -> Result<()> {
+    let owned;
+    let storage = if let Some(ctx) = preloaded_storage_ctx {
+        if ctx.no_db {
+            return Err(BeadsError::Config(
+                "lossless export requires a database".into(),
+            ));
+        }
+        &ctx.storage
+    } else if let Some(storage) = preloaded_storage {
+        storage
+    } else {
+        owned = config::open_storage_with_cli(beads_dir, cli)?;
+        if owned.no_db {
+            return Err(BeadsError::Config(
+                "lossless export requires a database".into(),
+            ));
+        }
+        &owned.storage
+    };
+    let records = crate::sync::export_selected_records(storage, &args.ids)?;
+    // Validate and serialize the entire selection before printing any row.
+    let lines = records
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn execute_inner(
     args: &ShowArgs,
     cli: &config::CliOverrides,
@@ -296,6 +339,15 @@ fn execute_inner(
     preloaded_storage: Option<&SqliteStorage>,
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
+    if args.lossless {
+        return execute_lossless(
+            args,
+            cli,
+            beads_dir,
+            preloaded_storage,
+            preloaded_storage_ctx,
+        );
+    }
     let (mut details_list, use_color) = load_issue_details_for_route(
         args,
         cli,

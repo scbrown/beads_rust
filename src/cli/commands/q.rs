@@ -142,6 +142,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         created_at: now,
         updated_at: now,
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         design: None,
         acceptance_criteria: None,
         notes: None,
@@ -194,6 +195,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         }
 
         issue.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: parent_id.clone(),
             dep_type: DependencyType::ParentChild,

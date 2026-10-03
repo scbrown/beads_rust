@@ -24,6 +24,7 @@ use common::{fixtures, test_db};
 /// the JSONL import path, which round-trips cyclic graphs losslessly.
 fn import_blocking_edge(storage: &SqliteStorage, from: &str, to: &str) {
     let dependency = Dependency {
+        jsonl_extensions: std::collections::BTreeMap::new(),
         issue_id: from.to_string(),
         depends_on_id: to.to_string(),
         dep_type: DependencyType::Blocks,
@@ -619,6 +620,7 @@ fn detect_all_cycles_collapses_dense_component_to_witness() {
             .iter()
             .filter(|to| *to != from)
             .map(|to| Dependency {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 issue_id: from.clone(),
                 depends_on_id: to.clone(),
                 dep_type: DependencyType::Blocks,

@@ -643,6 +643,11 @@ pub struct Issue {
     pub dependencies: Vec<Dependency>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub comments: Vec<Comment>,
+
+    /// Unmodeled top-level JSONL fields, preserved through database storage and
+    /// export. These participate in sync equality but not legacy content hashes.
+    #[serde(flatten, default)]
+    pub jsonl_extensions: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Issue {
@@ -692,6 +697,7 @@ impl Default for Issue {
             labels: Vec::new(),
             dependencies: Vec::new(),
             comments: Vec::new(),
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -756,6 +762,7 @@ impl Issue {
             // peer's context update during three-way merge / import de-dup
             // (persisted_import_issue_equals had to re-add it as a workaround).
             || self.agent_context != other.agent_context
+            || self.jsonl_extensions != other.jsonl_extensions
         {
             return false;
         }
@@ -926,6 +933,10 @@ pub struct Dependency {
     /// Thread ID for conversation linking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+
+    /// Peer fields not modeled by this version, retained across JSONL sync.
+    #[serde(flatten, default)]
+    pub jsonl_extensions: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// A comment on an issue.
@@ -937,6 +948,9 @@ pub struct Comment {
     #[serde(rename = "text")]
     pub body: String,
     pub created_at: DateTime<Utc>,
+    /// Includes native peer comment identities and unmodeled metadata.
+    #[serde(flatten, default)]
+    pub jsonl_extensions: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// An event in the issue's history (audit log).
@@ -970,6 +984,7 @@ pub struct Event {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::collections::BTreeMap;
 
     #[test]
     fn status_custom_roundtrip() {
@@ -1022,6 +1037,7 @@ mod tests {
     #[test]
     fn test_issue_serialization() {
         let issue = Issue {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: "bd-123".to_string(),
             content_hash: Some("abc".to_string()),
             title: "Test Issue".to_string(),
@@ -1494,6 +1510,7 @@ mod tests {
 
     fn create_test_issue() -> Issue {
         Issue {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: "bd-test".to_string(),
             content_hash: None,
             title: "Test Title".to_string(),
@@ -1651,6 +1668,7 @@ mod tests {
                 created_by: Some("alice".to_string()),
                 metadata: Some("{\"source\":\"cli\"}".to_string()),
                 thread_id: Some("br-1".to_string()),
+                jsonl_extensions: BTreeMap::new(),
             },
             Dependency {
                 issue_id: issue1.id.clone(),
@@ -1660,6 +1678,7 @@ mod tests {
                 created_by: Some("alice".to_string()),
                 metadata: None,
                 thread_id: None,
+                jsonl_extensions: BTreeMap::new(),
             },
         ];
         issue1.comments = vec![
@@ -1669,6 +1688,7 @@ mod tests {
                 author: "alice".to_string(),
                 body: "second".to_string(),
                 created_at: Utc.timestamp_opt(1_700_000_200, 0).unwrap(),
+                jsonl_extensions: BTreeMap::new(),
             },
             Comment {
                 id: 1,
@@ -1676,6 +1696,7 @@ mod tests {
                 author: "alice".to_string(),
                 body: "first".to_string(),
                 created_at: Utc.timestamp_opt(1_700_000_100, 0).unwrap(),
+                jsonl_extensions: BTreeMap::new(),
             },
         ];
 
@@ -1939,6 +1960,7 @@ mod tests {
             author: "testuser".to_string(),
             body: "This is a comment".to_string(),
             created_at: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            jsonl_extensions: BTreeMap::new(),
         };
 
         let json = serde_json::to_string(&comment).unwrap();
@@ -1968,6 +1990,7 @@ mod tests {
             created_by: Some("testuser".to_string()),
             metadata: None,
             thread_id: None,
+            jsonl_extensions: BTreeMap::new(),
         };
 
         let json = serde_json::to_string(&dep).unwrap();

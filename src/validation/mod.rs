@@ -890,6 +890,7 @@ mod tests {
         Issue {
             id: "bd-abc123".to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: "Test issue".to_string(),
             description: None,
             design: None,
@@ -1099,6 +1100,7 @@ mod tests {
     #[test]
     fn comment_validation_rejects_empty_body() {
         let comment = Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 1,
             issue_id: "bd-abc123".to_string(),
             author: "tester".to_string(),
@@ -1145,6 +1147,7 @@ mod tests {
 
     fn base_dependency() -> Dependency {
         Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: "issue".to_string(),
             depends_on_id: "dep".to_string(),
             dep_type: DependencyType::Blocks,

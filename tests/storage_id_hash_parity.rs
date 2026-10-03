@@ -642,6 +642,7 @@ fn content_hash_trait_implementation() {
     let mut issue = Issue {
         id: "bd-test123".to_string(),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title: "Test Issue".to_string(),
         description: Some("Description".to_string()),
         design: None,

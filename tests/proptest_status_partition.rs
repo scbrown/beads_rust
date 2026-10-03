@@ -48,6 +48,7 @@ fn make_issue(
     Issue {
         id: format!("bd-{suffix}"),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title: title.to_string(),
         description: None,
         design: None,

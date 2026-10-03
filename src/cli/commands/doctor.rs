@@ -13953,6 +13953,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: title.to_string(),
             description: None,
             design: None,
@@ -14660,6 +14661,7 @@ mod tests {
         issue.dependencies = blocked_by
             .iter()
             .map(|target| crate::model::Dependency {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 issue_id: id.to_string(),
                 depends_on_id: (*target).to_string(),
                 dep_type: crate::model::DependencyType::Blocks,
@@ -21875,6 +21877,7 @@ mod tests {
             let issue = Issue {
                 id: "bd-keep".to_string(),
                 content_hash: None,
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 title: "Keep me".to_string(),
                 description: None,
                 design: None,
@@ -22194,6 +22197,7 @@ mod tests {
         let issue = Issue {
             id: "proj-abc123".to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: "Imported".to_string(),
             description: None,
             design: None,

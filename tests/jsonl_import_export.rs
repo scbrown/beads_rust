@@ -18,6 +18,261 @@ fn issue_with_id(id: &str, title: &str) -> Issue {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One persisted lifecycle: import, reopen, edit, export, update, remove.
+fn unknown_jsonl_fields_survive_reopen_native_edit_and_real_export() {
+    use beads_rust::storage::IssueUpdate;
+    use serde_json::json;
+
+    let temp = TempDir::new().unwrap();
+    let input = temp.path().join("input.jsonl");
+    let output = temp.path().join("output.jsonl");
+    let db = temp.path().join("store.db");
+    let mut raw = serde_json::to_value(issue_with_id("test-carry", "Peer item")).unwrap();
+    raw["_seeds"] = json!({"revision": 7, "facts": [{"predicate": "custom", "value": "雪"}]});
+    raw["outcome"] = json!(null);
+    raw["workflow_run"] = json!({"id": "run-1", "steps": [true, 5, null]});
+    fs::write(&input, format!("{raw}\n")).unwrap();
+    {
+        let mut storage = SqliteStorage::open(&db).unwrap();
+        let imported = import_from_jsonl(
+            &mut storage,
+            &input,
+            &ImportConfig::default(),
+            Some("test-"),
+        )
+        .unwrap();
+        assert_eq!(imported.imported_count, 1);
+    }
+    let mut storage = SqliteStorage::open(&db).unwrap();
+    let loaded = storage.get_issue("test-carry").unwrap().unwrap();
+    assert_eq!(loaded.jsonl_extensions.len(), 3);
+    assert_eq!(loaded.jsonl_extensions["_seeds"], raw["_seeds"]);
+    storage
+        .update_issue(
+            "test-carry",
+            &IssueUpdate {
+                title: Some("Native positive control".into()),
+                ..IssueUpdate::default()
+            },
+            "native-editor",
+        )
+        .unwrap();
+    let result = export_to_jsonl(&storage, &output, &ExportConfig::default()).unwrap();
+    assert_eq!(
+        result.exported_count, 1,
+        "a skipped flush is not a round trip"
+    );
+    let returned: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&output).unwrap().trim()).unwrap();
+    assert_eq!(returned["title"], "Native positive control");
+    for name in ["_seeds", "outcome", "workflow_run"] {
+        assert!(
+            returned.as_object().unwrap().contains_key(name),
+            "lost {name}"
+        );
+        assert_eq!(returned[name], raw[name], "changed {name}");
+    }
+
+    // An extension-only newer import must update, while its repeat is a no-op.
+    let mut incoming = storage.get_issue_for_export("test-carry").unwrap().unwrap();
+    incoming.updated_at += Duration::seconds(1);
+    incoming
+        .jsonl_extensions
+        .insert("_seeds".into(), json!({"revision": 8}));
+    fs::write(
+        &input,
+        format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+    )
+    .unwrap();
+    let updated = import_from_jsonl(
+        &mut storage,
+        &input,
+        &ImportConfig::default(),
+        Some("test-"),
+    )
+    .unwrap();
+    assert_eq!(updated.updated_count, 1);
+    let repeated = import_from_jsonl(
+        &mut storage,
+        &input,
+        &ImportConfig::default(),
+        Some("test-"),
+    )
+    .unwrap();
+    assert_eq!(repeated.updated_count, 0);
+    assert_eq!(
+        storage
+            .get_issue("test-carry")
+            .unwrap()
+            .unwrap()
+            .jsonl_extensions,
+        incoming.jsonl_extensions
+    );
+
+    // Explicit removal in a newer full snapshot must not resurrect stale carry.
+    incoming.updated_at += Duration::seconds(1);
+    incoming.jsonl_extensions.clear();
+    fs::write(
+        &input,
+        format!("{}\n", serde_json::to_string(&incoming).unwrap()),
+    )
+    .unwrap();
+    import_from_jsonl(
+        &mut storage,
+        &input,
+        &ImportConfig::default(),
+        Some("test-"),
+    )
+    .unwrap();
+    assert!(
+        storage
+            .get_issue("test-carry")
+            .unwrap()
+            .unwrap()
+            .jsonl_extensions
+            .is_empty()
+    );
+}
+
+#[test]
+fn extension_only_changes_participate_in_sync_equality() {
+    let base = issue_with_id("test-carry", "Same modeled content");
+    let mut peer = base.clone();
+    peer.jsonl_extensions
+        .insert("future_field".into(), serde_json::json!([null, "value"]));
+    assert_eq!(base.compute_content_hash(), peer.compute_content_hash());
+    assert!(!base.sync_equals(&peer));
+    assert!(peer.sync_equals(&peer.clone()));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // One nested import/edit/export/update/removal lifecycle.
+fn nested_extensions_survive_disk_reopen_edit_and_export() {
+    use beads_rust::storage::IssueUpdate;
+    use serde_json::json;
+
+    let temp = TempDir::new().unwrap();
+    let input = temp.path().join("nested.jsonl");
+    let output = temp.path().join("export.jsonl");
+    let db = temp.path().join("store.db");
+    let mut raw = serde_json::to_value(issue_with_id("test-child", "Child")).unwrap();
+    raw["comments"] = json!([{"id":7,"issue_id":"test-child","author":"peer",
+        "text":"comment control","created_at":"2026-01-01T00:00:00Z",
+        "_seeds":{"index":7,"facts":[null,"雪"]},"future":null}]);
+    raw["dependencies"] = json!([{"issue_id":"test-child","depends_on_id":"test-parent",
+        "type":"blocks","created_at":"2026-01-01T00:00:00Z","created_by":"peer",
+        "future":{"nested":[true,null,3]}}]);
+    let parent = serde_json::to_string(&issue_with_id("test-parent", "Parent")).unwrap();
+    fs::write(&input, format!("{parent}\n{raw}\n")).unwrap();
+    {
+        let mut storage = SqliteStorage::open(&db).unwrap();
+        assert_eq!(
+            import_from_jsonl(
+                &mut storage,
+                &input,
+                &ImportConfig::default(),
+                Some("test-")
+            )
+            .unwrap()
+            .imported_count,
+            2
+        );
+    }
+    let mut storage = SqliteStorage::open(&db).unwrap();
+    storage
+        .update_issue(
+            "test-child",
+            &IssueUpdate {
+                title: Some("Native edit".into()),
+                ..IssueUpdate::default()
+            },
+            "editor",
+        )
+        .unwrap();
+    storage
+        .add_comment("test-child", "editor", "Native comment")
+        .unwrap();
+    assert!(
+        !storage
+            .add_dependency("test-child", "test-parent", "blocks", "editor")
+            .unwrap()
+    );
+    assert_eq!(
+        export_to_jsonl(&storage, &output, &ExportConfig::default())
+            .unwrap()
+            .exported_count,
+        2
+    );
+    let returned = read_issues_from_jsonl(&output)
+        .unwrap()
+        .into_iter()
+        .find(|issue| issue.id == "test-child")
+        .unwrap();
+    assert_eq!(returned.title, "Native edit");
+    assert_eq!(
+        returned.comments[0].jsonl_extensions["_seeds"],
+        raw["comments"][0]["_seeds"]
+    );
+    assert!(returned.comments[0].jsonl_extensions.contains_key("future"));
+    assert_eq!(
+        returned.dependencies[0].jsonl_extensions["future"],
+        raw["dependencies"][0]["future"]
+    );
+    let mut changed = returned.clone();
+    changed.comments[0].jsonl_extensions.clear();
+    assert!(!returned.sync_equals(&changed));
+    changed = returned.clone();
+    changed.dependencies[0].jsonl_extensions.clear();
+    assert!(!returned.sync_equals(&changed));
+
+    let mut incoming = returned.clone();
+    incoming.updated_at += Duration::seconds(1);
+    incoming.comments[0]
+        .jsonl_extensions
+        .insert("_seeds".into(), json!({"index":8}));
+    incoming.dependencies[0]
+        .jsonl_extensions
+        .insert("future".into(), json!(["updated"]));
+    for remove in [false, true] {
+        if remove {
+            incoming.updated_at += Duration::seconds(1);
+            incoming.comments[0].jsonl_extensions.clear();
+            incoming.dependencies[0].jsonl_extensions.clear();
+        }
+        fs::write(
+            &input,
+            format!("{parent}\n{}\n", serde_json::to_string(&incoming).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            import_from_jsonl(
+                &mut storage,
+                &input,
+                &ImportConfig::default(),
+                Some("test-")
+            )
+            .unwrap()
+            .updated_count,
+            1
+        );
+        assert_eq!(
+            import_from_jsonl(
+                &mut storage,
+                &input,
+                &ImportConfig::default(),
+                Some("test-")
+            )
+            .unwrap()
+            .updated_count,
+            0
+        );
+        let actual = storage.get_issue_for_export("test-child").unwrap().unwrap();
+        assert_eq!(actual.comments, incoming.comments);
+        assert_eq!(actual.dependencies, incoming.dependencies);
+    }
+}
+
+#[test]
 fn export_import_roundtrip_preserves_relationships() {
     let mut storage = SqliteStorage::open_memory().unwrap();
     let mut alpha = fixtures::issue("Alpha");
@@ -123,6 +378,7 @@ fn export_sorts_comments_canonically_after_loading_relations() {
     issue.updated_at = timestamp;
     issue.comments = vec![
         Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 0,
             issue_id: issue.id.clone(),
             author: "zara".to_string(),
@@ -130,6 +386,7 @@ fn export_sorts_comments_canonically_after_loading_relations() {
             created_at: timestamp,
         },
         Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 0,
             issue_id: issue.id.clone(),
             author: "alice".to_string(),

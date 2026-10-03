@@ -364,6 +364,7 @@ mod tests {
         );
 
         let raw_deps = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: "bd-source".to_string(),
             depends_on_id: "bd-target\x1b]52;c;bad\x07".to_string(),
             dep_type: DependencyType::Custom("custom\x08type".to_string()),

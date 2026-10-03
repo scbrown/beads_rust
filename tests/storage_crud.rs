@@ -65,6 +65,7 @@ fn create_issue_all_fields_populated() {
         comments: vec![],
         // Other optional fields
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         closed_at: None,
         close_reason: None,
         closed_by_session: None,
@@ -246,6 +247,7 @@ fn comments_with_same_timestamp_are_ordered_by_id() {
             &issue.id,
             &[
                 Comment {
+                    jsonl_extensions: std::collections::BTreeMap::new(),
                     id: 20,
                     issue_id: issue.id.clone(),
                     author: "reviewer".to_string(),
@@ -253,6 +255,7 @@ fn comments_with_same_timestamp_are_ordered_by_id() {
                     created_at,
                 },
                 Comment {
+                    jsonl_extensions: std::collections::BTreeMap::new(),
                     id: 10,
                     issue_id: issue.id.clone(),
                     author: "reviewer".to_string(),
@@ -523,6 +526,7 @@ fn update_issue_clear_optional_fields() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         design: None,
         acceptance_criteria: None,
         notes: None,
@@ -867,6 +871,7 @@ fn upsert_issue_stores_all_fields() {
         dependencies: vec![],
         comments: vec![],
         content_hash: Some("abc123".to_string()),
+        jsonl_extensions: std::collections::BTreeMap::new(),
         closed_at: None,
         close_reason: None,
         closed_by_session: None,

@@ -328,6 +328,7 @@
         "updated_at",
         "compaction_level"
       ],
+      "additionalProperties": true,
       "$defs": {
         "Status": {
           "description": "Issue lifecycle status.",
@@ -423,7 +424,8 @@
             "depends_on_id",
             "type",
             "created_at"
-          ]
+          ],
+          "additionalProperties": true
         },
         "DependencyType": {
           "description": "Dependency relationship type.",
@@ -477,7 +479,8 @@
             "author",
             "text",
             "created_at"
-          ]
+          ],
+          "additionalProperties": true
         },
         "IssueWithDependencyMetadata": {
           "type": "object",

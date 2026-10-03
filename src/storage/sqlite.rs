@@ -1145,7 +1145,8 @@ const EXPORT_HASH_CHUNK_SIZE: usize = 32;
 const BLOCKED_CACHE_DELETE_CHUNK_SIZE: usize = 400;
 const DIRTY_ISSUE_CHUNK_SIZE: usize = 900;
 const BLOCKS_DEP_EDGE_FILTER_LIMIT: usize = 400;
-const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 140;
+// Eight bound values per imported dependency must stay below 999 variables.
+const IMPORT_DEPENDENCY_CHUNK_SIZE: usize = 120;
 const DEPENDENCY_TRAVERSAL_MAX_DEPTH: usize = 500;
 const BLOCKED_CACHE_STATE_KEY: &str = "blocked_cache_state";
 const BLOCKED_CACHE_STATE_STALE: &str = "stale";
@@ -1668,7 +1669,7 @@ impl ReadyIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context"
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, jsonl_extensions"
             }
             Self::Command => {
                 r"SELECT id, title, description, acceptance_criteria, notes, status, priority,
@@ -1700,7 +1701,7 @@ impl SearchIssueProjection {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, jsonl_extensions
                   FROM issues
                   WHERE 1=1"
             }
@@ -1731,7 +1732,7 @@ impl BlockedIssueProjection {
                      i.due_at, i.defer_until, i.external_ref, i.source_system, i.source_repo,
                      i.deleted_at, i.deleted_by, i.delete_reason, i.original_type, i.compaction_level,
                      i.compacted_at, i.compacted_at_commit, i.original_size, i.sender, i.ephemeral,
-                     i.pinned, i.is_template, i.source_repo_path, i.agent_context,
+                     i.pinned, i.is_template, i.source_repo_path, i.agent_context, i.jsonl_extensions,
                      bc.blocked_by"
             }
             Self::Command => {
@@ -1750,7 +1751,7 @@ impl BlockedIssueProjection {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context"
+                     pinned, is_template, source_repo_path, agent_context, jsonl_extensions"
             }
             Self::Command => {
                 r"SELECT id, title, description, status, priority, issue_type,
@@ -1761,11 +1762,8 @@ impl BlockedIssueProjection {
 
     const fn cached_blocked_by_index(self) -> usize {
         match self {
-            // Bumped from 37 → 38 after `agent_context` was appended
-            // to the Full SELECT at position 37 (beads_rust#297).
-            // Source_repo_path is at 36, agent_context is at 37, so
-            // bc.blocked_by lands at 38 in the joined projection.
-            Self::Full => 38,
+            // jsonl_extensions is the final issue column at position 38.
+            Self::Full => 39,
             Self::Command => 9,
         }
     }
@@ -6801,8 +6799,8 @@ impl SqliteStorage {
                     closed_by_session, due_at, defer_until, external_ref, source_system,
                     source_repo, source_repo_path, deleted_at, deleted_by, delete_reason, original_type,
                     compaction_level, compacted_at, compacted_at_commit, original_size,
-                    sender, ephemeral, pinned, is_template, agent_context
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    sender, ephemeral, pinned, is_template, agent_context, jsonl_extensions
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 &[
                     SqliteValue::from(issue.id.as_str()),
                     SqliteValue::from(content_hash.as_str()),
@@ -6842,6 +6840,7 @@ impl SqliteStorage {
                     SqliteValue::from(i64::from(i32::from(issue.pinned))),
                     SqliteValue::from(i64::from(i32::from(issue.is_template))),
                     issue.agent_context.as_deref().map_or(SqliteValue::Null, SqliteValue::from),
+                    SqliteValue::from(serde_json::to_string(&issue.jsonl_extensions)?),
                 ],
             )?;
 
@@ -6905,14 +6904,15 @@ impl SqliteStorage {
                 }
 
                 conn.execute_with_params(
-                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by)
-                     VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, jsonl_extensions)
+                     VALUES (?, ?, ?, ?, ?, ?)",
                     &[
                         SqliteValue::from(issue.id.as_str()),
                         SqliteValue::from(dep.depends_on_id.as_str()),
                         SqliteValue::from(dep.dep_type.as_str()),
                         SqliteValue::from(dep.created_at.to_rfc3339()),
                         SqliteValue::from(dep.created_by.as_deref().unwrap_or(actor)),
+                        SqliteValue::from(serde_json::to_string(&dep.jsonl_extensions)?),
                     ],
                 )?;
 
@@ -6930,12 +6930,13 @@ impl SqliteStorage {
             // Insert Comments
             for comment in &issue.comments {
                 conn.execute_with_params(
-                    "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO comments (issue_id, author, text, created_at, jsonl_extensions) VALUES (?, ?, ?, ?, ?)",
                     &[
                         SqliteValue::from(issue.id.as_str()),
                         SqliteValue::from(comment.author.as_str()),
                         SqliteValue::from(comment.body.as_str()),
                         SqliteValue::from(comment.created_at.to_rfc3339()),
+                        SqliteValue::from(serde_json::to_string(&comment.jsonl_extensions)?),
                     ],
                 )?;
                 ctx.record_event(
@@ -8101,7 +8102,7 @@ impl SqliteStorage {
                    due_at, defer_until, external_ref, source_system, source_repo,
                    deleted_at, deleted_by, delete_reason, original_type,
                    compaction_level, compacted_at, compacted_at_commit, original_size,
-                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                   sender, ephemeral, pinned, is_template, source_repo_path, agent_context, jsonl_extensions
             FROM issues
             WHERE id = ?
         ";
@@ -8141,7 +8142,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, jsonl_extensions
                   FROM issues WHERE id IN ({})",
                 placeholders.join(",")
             );
@@ -8277,7 +8278,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type,
                      compaction_level, compacted_at, compacted_at_commit, original_size,
-                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context",
+                     sender, ephemeral, pinned, is_template, source_repo_path, agent_context, jsonl_extensions",
         );
 
         let mut params: Vec<SqliteValue> = Vec::new();
@@ -8469,7 +8470,7 @@ impl SqliteStorage {
                          due_at, defer_until, external_ref, source_system, source_repo,
                          deleted_at, deleted_by, delete_reason, original_type,
                          compaction_level, compacted_at, compacted_at_commit, original_size,
-                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context
+                         sender, ephemeral, pinned, is_template, source_repo_path, agent_context, jsonl_extensions
                   FROM issues
                   WHERE {status_filter}
                     AND is_template = 0
@@ -13938,7 +13939,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_comments(&self, issue_id: &str) -> Result<Vec<Comment>> {
         let rows = self.conn.query_with_params(
-            "SELECT id, issue_id, author, text, created_at
+            "SELECT id, issue_id, author, text, created_at, jsonl_extensions
              FROM comments
              WHERE issue_id = ?
              ORDER BY created_at ASC, id ASC",
@@ -13968,7 +13969,7 @@ impl SqliteStorage {
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT id, issue_id, author, text, created_at
+                "SELECT id, issue_id, author, text, created_at, jsonl_extensions
                  FROM comments
                  WHERE issue_id IN ({})
                  ORDER BY issue_id ASC, created_at ASC, id ASC",
@@ -14019,9 +14020,9 @@ impl SqliteStorage {
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             let placeholders: Vec<&str> = chunk.iter().map(|_| "?").collect();
             let sql = format!(
-                "SELECT id, issue_id, author, text, created_at
+                "SELECT id, issue_id, author, text, created_at, jsonl_extensions
                  FROM (
-                     SELECT id, issue_id, author, text, created_at,
+                     SELECT id, issue_id, author, text, created_at, jsonl_extensions,
                             ROW_NUMBER() OVER (
                                 PARTITION BY issue_id
                                 ORDER BY created_at DESC, id DESC
@@ -14936,7 +14937,7 @@ impl SqliteStorage {
                            due_at, defer_until, external_ref, source_system, source_repo,
                            deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                            compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                           pinned, is_template, source_repo_path, agent_context
+                           pinned, is_template, source_repo_path, agent_context, jsonl_extensions
                     FROM issues
                     WHERE (ephemeral = 0 OR ephemeral IS NULL)
                       AND id NOT LIKE '%-wisp-%'
@@ -15009,7 +15010,7 @@ impl SqliteStorage {
         use crate::model::{Dependency, DependencyType};
 
         let rows = self.conn.query(
-            "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+            "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id, jsonl_extensions
              FROM dependencies
              ORDER BY issue_id, depends_on_id",
         )?;
@@ -15037,6 +15038,7 @@ impl SqliteStorage {
                 created_by: row.get(4).and_then(SqliteValue::as_text).map(String::from),
                 metadata: row.get(5).and_then(SqliteValue::as_text).map(String::from),
                 thread_id: row.get(6).and_then(SqliteValue::as_text).map(String::from),
+                jsonl_extensions: jsonl_extensions_from_row(row, 7)?,
             };
             map.entry(issue_id).or_default().push(dep);
         }
@@ -15059,7 +15061,7 @@ impl SqliteStorage {
         let rows = self.conn.query(
             "SELECT dependencies.issue_id, dependencies.depends_on_id, dependencies.type,
                     dependencies.created_at, dependencies.created_by, dependencies.metadata,
-                    dependencies.thread_id
+                    dependencies.thread_id, dependencies.jsonl_extensions
              FROM dependencies
              INNER JOIN issues ON issues.id = dependencies.issue_id
              WHERE (issues.ephemeral = 0 OR issues.ephemeral IS NULL)
@@ -15090,6 +15092,7 @@ impl SqliteStorage {
                 created_by: row.get(4).and_then(SqliteValue::as_text).map(String::from),
                 metadata: row.get(5).and_then(SqliteValue::as_text).map(String::from),
                 thread_id: row.get(6).and_then(SqliteValue::as_text).map(String::from),
+                jsonl_extensions: jsonl_extensions_from_row(row, 7)?,
             };
             map.entry(issue_id).or_default().push(dep);
         }
@@ -15106,7 +15109,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_all_comments(&self) -> Result<HashMap<String, Vec<Comment>>> {
         let rows = self.conn.query(
-            "SELECT id, issue_id, author, text, created_at
+            "SELECT id, issue_id, author, text, created_at, jsonl_extensions
              FROM comments
              ORDER BY issue_id ASC, created_at ASC, id ASC",
         )?;
@@ -15129,7 +15132,7 @@ impl SqliteStorage {
     pub fn get_comments_for_export(&self) -> Result<HashMap<String, Vec<Comment>>> {
         let rows = self.conn.query(
             "SELECT comments.id, comments.issue_id, comments.author, comments.text,
-                    comments.created_at
+                    comments.created_at, comments.jsonl_extensions
              FROM comments
              INNER JOIN issues ON issues.id = comments.issue_id
              WHERE (issues.ephemeral = 0 OR issues.ephemeral IS NULL)
@@ -15912,13 +15915,20 @@ impl SqliteStorage {
             ephemeral: get_bool(33),
             pinned: get_bool(34),
             is_template: get_bool(35),
-            // Position 36 lands after `is_template` in the Full SELECT
-            // and before `bc.blocked_by` in the BlockedIssue::Full
-            // variant; the cached_blocked_by_index was bumped to 37
-            // in lock-step so the projection-specific blocked-by
-            // accessor still finds the right column.
+            // Appended columns retain the full projection's stable indices.
             source_repo_path: get_non_empty_str(36),
             agent_context: get_non_empty_str(37),
+            jsonl_extensions: match row.get(38) {
+                Some(SqliteValue::Null) => std::collections::BTreeMap::new(),
+                Some(value) => serde_json::from_str(value.as_text().ok_or_else(|| {
+                    BeadsError::Config("Issue jsonl_extensions must be TEXT or NULL".to_string())
+                })?)?,
+                None => {
+                    return Err(BeadsError::Config(
+                        "Issue projection missing jsonl_extensions".to_string(),
+                    ));
+                }
+            },
             labels: vec![],
             dependencies: vec![],
             comments: vec![],
@@ -15975,6 +15985,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16043,6 +16054,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16111,6 +16123,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16173,6 +16186,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16241,6 +16255,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -16303,6 +16318,7 @@ impl SqliteStorage {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -18498,7 +18514,7 @@ impl SqliteStorage {
     /// Returns an error if the database query fails.
     pub fn get_dependencies_full(&self, issue_id: &str) -> Result<Vec<crate::model::Dependency>> {
         let stmt = self.conn.prepare(
-            "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+            "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id, jsonl_extensions
              FROM dependencies
              WHERE issue_id = ?
              ORDER BY depends_on_id",
@@ -18537,6 +18553,7 @@ impl SqliteStorage {
                     .get(6)
                     .and_then(SqliteValue::as_text)
                     .map(str::to_string),
+                jsonl_extensions: jsonl_extensions_from_row(row, 7)?,
             });
         }
 
@@ -18563,7 +18580,7 @@ impl SqliteStorage {
         for chunk in issue_ids.chunks(SQLITE_VAR_LIMIT) {
             let placeholders = vec!["?"; chunk.len()].join(", ");
             let sql = format!(
-                "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
+                "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id, jsonl_extensions
                  FROM dependencies
                  WHERE issue_id IN ({})
                  ORDER BY depends_on_id",
@@ -18607,6 +18624,7 @@ impl SqliteStorage {
                         .get(6)
                         .and_then(SqliteValue::as_text)
                         .map(str::to_string),
+                    jsonl_extensions: jsonl_extensions_from_row(row, 7)?,
                 };
                 map.entry(dep.issue_id.clone()).or_default().push(dep);
             }
@@ -18981,7 +18999,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context
+                     pinned, is_template, source_repo_path, agent_context, jsonl_extensions
                FROM issues WHERE external_ref = ?",
             &[SqliteValue::from(external_ref)],
         ) {
@@ -19004,7 +19022,7 @@ impl SqliteStorage {
                      due_at, defer_until, external_ref, source_system, source_repo,
                      deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                      compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                     pinned, is_template, source_repo_path, agent_context
+                     pinned, is_template, source_repo_path, agent_context, jsonl_extensions
                FROM issues WHERE content_hash = ?",
             &[SqliteValue::from(content_hash)],
         ) {
@@ -19029,11 +19047,11 @@ impl SqliteStorage {
     fn import_issue_field_values(
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
-    ) -> Vec<SqliteValue> {
+    ) -> Result<Vec<SqliteValue>> {
         let status_str = issue.status.as_str();
         let issue_type_str = issue.issue_type.as_str();
 
-        vec![
+        Ok(vec![
             issue
                 .content_hash
                 .as_deref()
@@ -19106,7 +19124,8 @@ impl SqliteStorage {
                 .agent_context
                 .as_deref()
                 .map_or(SqliteValue::Null, SqliteValue::from),
-        ]
+            SqliteValue::from(serde_json::to_string(&issue.jsonl_extensions)?),
+        ])
     }
 
     /// Return the exact SQLite values a full import INSERT/UPDATE writes, in
@@ -19114,28 +19133,34 @@ impl SqliteStorage {
     /// to bind implementation-produced raw poststate into its review token.
     pub(crate) fn import_issue_raw_row_for_witness(issue: &Issue) -> Result<Vec<SqliteValue>> {
         let timestamps = ImportIssueTimestampStrings::from_issue(issue);
-        let mut fields = Self::import_issue_field_values(issue, &timestamps);
-        if fields.len() != 37 {
+        let mut fields = Self::import_issue_field_values(issue, &timestamps)?;
+        if fields.len() != 38 {
             return Err(BeadsError::Config(format!(
-                "Import issue raw witness expected 37 fields, found {}",
+                "Import issue raw witness expected 38 fields, found {}",
                 fields.len()
             )));
         }
         // Import SQL places source_repo_path beside source_repo for parameter
         // readability, while migrated physical schemas append it immediately
-        // before agent_context. Reorder into SELECT * / schema-catalog order.
+        // before agent_context and jsonl_extensions. Reorder into physical order.
         let source_repo_path = fields.remove(23);
+        let jsonl_extensions = fields.pop().ok_or_else(|| {
+            BeadsError::Config(
+                "Import issue raw witness lost the jsonl_extensions field".to_string(),
+            )
+        })?;
         let agent_context = fields.pop().ok_or_else(|| {
             BeadsError::Config("Import issue raw witness lost the agent_context field".to_string())
         })?;
-        let mut row = Vec::with_capacity(38);
+        let mut row = Vec::with_capacity(39);
         row.push(SqliteValue::from(issue.id.as_str()));
         row.extend(fields);
         row.push(source_repo_path);
         row.push(agent_context);
-        if row.len() != 38 {
+        row.push(jsonl_extensions);
+        if row.len() != 39 {
             return Err(BeadsError::Config(format!(
-                "Import issue raw witness expected 38 columns, found {}",
+                "Import issue raw witness expected 39 columns, found {}",
                 row.len()
             )));
         }
@@ -19147,9 +19172,9 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut insert_params = Vec::with_capacity(38);
+        let mut insert_params = Vec::with_capacity(39);
         insert_params.push(SqliteValue::from(issue.id.as_str()));
-        insert_params.extend(Self::import_issue_field_values(issue, timestamps));
+        insert_params.extend(Self::import_issue_field_values(issue, timestamps)?);
 
         let rows = self.conn.execute_with_params(
             r"INSERT INTO issues (
@@ -19159,9 +19184,9 @@ impl SqliteStorage {
                 due_at, defer_until, external_ref, source_system, source_repo, source_repo_path,
                 deleted_at, deleted_by, delete_reason, original_type, compaction_level,
                 compacted_at, compacted_at_commit, original_size, sender, ephemeral,
-                pinned, is_template, agent_context
+                pinned, is_template, agent_context, jsonl_extensions
             ) VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )",
             &insert_params,
         )?;
@@ -19174,7 +19199,7 @@ impl SqliteStorage {
         issue: &Issue,
         timestamps: &ImportIssueTimestampStrings,
     ) -> Result<usize> {
-        let mut params = Self::import_issue_field_values(issue, timestamps);
+        let mut params = Self::import_issue_field_values(issue, timestamps)?;
         params.push(SqliteValue::from(issue.id.as_str()));
         let rows = self.conn.execute_with_params(
             r"UPDATE issues SET
@@ -19186,7 +19211,7 @@ impl SqliteStorage {
                 external_ref = ?, source_system = ?, source_repo = ?, source_repo_path = ?,
                 deleted_at = ?, deleted_by = ?, delete_reason = ?, original_type = ?, compaction_level = ?,
                 compacted_at = ?, compacted_at_commit = ?, original_size = ?, sender = ?,
-                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?
+                ephemeral = ?, pinned = ?, is_template = ?, agent_context = ?, jsonl_extensions = ?
               WHERE id = ?",
             &params,
         )?;
@@ -19557,14 +19582,14 @@ impl SqliteStorage {
         for chunk in unique_deps.chunks(IMPORT_DEPENDENCY_CHUNK_SIZE) {
             let placeholders: Vec<String> = chunk
                 .iter()
-                .map(|_| "(?, ?, ?, ?, ?, ?, ?)".to_string())
+                .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?)".to_string())
                 .collect();
             let sql = format!(
-                "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) VALUES {}",
+                "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id, jsonl_extensions) VALUES {}",
                 placeholders.join(", ")
             );
 
-            let mut params = Vec::with_capacity(chunk.len() * 7);
+            let mut params = Vec::with_capacity(chunk.len() * 8);
             for dep in chunk {
                 params.push(SqliteValue::from(issue_id));
                 params.push(SqliteValue::from(dep.depends_on_id.as_str()));
@@ -19575,6 +19600,9 @@ impl SqliteStorage {
                 ));
                 params.push(SqliteValue::from(dep.metadata.as_deref().unwrap_or("{}")));
                 params.push(SqliteValue::from(dep.thread_id.as_deref().unwrap_or("")));
+                params.push(SqliteValue::from(serde_json::to_string(
+                    &dep.jsonl_extensions,
+                )?));
             }
 
             self.conn.execute_with_params(&sql, &params)?;
@@ -20427,12 +20455,13 @@ impl SqliteStorage {
         created_at: &str,
     ) -> Result<()> {
         self.conn.execute_with_params(
-            "INSERT INTO comments (issue_id, author, text, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO comments (issue_id, author, text, created_at, jsonl_extensions) VALUES (?, ?, ?, ?, ?)",
             &[
                 SqliteValue::from(issue_id),
                 SqliteValue::from(comment.author.as_str()),
                 SqliteValue::from(comment.body.as_str()),
                 SqliteValue::from(created_at),
+                SqliteValue::from(serde_json::to_string(&comment.jsonl_extensions)?),
             ],
         )?;
         Ok(())
@@ -20445,13 +20474,14 @@ impl SqliteStorage {
         created_at: &str,
     ) -> Result<()> {
         self.conn.execute_with_params(
-            "INSERT INTO comments (id, issue_id, author, text, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO comments (id, issue_id, author, text, created_at, jsonl_extensions) VALUES (?, ?, ?, ?, ?, ?)",
             &[
                 SqliteValue::from(comment.id),
                 SqliteValue::from(issue_id),
                 SqliteValue::from(comment.author.as_str()),
                 SqliteValue::from(comment.body.as_str()),
                 SqliteValue::from(created_at),
+                SqliteValue::from(serde_json::to_string(&comment.jsonl_extensions)?),
             ],
         )?;
         Ok(())
@@ -20525,6 +20555,7 @@ fn validate_new_comment(issue_id: &str, author: &str, text: &str) -> Result<()> 
         author: author.to_string(),
         body: text.to_string(),
         created_at: Utc::now(),
+        jsonl_extensions: std::collections::BTreeMap::new(),
     };
 
     CommentValidator::validate(&comment).map_err(BeadsError::from_validation_errors)
@@ -20556,6 +20587,7 @@ fn validate_import_comments_for_issue(issue_id: &str, comments: &[Comment]) -> R
             author: comment.author.clone(),
             body: comment.body.clone(),
             created_at: comment.created_at,
+            jsonl_extensions: comment.jsonl_extensions.clone(),
         };
         CommentValidator::validate(&comment_for_validation)
             .map_err(BeadsError::from_validation_errors)?;
@@ -20632,7 +20664,7 @@ fn gate_result_record_from_row(row: &Row) -> Result<crate::close_policy::GateRes
 
 fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
     let row = match conn.query_row_with_params(
-        "SELECT id, issue_id, author, text, created_at FROM comments WHERE id = ?",
+        "SELECT id, issue_id, author, text, created_at, jsonl_extensions FROM comments WHERE id = ?",
         &[SqliteValue::from(comment_id)],
     ) {
         Ok(row) => row,
@@ -20644,6 +20676,21 @@ fn fetch_comment(conn: &Connection, comment_id: i64) -> Result<Comment> {
         Err(error) => return Err(error.into()),
     };
     comment_from_row(&row)
+}
+
+fn jsonl_extensions_from_row(
+    row: &Row,
+    index: usize,
+) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+    match row.get(index) {
+        Some(SqliteValue::Null) => Ok(std::collections::BTreeMap::new()),
+        Some(value) => Ok(serde_json::from_str(value.as_text().ok_or_else(|| {
+            BeadsError::Config("jsonl_extensions must be TEXT or NULL".to_string())
+        })?)?),
+        None => Err(BeadsError::Config(
+            "Row projection missing jsonl_extensions".to_string(),
+        )),
+    }
 }
 
 fn comment_from_row(row: &Row) -> Result<Comment> {
@@ -20682,6 +20729,7 @@ fn comment_from_row(row: &Row) -> Result<Comment> {
         author,
         body,
         created_at,
+        jsonl_extensions: jsonl_extensions_from_row(row, 5)?,
     })
 }
 
@@ -20840,6 +20888,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -23892,6 +23941,7 @@ mod tests {
             created_by: None,
             metadata: None,
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         storage
             .sync_dependencies_for_import("bd-391-p", &[cyclic_dep("bd-391-p", "bd-391-q")])
@@ -24465,6 +24515,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -26681,6 +26732,7 @@ mod tests {
             created_by: Some("import".to_string()),
             metadata: None,
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         let err = storage
             .sync_dependencies_for_import(&issue.id, &[self_dependency])
@@ -26696,6 +26748,7 @@ mod tests {
             created_by: Some("import".to_string()),
             metadata: None,
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         let err = storage
             .sync_dependencies_for_import(&issue.id, &[wrong_source])
@@ -26719,6 +26772,7 @@ mod tests {
             created_by: Some("import".to_string()),
             metadata: Some("{not-json".to_string()),
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         let err = storage
             .sync_dependencies_for_import(&issue.id, &[invalid_metadata])
@@ -26743,6 +26797,7 @@ mod tests {
             created_by: Some("import".to_string()),
             metadata: None,
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         let err = storage
             .sync_dependencies_for_import(&issue.id, &[invalid_parent])
@@ -28125,6 +28180,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -28209,6 +28265,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -28287,6 +28344,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -28422,6 +28480,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -28520,6 +28579,7 @@ mod tests {
             author: "alice".to_string(),
             body: "   ".to_string(),
             created_at: t1,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         });
 
         let err = storage.create_issue(&issue, "tester").unwrap_err();
@@ -28615,6 +28675,7 @@ mod tests {
             author: "alice".to_string(),
             body: "Imported comment".to_string(),
             created_at: t1 + chrono::Duration::minutes(5),
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         storage
             .sync_comments_for_import("bd-c-import-a", &[imported_comment])
@@ -28655,6 +28716,7 @@ mod tests {
             author: "alice".to_string(),
             body: "first imported comment".to_string(),
             created_at: t1,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         let second = crate::model::Comment {
             id: 42,
@@ -28662,6 +28724,7 @@ mod tests {
             author: "alice".to_string(),
             body: "duplicate imported comment".to_string(),
             created_at: t1 + chrono::Duration::minutes(1),
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
 
         let error = storage
@@ -28682,6 +28745,7 @@ mod tests {
             author: "alice".to_string(),
             body: "valid text, wrong owner".to_string(),
             created_at: t1,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         let error = storage
             .sync_comments_for_import(&issue.id, &[wrong_issue_comment])
@@ -28745,6 +28809,7 @@ mod tests {
             author: "alice".to_string(),
             body: "first imported (collides with B)".to_string(),
             created_at: t1 + chrono::Duration::minutes(1),
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
         let second = crate::model::Comment {
             id: e + 1,
@@ -28752,6 +28817,7 @@ mod tests {
             author: "alice".to_string(),
             body: "second imported (self-collision)".to_string(),
             created_at: t1 + chrono::Duration::minutes(2),
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
 
         storage
@@ -28833,6 +28899,7 @@ mod tests {
             author: "alice".to_string(),
             body: "   ".to_string(),
             created_at: t1,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         };
 
         let error = storage
@@ -28872,6 +28939,7 @@ mod tests {
             created_by: Some("import".to_string()),
             metadata: None,
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }];
         imported.comments = vec![crate::model::Comment {
             id: existing_comment.id,
@@ -28879,6 +28947,7 @@ mod tests {
             author: "alice".to_string(),
             body: "Imported comment".to_string(),
             created_at: t1 + chrono::Duration::minutes(5),
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }];
 
         storage
@@ -29043,6 +29112,7 @@ mod tests {
             source_repo: None,
             source_repo_path: None,
             agent_context: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             deleted_at: None,
             deleted_by: None,
             delete_reason: None,
@@ -35073,7 +35143,8 @@ mod tests {
                 pinned INTEGER,
                 is_template INTEGER,
                 source_repo_path TEXT,
-                agent_context TEXT
+                agent_context TEXT,
+                jsonl_extensions TEXT
             );
             CREATE TABLE blocked_issues_cache (
                 issue_id TEXT PRIMARY KEY,
@@ -37115,6 +37186,7 @@ mod tests {
             author: "fixture".to_string(),
             body: "Imported merge comment".to_string(),
             created_at: now,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }];
         let mut child = make_issue(
             "bd-merge-parent.1",
@@ -37133,6 +37205,7 @@ mod tests {
             created_by: Some("fixture".to_string()),
             metadata: Some("{}".to_string()),
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }];
         let kept = vec![parent.clone(), child.clone()];
         let deleted = vec![victim.id.clone()];
@@ -37246,6 +37319,7 @@ mod tests {
             created_by: None,
             metadata: Some("not-json".to_string()),
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }];
 
         let kept = vec![invalid.clone()];
@@ -38157,6 +38231,7 @@ mod tests {
             created_by: Some("substituted".to_string()),
             metadata: Some("{}".to_string()),
             thread_id: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         });
         let mut comment = planned.clone();
         comment.comments.push(crate::model::Comment {
@@ -38165,6 +38240,7 @@ mod tests {
             author: "substituted".to_string(),
             body: "Substituted owned comment".to_string(),
             created_at: now,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         });
         let mut timestamp = planned.clone();
         timestamp.updated_at += chrono::Duration::nanoseconds(1);

@@ -24,6 +24,7 @@ pub fn issue(title: &str) -> Issue {
         created_at: base,
         updated_at: base + Duration::seconds(1),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         design: None,
         acceptance_criteria: None,
         notes: None,
@@ -126,6 +127,7 @@ impl IssueBuilder {
 
 pub fn dependency(from: &str, to: &str) -> Dependency {
     Dependency {
+        jsonl_extensions: std::collections::BTreeMap::new(),
         issue_id: from.to_string(),
         depends_on_id: to.to_string(),
         dep_type: DependencyType::Blocks,

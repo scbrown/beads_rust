@@ -23,6 +23,7 @@ fn make_test_issue(id: &str) -> Issue {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         description: None,
         design: None,
         acceptance_criteria: None,

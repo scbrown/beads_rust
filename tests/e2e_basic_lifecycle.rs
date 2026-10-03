@@ -48,6 +48,7 @@ fn make_issue(id: &str, title: &str, now: chrono::DateTime<Utc>) -> Issue {
         created_at: now,
         updated_at: now,
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         description: None,
         design: None,
         acceptance_criteria: None,

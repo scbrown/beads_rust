@@ -20,6 +20,7 @@ fn seed_issue(storage: &mut SqliteStorage, id: &str, assignee: Option<&str>) {
         updated_at: t,
         assignee: assignee.map(str::to_string),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         description: None,
         design: None,
         acceptance_criteria: None,

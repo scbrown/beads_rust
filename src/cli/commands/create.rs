@@ -500,6 +500,7 @@ pub fn create_issue_impl(
             ephemeral: args.ephemeral,
             // Defaults
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             design: None,
             acceptance_criteria: args.acceptance_criteria.clone(),
             notes: None,
@@ -1022,6 +1023,7 @@ fn execute_import(
                 design: design.clone(),
                 acceptance_criteria: acceptance_criteria.clone(),
                 content_hash: None,
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 notes: None,
                 // Keep import hashes actor-independent so identical markdown imports
                 // still deduplicate across sync boundaries.

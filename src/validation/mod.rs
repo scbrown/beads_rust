@@ -890,6 +890,7 @@ mod tests {
         Issue {
             id: "bd-abc123".to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: "Test issue".to_string(),
             description: None,
             design: None,

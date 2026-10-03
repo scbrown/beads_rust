@@ -8,7 +8,7 @@ use crate::error::{BeadsError, Result};
 use crate::model::{IssueType, Priority, Status};
 use crate::util::content_hash_from_parts;
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 17;
+pub const CURRENT_SCHEMA_VERSION: i32 = 18;
 const RUNTIME_SCHEMA_WITNESS_KEY: &str = "runtime_schema_witness_v1";
 
 // Persisted witnesses are valid only for this exact compatibility predicate.
@@ -284,6 +284,8 @@ pub const SCHEMA_SQL: &str = r"
         -- column itself stays a TEXT bag. NULL means no inherited context;
         -- emission for descendants silently skips ancestors with NULL.
         agent_context TEXT,
+        -- Opaque peer fields survive native edits and genuine exports.
+        jsonl_extensions TEXT,
         CHECK (
             (status = 'closed' AND closed_at IS NOT NULL) OR
             (status = 'tombstone') OR
@@ -876,7 +878,7 @@ fn connection_user_version(conn: &Connection) -> Result<u32> {
 /// gate-history schema shipped in the v0.2.19-era line) and 16 (the #384
 /// capacity-exemptions schema created by the released v0.2.19 binary). See
 /// GitHub #398.
-pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 4] = [13, 14, 15, 16];
+pub const REVIEWED_MIGRATION_SOURCE_VERSIONS: [u32; 5] = [13, 14, 15, 16, 17];
 
 fn current_schema_version_u32() -> Result<u32> {
     u32::try_from(CURRENT_SCHEMA_VERSION).map_err(|_| {
@@ -932,7 +934,7 @@ fn validate_reviewed_schema_migration(
     if !REVIEWED_MIGRATION_SOURCE_VERSIONS.contains(&from) {
         return Err(BeadsError::internal(format!(
             "schema migrate refused — reviewed migrations are supported only from source \
-             schemas 13, 14, 15, and 16 to {supported_target} (got {from}->{target_version})"
+             schemas 13 through 17 to {supported_target} (got {from}->{target_version})"
         )));
     }
     if marked_at.is_empty() {
@@ -957,7 +959,7 @@ fn validate_reviewed_schema_migration(
 /// `BEGIN IMMEDIATE` transaction before calling it. All validation occurs
 /// before the first migration write.
 ///
-/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13, 14, 15, 16) are
+/// Sources in [`REVIEWED_MIGRATION_SOURCE_VERSIONS`] (13 through 17) are
 /// accepted, each running exactly the version-gated step chain up to
 /// `CURRENT_SCHEMA_VERSION` (#398). `marked_at` is written verbatim to every
 /// `dirty_issues` row rewritten by the v13 content-hash step, making the
@@ -1010,6 +1012,8 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
         "Migrating database to schema version 17 (capacity occupancy - GitHub #384 phase 5)"
     );
     apply_capacity_occupancy_migration_in_transaction(conn)?;
+
+    ensure_columns(conn, "issues", &[("jsonl_extensions", "TEXT")])?;
 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
@@ -1252,6 +1256,7 @@ const ISSUE_COLUMNS: &[(&str, &str)] = &[
     // Append-at-end keeps EXPECTED_ISSUE_COLUMN_ORDER aligned for fresh
     // and migrated databases.
     ("agent_context", "TEXT"),
+    ("jsonl_extensions", "TEXT"),
 ];
 
 const DEPENDENCY_COLUMNS: &[(&str, &str)] = &[
@@ -1321,6 +1326,7 @@ const ISSUES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
     schema_column("is_template", "INTEGER", true, Some("0"), 0),
     schema_column("source_repo_path", "TEXT", false, None, 0),
     schema_column("agent_context", "TEXT", false, None, 0),
+    schema_column("jsonl_extensions", "TEXT", false, None, 0),
 ];
 
 const DEPENDENCIES_RUNTIME_COLUMNS: &[ExpectedSchemaColumn] = &[
@@ -2753,6 +2759,7 @@ const EXPECTED_ISSUE_COLUMN_ORDER: &[&str] = &[
     "is_template",
     "source_repo_path",
     "agent_context",
+    "jsonl_extensions",
 ];
 
 /// Check whether the issues table has columns in the expected order.
@@ -3839,6 +3846,14 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
         apply_capacity_occupancy_migration_in_transaction(conn)?;
     }
 
+    if !issues_rebuilt
+        && user_version < 18
+        && table_exists(conn, "issues")
+        && !column_exists(conn, "issues", "jsonl_extensions")
+    {
+        conn.execute("ALTER TABLE issues ADD COLUMN jsonl_extensions TEXT")?;
+    }
+
     // Migration: Add missing indexes for bd parity
     // These use IF NOT EXISTS so they're safe to run multiple times
     execute_batch(
@@ -4425,6 +4440,37 @@ mod tests {
     use crate::franken_sync::Connection;
     use std::collections::HashSet;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_v17_jsonl_extension_migration_preserves_existing_issue() {
+        let temp = TempDir::new().unwrap();
+        let db = temp.path().join("v17.db");
+        let conn = Connection::open(db.to_string_lossy().into_owned()).unwrap();
+        let old_schema = SCHEMA_SQL.replace("        jsonl_extensions TEXT,\n", "");
+        execute_batch(&conn, &old_schema).unwrap();
+        conn.execute("PRAGMA user_version = 17").unwrap();
+        conn.execute("INSERT INTO issues (id, title) VALUES ('test-carry', 'preserve me')")
+            .unwrap();
+        assert!(!column_exists(&conn, "issues", "jsonl_extensions"));
+        conn.execute("BEGIN IMMEDIATE").unwrap();
+        run_reviewed_schema_migration_steps_in_transaction(
+            &conn,
+            17,
+            current_schema_version_u32().unwrap(),
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        conn.execute("COMMIT").unwrap();
+        let row = conn
+            .query_row("SELECT title, jsonl_extensions FROM issues WHERE id = 'test-carry'")
+            .unwrap();
+        assert_eq!(
+            row.get(0).and_then(SqliteValue::as_text),
+            Some("preserve me")
+        );
+        assert_eq!(row.get(1), Some(&SqliteValue::Null));
+        assert!(runtime_schema_compatible(&conn));
+    }
 
     fn reviewed_v14_with_gate_history_schema(schema_sql: &str) -> (TempDir, Connection) {
         let temp = TempDir::new().expect("tempdir");

@@ -28,6 +28,7 @@ fn make_valid_issue(title: &str) -> Issue {
     Issue {
         id: "bd-test123".to_string(),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title: title.to_string(),
         description: None,
         design: None,

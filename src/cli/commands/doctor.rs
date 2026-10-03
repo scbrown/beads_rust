@@ -13953,6 +13953,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: title.to_string(),
             description: None,
             design: None,
@@ -21875,6 +21876,7 @@ mod tests {
             let issue = Issue {
                 id: "bd-keep".to_string(),
                 content_hash: None,
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 title: "Keep me".to_string(),
                 description: None,
                 design: None,
@@ -22194,6 +22196,7 @@ mod tests {
         let issue = Issue {
             id: "proj-abc123".to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: "Imported".to_string(),
             description: None,
             design: None,

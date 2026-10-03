@@ -35,6 +35,7 @@ fn create_test_issue(i: usize) -> Issue {
     Issue {
         id: format!("bench-{i:06}"),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title: format!("Benchmark issue {i}"),
         description: Some(format!("Description for benchmark issue {i}")),
         design: None,

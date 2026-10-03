@@ -363,6 +363,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             design: None,
             acceptance_criteria: None,
             notes: None,

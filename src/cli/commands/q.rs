@@ -142,6 +142,7 @@ pub fn execute(args: QuickArgs, cli: &config::CliOverrides, ctx: &OutputContext)
         created_at: now,
         updated_at: now,
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         design: None,
         acceptance_criteria: None,
         notes: None,

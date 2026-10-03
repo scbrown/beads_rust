@@ -16276,6 +16276,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: title.to_string(),
             description: None,
             design: None,
@@ -16946,6 +16947,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: title.to_string(),
             description: None,
             design: None,
@@ -23998,6 +24000,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             content_hash: hash.map(str::to_string),
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: title.to_string(),
             description: None,
             design: None,
@@ -24555,6 +24558,31 @@ mod tests {
             result,
             MergeResult::Conflict(ConflictType::BothModified)
         ));
+    }
+
+    #[test]
+    fn test_manual_merge_reports_extension_only_conflict() {
+        let base = make_issue_with_hash("bd-carry", "Same", fixed_time_merge(100), Some("same"));
+        let mut local = base.clone();
+        let mut peer = base.clone();
+        local
+            .jsonl_extensions
+            .insert("_seeds".into(), serde_json::json!({"revision": 2}));
+        peer.jsonl_extensions
+            .insert("_seeds".into(), serde_json::json!({"revision": 3}));
+        assert!(matches!(
+            merge_issue(
+                Some(&base),
+                Some(&local),
+                Some(&peer),
+                ConflictResolution::Manual
+            ),
+            MergeResult::Conflict(ConflictType::BothModified)
+        ));
+        assert!(
+            matches!(merge_issue(Some(&base), Some(&base), Some(&peer), ConflictResolution::Manual),
+            MergeResult::Keep(issue) if issue.jsonl_extensions == peer.jsonl_extensions)
+        );
     }
 
     #[test]

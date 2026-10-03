@@ -91,6 +91,7 @@ fn make_issue(
     Issue {
         id,
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title,
         description,
         design,

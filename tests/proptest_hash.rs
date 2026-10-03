@@ -29,6 +29,7 @@ fn make_issue(title: &str, description: Option<&str>) -> Issue {
     Issue {
         id: "bd-test".to_string(),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title: title.to_string(),
         description: description.map(ToString::to_string),
         design: None,

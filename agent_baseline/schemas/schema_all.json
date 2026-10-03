@@ -3165,6 +3165,7 @@
         "updated_at",
         "compaction_level"
       ],
+      "additionalProperties": true,
       "$defs": {
         "Status": {
           "description": "Issue lifecycle status.",
@@ -3644,6 +3645,7 @@
         "updated_at",
         "compaction_level"
       ],
+      "additionalProperties": true,
       "$defs": {
         "Status": {
           "description": "Issue lifecycle status.",
@@ -4254,6 +4256,7 @@
         "dependency_count",
         "dependent_count"
       ],
+      "additionalProperties": true,
       "$defs": {
         "Status": {
           "description": "Issue lifecycle status.",

@@ -1017,7 +1017,7 @@ pub fn run_reviewed_schema_migration_steps_in_transaction(
 
     ensure_columns(conn, "issues", &[("jsonl_extensions", "TEXT")])?;
     ensure_columns(conn, "dependencies", &[("jsonl_extensions", "TEXT")])?;
-    ensure_columns(conn, "comments", &[("jsonl_extensions", "TEXT")])?;
+    ensure_comment_extensions(conn)?;
 
     conn.execute(&format!("PRAGMA user_version = {target_version}"))
         .map_err(BeadsError::Database)?;
@@ -1703,6 +1703,73 @@ fn ensure_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> R
         }
     }
 
+    Ok(())
+}
+
+/// Rebuild legacy comments rather than appending a column to an INTEGER PRIMARY
+/// KEY table. The migration/VACUUM/index-rebuild path otherwise produces shifted
+/// comment index keys with the current engine, despite retaining the table rows.
+fn ensure_comment_extensions(conn: &Connection) -> Result<()> {
+    if !table_exists(conn, "comments") || column_exists(conn, "comments", "jsonl_extensions") {
+        return Ok(());
+    }
+    if table_exists(conn, "comments_extension_tmp") {
+        return Err(BeadsError::Config(
+            "comments_extension_tmp already exists".into(),
+        ));
+    }
+    let columns = conn.query("PRAGMA table_info('comments')")?;
+    let names: Vec<_> = columns
+        .iter()
+        .filter_map(|r| r.get(1).and_then(SqliteValue::as_text))
+        .collect();
+    if names != ["id", "issue_id", "author", "text", "created_at"] {
+        return Err(BeadsError::Config(
+            "refusing to rebuild noncanonical legacy comments columns".into(),
+        ));
+    }
+    let indexes = conn.query("SELECT sql FROM main.sqlite_master WHERE type = 'index' AND tbl_name = 'comments' AND sql IS NOT NULL")?;
+    let sequence = conn.query("SELECT seq FROM main.sqlite_sequence WHERE name = 'comments'")?;
+    conn.execute(
+        "CREATE TABLE main.comments_extension_tmp (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        issue_id TEXT NOT NULL,
+        author TEXT NOT NULL,
+        text TEXT NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        jsonl_extensions TEXT,
+        FOREIGN KEY (issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    )",
+    )?;
+    conn.execute(
+        "INSERT INTO main.comments_extension_tmp (id, issue_id, author, text, created_at)
+        SELECT id, issue_id, author, text, created_at FROM main.comments NOT INDEXED",
+    )?;
+    conn.execute("DROP TABLE main.comments")?;
+    conn.execute("ALTER TABLE main.comments_extension_tmp RENAME TO comments")?;
+    for row in indexes {
+        let sql = row
+            .get(0)
+            .and_then(SqliteValue::as_text)
+            .ok_or_else(|| BeadsError::Config("missing comment index DDL".into()))?;
+        conn.execute(sql)?;
+    }
+    if let Some(high_water) = sequence
+        .first()
+        .and_then(|r| r.get(0))
+        .and_then(SqliteValue::as_integer)
+    {
+        conn.execute_with_params(
+            "INSERT INTO main.sqlite_sequence (name, seq)
+             SELECT 'comments', ? WHERE NOT EXISTS
+             (SELECT 1 FROM main.sqlite_sequence WHERE name = 'comments')",
+            &[SqliteValue::from(high_water)],
+        )?;
+        conn.execute_with_params(
+            "UPDATE main.sqlite_sequence SET seq = ? WHERE name = 'comments' AND seq < ?",
+            &[SqliteValue::from(high_water), SqliteValue::from(high_water)],
+        )?;
+    }
     Ok(())
 }
 
@@ -3864,7 +3931,7 @@ fn run_migrations(conn: &Connection, issues_rebuilt: bool) -> Result<()> {
 
     if user_version < 19 {
         ensure_columns(conn, "dependencies", &[("jsonl_extensions", "TEXT")])?;
-        ensure_columns(conn, "comments", &[("jsonl_extensions", "TEXT")])?;
+        ensure_comment_extensions(conn)?;
     }
 
     // Migration: Add missing indexes for bd parity
@@ -4517,6 +4584,12 @@ mod tests {
         assert_eq!(dep.get(0).and_then(SqliteValue::as_text), Some("test-b"));
         assert_eq!(dep.get(1), Some(&SqliteValue::Null));
         assert!(runtime_schema_compatible(&conn));
+        conn.execute("REINDEX").unwrap();
+        let indexed = conn.query_row("SELECT issue_id FROM comments INDEXED BY idx_comments_issue WHERE issue_id = 'test-a'").unwrap();
+        assert_eq!(
+            indexed.get(0).and_then(SqliteValue::as_text),
+            Some("test-a")
+        );
     }
 
     fn reviewed_v14_with_gate_history_schema(schema_sql: &str) -> (TempDir, Connection) {

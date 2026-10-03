@@ -1336,6 +1336,30 @@ fn run_post_migration_maintenance(
             candidate_conn.execute(statement)?;
         }
         candidate_conn.execute("REINDEX")?;
+        // The engine integrity pragma can report ok even when a rebuilt index
+        // contains shifted keys. Compare the actual reader path with a table
+        // scan before this candidate can replace the rollback authority.
+        for (index, key) in [
+            ("idx_comments_issue", "issue_id"),
+            ("idx_comments_created_at", "created_at"),
+        ] {
+            let expected = candidate_conn.query(&format!(
+                "SELECT {key}, id FROM comments NOT INDEXED ORDER BY {key}, id"
+            ))?;
+            let indexed = candidate_conn.query(&format!(
+                "SELECT {key}, id FROM comments INDEXED BY {index} ORDER BY {key}, id"
+            ))?;
+            if expected.len() != indexed.len()
+                || expected
+                    .iter()
+                    .zip(&indexed)
+                    .any(|(left, right)| left.get(0) != right.get(0) || left.get(1) != right.get(1))
+            {
+                return Err(BeadsError::Config(format!(
+                    "migration candidate comment index {index} differs from table rows"
+                )));
+            }
+        }
         candidate_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     })();
@@ -3915,6 +3939,69 @@ mod tests {
 
     fn reviewed_v14_migration_context() -> (TempDir, MigrationContext) {
         reviewed_v14_migration_context_with_database_name("beads.db")
+    }
+
+    #[test]
+    fn reviewed_v18_migration_preserves_comment_index_keys() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir(&beads_dir).unwrap();
+        let db_path = beads_dir.join("beads.db");
+        let conn = Connection::open(db_path.to_string_lossy().into_owned()).unwrap();
+        let old_schema =
+            crate::storage::schema::SCHEMA_SQL.replace("        jsonl_extensions TEXT,\n", "");
+        crate::storage::schema::execute_batch(&conn, &old_schema).unwrap();
+        conn.execute("ALTER TABLE issues ADD COLUMN jsonl_extensions TEXT")
+            .unwrap();
+        conn.execute("PRAGMA user_version = 18").unwrap();
+        conn.execute("INSERT INTO issues (id, title) VALUES ('test-a', 'A')")
+            .unwrap();
+        conn.execute("INSERT INTO comments (id, issue_id, author, text) VALUES (7, 'test-a', 'peer', 'keep')").unwrap();
+        conn.execute("INSERT INTO comments (id, issue_id, author, text) VALUES (42, 'test-a', 'peer', 'deleted')").unwrap();
+        conn.execute("DELETE FROM comments WHERE id = 42").unwrap();
+        close_connection(conn).unwrap();
+        let write_authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                &beads_dir,
+                &db_path,
+                Some(1000),
+            )
+            .unwrap(),
+        );
+        let migration = MigrationContext {
+            beads_dir,
+            db_path,
+            write_authority,
+        };
+        let plan = build_plan(&migration.db_path).unwrap();
+        execute_apply(
+            &DoctorMigrateSchemaApplyArgs {
+                plan_token: plan.plan_token.unwrap(),
+                json: false,
+            },
+            &migration,
+        )
+        .unwrap();
+        let conn = Connection::open(migration.db_path.to_string_lossy().into_owned()).unwrap();
+        let indexed = conn.query_row("SELECT issue_id FROM comments INDEXED BY idx_comments_issue WHERE issue_id = 'test-a'").unwrap();
+        assert_eq!(
+            indexed.get(0).and_then(SqliteValue::as_text),
+            Some("test-a")
+        );
+        let count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM comments INNER JOIN issues ON issues.id = comments.issue_id",
+            )
+            .unwrap();
+        assert_eq!(count.get(0).and_then(SqliteValue::as_integer), Some(1));
+        let high_water = conn
+            .query_row("SELECT seq FROM sqlite_sequence WHERE name = 'comments'")
+            .unwrap();
+        assert_eq!(
+            high_water.get(0).and_then(SqliteValue::as_integer),
+            Some(42)
+        );
+        close_connection(conn).unwrap();
     }
 
     #[test]

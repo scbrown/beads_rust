@@ -1,5 +1,8 @@
 //! `SQLite` storage implementation.
 
+#[path = "effects.rs"]
+mod effects;
+
 use crate::error::{BeadsError, Result};
 use crate::format::{IssueDetails, IssueWithDependencyMetadata, RollupSummary};
 use crate::franken_sync::compat::{OpenFlags, open_with_flags};
@@ -2613,6 +2616,7 @@ impl SqliteStorage {
     /// leave every live family member byte-identical, so copy the durable
     /// database/WAL inputs to a scratch family and let the engine mutate only
     /// scratch coordination sidecars.
+    #[cfg(test)]
     fn open_current_read_only_snapshot_under_authority(
         path: &Path,
         authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
@@ -12061,7 +12065,20 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn id_exists(&self, id: &str) -> Result<bool> {
-        Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some())
+        // Resolution and collision checks need identity, not every issue field.
+        // Keep the returned-identity check: an engine returning a different row
+        // must never authorize a mutation of the requested issue.
+        match self.conn.query_row_with_params(
+            "SELECT id FROM issues WHERE id = ?",
+            &[SqliteValue::from(id)],
+        ) {
+            Ok(row) if row.get(0).and_then(SqliteValue::as_text) == Some(id) => Ok(true),
+            Ok(_) => Err(BeadsError::internal(format!(
+                "storage consistency: id_exists returned a different identity for {id:?}"
+            ))),
+            Err(FrankenError::QueryReturnedNoRows) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Find issue IDs with a title that exactly matches `title`.
@@ -20228,9 +20245,10 @@ impl SqliteStorage {
                     .to_string(),
             });
         }
-        let Some(mut storage) =
-            Self::open_current_read_only_snapshot_under_authority(path, authority)?
-        else {
+        // Stream the held database's committed pages through the native
+        // read-only pager. The observational contract below permits WAL reader
+        // marks, not mutations to durable database-family contents.
+        let Some(mut storage) = Self::open_current_read_only(path)? else {
             let found = effective_database_user_version(path)?;
             return match found {
                 Some(found) => Err(BeadsError::SchemaMismatch {
@@ -20848,6 +20866,86 @@ mod tests {
     use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn id_exists_is_exact_includes_tombstones_and_propagates_query_errors() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        for id in ["probe-a", "probe-a.1"] {
+            storage
+                .create_issue(
+                    &Issue {
+                        id: id.into(),
+                        title: id.into(),
+                        ..Issue::default()
+                    },
+                    "fixture",
+                )
+                .unwrap();
+        }
+        assert!(storage.id_exists("probe-a").unwrap());
+        assert!(storage.id_exists("probe-a.1").unwrap());
+        for missing in ["probe", "a", "probe-a.2", "probe-a' OR 1=1 --"] {
+            assert!(!storage.id_exists(missing).unwrap());
+        }
+        storage
+            .execute_test_sql("UPDATE issues SET status='tombstone' WHERE id='probe-a'")
+            .unwrap();
+        assert!(
+            storage.id_exists("probe-a").unwrap(),
+            "deleted identities stay reserved"
+        );
+        storage.execute_test_sql("DROP TABLE issues").unwrap();
+        assert!(
+            storage.id_exists("probe-a").is_err(),
+            "query failure is not absence"
+        );
+    }
+
+    #[test]
+    fn pending_direct_reader_matches_private_copy() {
+        for value in [None, Some("{}"), Some("not-json")] {
+            let temp = TempDir::new().unwrap();
+            let db = temp.path().join("beads.db");
+            {
+                let storage = SqliteStorage::open(&db).unwrap();
+                if let Some(value) = value {
+                    storage
+                        .conn
+                        .execute_with_params(
+                            "INSERT INTO metadata(key,value) VALUES (?,?)",
+                            &[
+                                SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                                SqliteValue::from(value),
+                            ],
+                        )
+                        .unwrap();
+                }
+            }
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    temp.path(),
+                    &db,
+                    Some(1_000),
+                )
+                .unwrap(),
+            );
+            authority.bind_database_inode_for_mutation().unwrap();
+            let copy =
+                SqliteStorage::open_current_read_only_snapshot_under_authority(&db, &authority)
+                    .unwrap()
+                    .unwrap();
+            let expected = format!("{:?}", copy.inspect_pending_sync_merge().unwrap());
+            drop(copy);
+            let before = database_family_snapshot(&db).unwrap();
+            let actual =
+                SqliteStorage::inspect_pending_sync_merge_under_authority(&db, &authority).unwrap();
+            assert_eq!(format!("{actual:?}"), expected);
+            assert!(
+                database_family_read_only_diffs(&before, &database_family_snapshot(&db).unwrap())
+                    .is_empty()
+            );
+        }
+    }
 
     fn make_issue(
         id: &str,

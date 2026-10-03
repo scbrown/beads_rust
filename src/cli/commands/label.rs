@@ -21,6 +21,15 @@ use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use tracing::{debug, info};
 
+fn phase_timing(stage: &str, started: std::time::Instant) {
+    if std::env::var_os("BR_EFFECT_TIMING").is_some() {
+        eprintln!(
+            "BR_LABEL_TIMING {stage} {:.6}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
 /// Execute the label command.
 ///
 /// # Errors
@@ -35,7 +44,7 @@ pub fn execute(
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
 
     match command {
-        LabelCommands::Add(args) => execute_routed_label_add(args, cli, ctx, &beads_dir),
+        LabelCommands::Add(args) => execute_routed_label_add(args, cli, ctx, &beads_dir, None),
         LabelCommands::Remove(args) => execute_routed_label_remove(args, cli, ctx, &beads_dir),
         LabelCommands::List(args) => execute_label_list_command(args, json, cli, ctx, &beads_dir),
         LabelCommands::ListAll => {
@@ -49,6 +58,36 @@ pub fn execute(
             label_rename(args, &mut storage_ctx, &actor, json, ctx)
         }
     }
+}
+
+/// Execute label-add using its prepared receipt's exact owner witness.
+/// The caller must keep the same database-family write authority held from
+/// receipt preparation through completion; no import may intervene.
+///
+/// # Errors
+/// Refuses changed scope, routing, or flags; retains all native mutation checks.
+pub fn execute_with_receipt(
+    command: &LabelCommands,
+    cli: &config::CliOverrides,
+    ctx: &OutputContext,
+    receipt: &crate::cli::effects::Receipt,
+) -> Result<()> {
+    if cli.db.is_none()
+        || cli.no_db == Some(true)
+        || cli.no_auto_import != Some(true)
+        || cli.no_auto_flush != Some(true)
+    {
+        return Err(BeadsError::Config(
+            "receipt label execution requires unchanged isolated flags".into(),
+        ));
+    }
+    let LabelCommands::Add(args) = command else {
+        return Err(BeadsError::Config(
+            "receipt label execution supports add only".into(),
+        ));
+    };
+    let beads_dir = config::discover_beads_dir_with_cli(cli)?;
+    execute_routed_label_add(args, cli, ctx, &beads_dir, Some(receipt))
 }
 
 /// Execute read-only label subcommands when the caller already has open storage.
@@ -209,17 +248,23 @@ fn execute_routed_label_add(
     cli: &config::CliOverrides,
     ctx: &OutputContext,
     beads_dir: &Path,
+    receipt: Option<&crate::cli::effects::Receipt>,
 ) -> Result<()> {
+    let phase_started = std::time::Instant::now();
     let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
     validate_label(&label)?;
-    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
+    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir, receipt)?;
+    phase_timing("routes_prepared", phase_started);
     let mut routed_results = Vec::new();
 
     for mut prepared_route in prepared_routes {
         let batch_inputs = prepared_route.issue_inputs.clone();
         let batch_results = label_add(&mut prepared_route, &label, ctx)?;
+        phase_timing("mutation_done", phase_started);
         routed_results.push((batch_inputs, batch_results));
     }
+
+    phase_timing("routes_dropped", phase_started);
 
     let results = reorder_routed_items_by_requested_inputs(
         &issue_inputs,
@@ -289,7 +334,7 @@ fn execute_routed_label_remove(
 ) -> Result<()> {
     let (issue_inputs, label) = parse_issues_and_label(&args.issues, args.label.as_ref())?;
     validate_label(&label)?;
-    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir)?;
+    let prepared_routes = prepare_label_routes(&issue_inputs, cli, beads_dir, None)?;
     let mut routed_results = Vec::new();
 
     for mut prepared_route in prepared_routes {
@@ -389,11 +434,18 @@ fn prepare_label_routes(
     issue_inputs: &[String],
     cli: &config::CliOverrides,
     beads_dir: &Path,
+    receipt: Option<&crate::cli::effects::Receipt>,
 ) -> Result<Vec<PreparedLabelRoute>> {
+    let phase_started = std::time::Instant::now();
     let routed_batches = config::routing::group_issue_inputs_by_route(issue_inputs, beads_dir)?;
     let mut prepared_routes = Vec::new();
 
     for batch in routed_batches {
+        if receipt.is_some() && batch.is_external {
+            return Err(BeadsError::Config(
+                "prepared receipt cannot authorize an external route".into(),
+            ));
+        }
         let mut batch_cli = routed_cli_for_batch(cli, batch.is_external);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &batch.beads_dir,
@@ -401,16 +453,23 @@ fn prepare_label_routes(
             batch_cli.lock_timeout,
         )?;
         routed_write_lock.mark_cli_write_lock_held(&mut batch_cli);
+        phase_timing("before_open", phase_started);
         let mut storage_ctx = config::open_storage_with_cli(&batch.beads_dir, &batch_cli)?;
+        phase_timing("after_open", phase_started);
         auto_import_storage_ctx_if_stale(&mut storage_ctx, &batch_cli)?;
         let config_layer = storage_ctx.load_config(&batch_cli)?;
         let id_config = config::id_config_from_layer(&config_layer);
         let resolver = IdResolver::new(ResolverConfig::with_prefix(id_config.prefix));
+        phase_timing("before_resolve", phase_started);
         let resolved_ids = batch
             .issue_inputs
             .iter()
-            .map(|input| resolve_issue_id(&storage_ctx.storage, &resolver, input))
+            .map(|input| match receipt {
+                Some(receipt) => receipt.selected_id(&storage_ctx.paths.db_path, input),
+                None => resolve_issue_id(&storage_ctx.storage, &resolver, input),
+            })
             .collect::<Result<Vec<_>>>()?;
+        phase_timing("after_resolve", phase_started);
 
         prepared_routes.push(PreparedLabelRoute {
             issue_inputs: batch.issue_inputs,

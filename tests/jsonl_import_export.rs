@@ -18,6 +18,72 @@ fn issue_with_id(id: &str, title: &str) -> Issue {
 }
 
 #[test]
+fn selected_export_matches_full_native_records_and_refuses_incomplete_selection() {
+    use beads_rust::sync::{export_selected_records, export_to_writer};
+    use serde_json::json;
+    let temp = TempDir::new().unwrap();
+    let input = temp.path().join("input.jsonl");
+    let mut a = serde_json::to_value(issue_with_id("test-select", "Selected")).unwrap();
+    let b = issue_with_id("test-other", "Unselected");
+    a["future"] = json!({"nested":[null,true]});
+    a["labels"] = json!(["z", "a"]);
+    a["comments"] = json!([{"id":77,"issue_id":"test-select","author":"peer",
+        "text":"exact comment", "created_at":"2026-01-01T00:00:00Z",
+        "_seeds":{"format":"seeds-facts-v1","index":9,"facts":[]}}]);
+    a["dependencies"] = json!([{"issue_id":"test-select","depends_on_id":"test-other",
+        "type":"related","created_at":"2026-01-01T00:00:00Z","created_by":"peer",
+        "metadata":"{\"nested\":true}","future":{"value":null}}]);
+    fs::write(
+        &input,
+        format!("{a}\n{}\n", serde_json::to_string(&b).unwrap()),
+    )
+    .unwrap();
+    let mut storage = SqliteStorage::open_memory().unwrap();
+    import_from_jsonl(
+        &mut storage,
+        &input,
+        &ImportConfig::default(),
+        Some("test-"),
+    )
+    .unwrap();
+    let mut full = Vec::new();
+    export_to_writer(&storage, &mut full).unwrap();
+    let expected: serde_json::Value = String::from_utf8(full)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|v| v["id"] == "test-select")
+        .unwrap();
+    let selected = export_selected_records(&storage, &["test-select".into()]).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(serde_json::to_value(&selected[0]).unwrap(), expected);
+    assert_eq!(expected["future"], a["future"]);
+    assert_eq!(
+        expected["comments"][0]["_seeds"],
+        a["comments"][0]["_seeds"]
+    );
+    assert_eq!(
+        expected["dependencies"][0]["future"],
+        a["dependencies"][0]["future"]
+    );
+    for ids in [
+        vec![],
+        vec!["test-select", "test-select"],
+        vec!["test-select", "absent"],
+        vec![""],
+    ] {
+        assert!(
+            export_selected_records(
+                &storage,
+                &ids.into_iter().map(str::to_string).collect::<Vec<_>>()
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(storage.count_all_issues().unwrap(), 2);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)] // One persisted lifecycle: import, reopen, edit, export, update, remove.
 fn unknown_jsonl_fields_survive_reopen_native_edit_and_real_export() {
     use beads_rust::storage::IssueUpdate;

@@ -14205,11 +14205,31 @@ mod tests {
         // The main file, WAL, and journal must be byte-identical; the
         // WAL-index may only carry the reader mark the WAL read lock
         // registered (GitHub #476).
-        assert_database_family_read_only(
-            &before,
-            &database_family_bytes(&db_path),
-            "read-only authority inspection",
-        );
+        let after = database_family_bytes(&db_path);
+        for (suffix, previous) in &before {
+            let current = &after[suffix];
+            match (previous, current) {
+                (Some(previous), Some(current)) => {
+                    let offsets: Vec<_> = previous
+                        .iter()
+                        .zip(current)
+                        .enumerate()
+                        .filter_map(|(offset, (old, new))| (old != new).then_some(offset))
+                        .collect();
+                    eprintln!(
+                        "authority-byte-diff suffix={suffix:?} before={} after={} offsets={offsets:?}",
+                        previous.len(),
+                        current.len()
+                    );
+                }
+                _ => eprintln!(
+                    "authority-byte-diff suffix={suffix:?} before_present={} after_present={}",
+                    previous.is_some(),
+                    current.is_some()
+                ),
+            }
+        }
+        assert_database_family_read_only(&before, &after, "read-only authority inspection");
     }
 
     #[test]

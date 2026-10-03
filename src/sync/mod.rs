@@ -10444,6 +10444,36 @@ fn read_jsonl_lines_by_id(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(lines_by_id)
 }
 
+/// Read a selected set with the same hydration and normalization as full export.
+///
+/// IDs are exact and unique. Missing, ephemeral and wisp records refuse the
+/// whole selection; callers must not treat a partial result as a full board.
+///
+/// # Errors
+/// Returns an error for invalid selections or any failed relation read.
+pub fn export_selected_records(storage: &SqliteStorage, ids: &[String]) -> Result<Vec<Issue>> {
+    let unique: BTreeSet<_> = ids.iter().collect();
+    if ids.is_empty() || unique.len() != ids.len() || ids.iter().any(String::is_empty) {
+        return Err(BeadsError::Config(
+            "export requires nonempty unique exact IDs".into(),
+        ));
+    }
+    storage.with_read_transaction(|storage| {
+        let mut ctx = ExportContext::new(ExportErrorPolicy::Strict);
+        let issues = hydrate_export_issue_batch(storage, ids, &mut ctx)?;
+        if issues.len() != ids.len()
+            || issues
+                .iter()
+                .any(|issue| issue.ephemeral || issue.id.contains("-wisp-"))
+        {
+            return Err(BeadsError::Config(
+                "export ID missing or excluded from the ledger".into(),
+            ));
+        }
+        Ok(issues)
+    })
+}
+
 fn export_issue_ids(storage: &SqliteStorage) -> Result<Vec<String>> {
     let rows = storage.execute_raw_query(
         r"SELECT id
@@ -12020,7 +12050,7 @@ fn redact_owner_email(issue: &mut Issue) {
     }
 }
 
-fn normalize_issue_for_export(issue: &mut Issue) {
+pub(crate) fn normalize_issue_for_export(issue: &mut Issue) {
     redact_owner_email(issue);
     // aegis-19lsrv: a record stamped before the field became relative carries
     // the creator's absolute home path; it never reaches an exported JSONL.
@@ -14036,10 +14066,38 @@ fn verify_applied_import_issue_semantics(
         let mut persisted_expected = expected.clone();
         canonicalize_persisted_issue_defaults(&mut persisted_expected);
         if !persisted_import_issue_equals(actual, &persisted_expected) {
+            let actual_json = serde_json::to_value(actual)?;
+            let expected_json = serde_json::to_value(&persisted_expected)?;
+            let differing_fields = actual_json
+                .as_object()
+                .into_iter()
+                .flat_map(|v| v.keys())
+                .chain(expected_json.as_object().into_iter().flat_map(|v| v.keys()))
+                .filter(|key| actual_json.get(*key) != expected_json.get(*key))
+                .collect::<BTreeSet<_>>();
+            let dependency_fields = actual_json["dependencies"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .zip(
+                    expected_json["dependencies"]
+                        .as_array()
+                        .into_iter()
+                        .flatten(),
+                )
+                .flat_map(|(left, right)| {
+                    left.as_object()
+                        .into_iter()
+                        .flat_map(|v| v.keys())
+                        .chain(right.as_object().into_iter().flat_map(|v| v.keys()))
+                        .filter(|key| left.get(*key) != right.get(*key))
+                })
+                .collect::<BTreeSet<_>>();
             return Err(BeadsError::SyncConflict {
                 message: format!(
-                    "Import semantic verification failed: issue {} does not match its normalized JSONL payload; rolling back the import",
-                    expected.id
+                    "Import semantic verification failed: issue {} does not match its normalized JSONL payload; fields {differing_fields:?}, dependency_fields={dependency_fields:?}, content_hash_equal={}; rolling back the import",
+                    expected.id,
+                    actual.content_hash == persisted_expected.content_hash
                 ),
             });
         }

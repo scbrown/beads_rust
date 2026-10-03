@@ -30,6 +30,7 @@ fn fixed_issue() -> Issue {
     Issue {
         id: "storage-golden-1".to_string(),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title: "Golden storage lifecycle".to_string(),
         description: Some("Initial description".to_string()),
         design: None,

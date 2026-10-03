@@ -126,6 +126,7 @@ mod tests {
             created_at: base + Duration::seconds(age_offset_secs),
             updated_at: base + Duration::seconds(age_offset_secs + 1),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             description: None,
             design: None,
             acceptance_criteria: None,

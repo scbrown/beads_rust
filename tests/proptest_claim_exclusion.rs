@@ -13,6 +13,7 @@ fn make_open_issue(suffix: &str, title: &str, priority: Priority) -> Issue {
     Issue {
         id: format!("bd-{suffix}"),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         title: title.to_string(),
         description: None,
         design: None,

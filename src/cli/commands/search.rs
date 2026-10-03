@@ -878,6 +878,7 @@ mod tests {
         Issue {
             id: id.to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: title.to_string(),
             description: description.map(str::to_string),
             design: None,

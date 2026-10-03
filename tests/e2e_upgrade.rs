@@ -259,7 +259,10 @@ fn e2e_upgrade_with_version_flag() {
             || upgrade.stderr.contains("0.1.0")
             || upgrade.stderr.contains("NetworkError")
             || upgrade.stdout.contains("error"),
-        "should reference version or show network error"
+        "should reference version or show network error; status={:?}, stdout={:?}, stderr={:?}",
+        upgrade.status,
+        upgrade.stdout,
+        upgrade.stderr
     );
 }
 

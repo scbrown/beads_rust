@@ -24,6 +24,7 @@ pub fn issue(title: &str) -> Issue {
         created_at: base,
         updated_at: base + Duration::seconds(1),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         design: None,
         acceptance_criteria: None,
         notes: None,

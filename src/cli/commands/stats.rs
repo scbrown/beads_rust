@@ -1645,6 +1645,7 @@ mod tests {
             dependencies: vec![],
             comments: vec![],
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }
     }
 

@@ -1422,6 +1422,7 @@ schemas:
         items:
           "$ref": #/$defs/Comment
     required[8]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level
+    additionalProperties: true
     "$defs":
       Status:
         description: Issue lifecycle status.
@@ -1638,6 +1639,7 @@ schemas:
         items:
           "$ref": #/$defs/InheritedBlock
     required[8]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level
+    additionalProperties: true
     "$defs":
       Status:
         description: Issue lifecycle status.
@@ -1917,6 +1919,7 @@ schemas:
         format: uint
         minimum: 0
     required[10]: id,title,status,priority,issue_type,created_at,updated_at,compaction_level,dependency_count,dependent_count
+    additionalProperties: true
     "$defs":
       Status:
         description: Issue lifecycle status.

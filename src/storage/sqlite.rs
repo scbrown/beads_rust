@@ -2581,7 +2581,11 @@ impl SqliteStorage {
                     .create_new(true)
                     .open(&destination)?;
                 std::io::copy(&mut source.file, &mut output)?;
-                output.sync_all()?;
+                // No sync_all(): this is a private SCRATCH family, opened once and
+                // deleted after the read. The reader sees these bytes through the page
+                // cache, so durability buys nothing, and the fsync was most of a write's
+                // cost: ~1.4s for the 302MB aegis store, under the family write lock, on
+                // every mutation (aegis-i7xl1x).
                 source.verify_path(&source_path, description)?;
             }
             Ok::<(), BeadsError>(())
@@ -2650,7 +2654,11 @@ impl SqliteStorage {
                     .create_new(true)
                     .open(&destination)?;
                 std::io::copy(&mut source.file, &mut output)?;
-                output.sync_all()?;
+                // No sync_all(): this is a private SCRATCH family, opened once and
+                // deleted after the read. The reader sees these bytes through the page
+                // cache, so durability buys nothing, and the fsync was most of a write's
+                // cost: ~1.4s for the 302MB aegis store, under the family write lock, on
+                // every mutation (aegis-i7xl1x).
                 source.verify_path(&source_path, description)?;
                 authority.verify_database_authority()?;
             }

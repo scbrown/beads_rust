@@ -429,6 +429,7 @@ mod tests {
         Issue {
             id: "bd-test".to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: "Test title".to_string(),
             description: None,
             design: None,

@@ -2,6 +2,23 @@
 
 > How `br sync` keeps your repository safe.
 
+## Opaque JSONL fields
+
+Import preserves unmodeled top-level JSONL fields, including nested objects,
+arrays and explicit nulls, in the issue's `jsonl_extensions` database column
+(schema 18). Full issue reads and actual exports restore those fields at their
+original top-level keys. Native edits leave them intact; a newer imported full
+record replaces the extension map, including removals. Extensions participate in
+sync equality and manual three-way conflict detection, but do not change the
+legacy deduplication hash. The additive `--reconcile` interface still refuses
+unknown source fields under its stricter reviewed schema contract.
+
+This is semantic JSON preservation, not byte preservation. Existing policies
+for modeled fields still apply: timestamp/default normalization, owner-email
+redaction and portable repository paths. A cutover adapter must account for or
+refuse those transformations before claiming a lossless rollback. Extension
+preservation alone does not authorize a tracker cutover or prove complete sync.
+
 ---
 
 ## Overview

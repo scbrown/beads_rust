@@ -65,6 +65,7 @@ fn create_issue_all_fields_populated() {
         comments: vec![],
         // Other optional fields
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         closed_at: None,
         close_reason: None,
         closed_by_session: None,
@@ -523,6 +524,7 @@ fn update_issue_clear_optional_fields() {
         created_at: Utc::now(),
         updated_at: Utc::now(),
         content_hash: None,
+        jsonl_extensions: std::collections::BTreeMap::new(),
         design: None,
         acceptance_criteria: None,
         notes: None,
@@ -867,6 +869,7 @@ fn upsert_issue_stores_all_fields() {
         dependencies: vec![],
         comments: vec![],
         content_hash: Some("abc123".to_string()),
+        jsonl_extensions: std::collections::BTreeMap::new(),
         closed_at: None,
         close_reason: None,
         closed_by_session: None,

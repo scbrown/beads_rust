@@ -643,6 +643,11 @@ pub struct Issue {
     pub dependencies: Vec<Dependency>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub comments: Vec<Comment>,
+
+    /// Unmodeled top-level JSONL fields, preserved through database storage and
+    /// export. These participate in sync equality but not legacy content hashes.
+    #[serde(flatten, default)]
+    pub jsonl_extensions: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Issue {
@@ -692,6 +697,7 @@ impl Default for Issue {
             labels: Vec::new(),
             dependencies: Vec::new(),
             comments: Vec::new(),
+            jsonl_extensions: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -756,6 +762,7 @@ impl Issue {
             // peer's context update during three-way merge / import de-dup
             // (persisted_import_issue_equals had to re-add it as a workaround).
             || self.agent_context != other.agent_context
+            || self.jsonl_extensions != other.jsonl_extensions
         {
             return false;
         }
@@ -1022,6 +1029,7 @@ mod tests {
     #[test]
     fn test_issue_serialization() {
         let issue = Issue {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: "bd-123".to_string(),
             content_hash: Some("abc".to_string()),
             title: "Test Issue".to_string(),
@@ -1494,6 +1502,7 @@ mod tests {
 
     fn create_test_issue() -> Issue {
         Issue {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: "bd-test".to_string(),
             content_hash: None,
             title: "Test Title".to_string(),

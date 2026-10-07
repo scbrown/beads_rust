@@ -200,6 +200,7 @@ mod tests {
         Issue {
             id: "bd-test123".to_string(),
             content_hash: None,
+            jsonl_extensions: std::collections::BTreeMap::new(),
             title: "Test Issue".to_string(),
             description: Some("A test description".to_string()),
             design: None,

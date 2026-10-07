@@ -168,7 +168,7 @@ fn prepare_current_duplicate_config_rows(fixture: &FixtureWorkspace) {
     // The checked-in database is intentionally historical (schema 4), but
     // the recovery surface under test is duplicate config rows, not an
     // unsupported schema jump. Rebuild from the fixture's public JSONL, then
-    // inject exactly that higher-level invariant violation into schema 17.
+    // inject exactly that higher-level invariant violation into the current schema.
     preserve_legacy_database_family(fixture, &current_database_path(fixture));
     import_current_database(fixture, "duplicate_config_rows_current_schema_import");
 

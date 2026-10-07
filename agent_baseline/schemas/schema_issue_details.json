@@ -328,6 +328,7 @@
         "updated_at",
         "compaction_level"
       ],
+      "additionalProperties": true,
       "$defs": {
         "Status": {
           "description": "Issue lifecycle status.",

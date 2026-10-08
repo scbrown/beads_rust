@@ -12203,7 +12203,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn id_exists(&self, id: &str) -> Result<bool> {
-        Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some())
+        if self.conn.in_transaction() {
+            return Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some());
+        }
+        // Autocommit preparation refreshes FrankenSQLite's whole MemDB image.
+        // A native read transaction keeps this point lookup proportional to
+        // the selected issue while retaining full row validation and errors.
+        self.with_read_transaction(|storage| {
+            Ok(Self::get_issue_from_conn(&storage.conn, id)?.is_some())
+        })
     }
 
     /// Find issue IDs with a title that exactly matches `title`.
@@ -33517,6 +33525,77 @@ mod tests {
         }
 
         assert!(max_rootpage >= 0, "diagnostic test completed");
+    }
+
+    #[test]
+    fn id_exists_is_exact_keeps_tombstones_and_propagates_query_errors() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-existing",
+            "Existence control",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+        assert!(storage.id_exists("bd-existing").unwrap());
+        for missing in ["bd-missing", "existing", "bd-existing' OR 1=1 --"] {
+            assert!(!storage.id_exists(missing).unwrap(), "{missing}");
+        }
+        storage
+            .conn
+            .execute("UPDATE issues SET status='tombstone' WHERE id='bd-existing'")
+            .unwrap();
+        assert_eq!(
+            storage.get_issue("bd-existing").unwrap().unwrap().status,
+            Status::Tombstone
+        );
+        assert!(storage.id_exists("bd-existing").unwrap());
+        storage.conn.close_in_place().unwrap();
+        assert!(storage.id_exists("bd-existing").is_err());
+    }
+
+    #[test]
+    fn id_exists_refuses_damaged_schema() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("DROP TABLE issues").unwrap();
+        storage
+            .conn
+            .execute("CREATE TABLE issues(id TEXT)")
+            .unwrap();
+        storage
+            .conn
+            .execute("INSERT INTO issues(id) VALUES('bd-duplicate'),('bd-duplicate')")
+            .unwrap();
+        assert!(storage.id_exists("bd-duplicate").is_err());
+    }
+
+    #[test]
+    fn id_exists_preserves_caller_transaction_and_rollback() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-owned",
+            "Owned transaction",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+        assert!(storage.id_exists("bd-owned").unwrap());
+        assert!(!storage.conn.in_transaction());
+        storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+        storage
+            .conn
+            .execute("UPDATE issues SET notes='uncommitted' WHERE id='bd-owned'")
+            .unwrap();
+        assert!(storage.id_exists("bd-owned").unwrap());
+        assert!(storage.conn.in_transaction());
+        storage.conn.execute("ROLLBACK").unwrap();
+        assert_eq!(storage.get_issue("bd-owned").unwrap().unwrap().notes, None);
     }
 
     #[test]

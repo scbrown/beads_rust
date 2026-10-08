@@ -243,7 +243,7 @@ fn main() {
         no_db_jsonl_write,
         pending_merge_mutation_gate_required,
     );
-    let mut write_lock = if startup_database_authority_required && ctx.is_initialized() {
+    let write_lock = if startup_database_authority_required && ctx.is_initialized() {
         let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
         match ctx
             .beads_dir
@@ -463,6 +463,9 @@ fn main() {
     } else {
         write_lock
     };
+
+    #[cfg(not(feature = "mcp"))]
+    let mut write_lock = write_lock;
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {

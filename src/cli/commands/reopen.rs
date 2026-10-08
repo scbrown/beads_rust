@@ -82,7 +82,8 @@ pub fn execute(
         target_inputs.push(last_touched);
     }
 
-    let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&target_inputs, &beads_dir, cli)?;
     let mut reopened_issues = Vec::new();
     let mut skipped_issues = Vec::new();
     let mut capacity_warnings = Vec::new();

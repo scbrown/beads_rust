@@ -215,7 +215,7 @@ fn open_routed_storage_for_issue_input(
     cli: &config::CliOverrides,
     issue_input: &str,
 ) -> Result<(config::OpenStorageResult, String, RoutedWorkspaceWriteLock)> {
-    let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    let route = config::routing::resolve_route_with_cli(issue_input, local_beads_dir, cli)?;
     let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
 
     let routed_write_lock = acquire_routed_workspace_write_lock(

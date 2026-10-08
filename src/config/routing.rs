@@ -359,6 +359,52 @@ pub fn resolve_route(issue_id: &str, local_beads_dir: &Path) -> Result<RoutingRe
     Ok(RoutingResult::local(local_beads_dir.to_path_buf()))
 }
 
+/// Resolve a CLI input without letting ID routing override a selected database.
+///
+/// An explicit database confines the operation to that database, even if the ID
+/// has a route in the local workspace or an ancestor town. Do not read route
+/// files in this case: a missing target or malformed route must not affect an
+/// operation on a copied database.
+///
+/// # Errors
+///
+/// Returns route discovery errors when no database override was supplied.
+pub fn resolve_route_with_cli(
+    issue_id: &str,
+    local_beads_dir: &Path,
+    cli: &super::CliOverrides,
+) -> Result<RoutingResult> {
+    if cli.db.is_some() {
+        return Ok(RoutingResult::local(local_beads_dir.to_path_buf()));
+    }
+    resolve_route(issue_id, local_beads_dir)
+}
+
+/// Group CLI inputs while preserving explicit database confinement.
+///
+/// # Errors
+///
+/// Returns route discovery errors when no database override was supplied.
+pub fn group_issue_inputs_by_route_with_cli(
+    issue_inputs: &[String],
+    local_beads_dir: &Path,
+    cli: &super::CliOverrides,
+) -> Result<Vec<RoutedIssueBatch>> {
+    if cli.db.is_some() {
+        return Ok(if issue_inputs.is_empty() {
+            Vec::new()
+        } else {
+            vec![RoutedIssueBatch {
+                beads_dir: local_beads_dir.to_path_buf(),
+                is_external: false,
+                project_path: None,
+                issue_inputs: issue_inputs.to_vec(),
+            }]
+        });
+    }
+    group_issue_inputs_by_route(issue_inputs, local_beads_dir)
+}
+
 /// Group issue inputs by their resolved route, preserving first-seen batch order.
 ///
 /// # Errors
@@ -728,6 +774,39 @@ mod tests {
         let result = resolve_route("nohyphen", &beads_dir).unwrap();
         assert_eq!(result.beads_dir, beads_dir);
         assert!(!result.is_external);
+    }
+
+    #[test]
+    fn explicit_database_skips_invalid_routes_and_preserves_input_order() {
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join(".beads");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(local.join("routes.jsonl"), "invalid JSON\n").unwrap();
+        let cli = super::super::CliOverrides {
+            db: Some(local.join("copy.db")),
+            ..Default::default()
+        };
+        let inputs = vec![
+            "ext-two".to_string(),
+            "local-one".to_string(),
+            "ext-two".to_string(),
+        ];
+        assert!(
+            resolve_route("ext-two", &local).is_err(),
+            "positive control: invalid routes fail"
+        );
+        let route = resolve_route_with_cli("ext-two", &local, &cli).unwrap();
+        assert_eq!(route, RoutingResult::local(local.clone()));
+        let batches = group_issue_inputs_by_route_with_cli(&inputs, &local, &cli).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].issue_inputs, inputs);
+        assert_eq!(batches[0].beads_dir, local);
+        assert!(!batches[0].is_external);
+        assert!(
+            group_issue_inputs_by_route_with_cli(&[], &local, &cli)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

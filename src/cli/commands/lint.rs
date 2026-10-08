@@ -335,7 +335,8 @@ fn resolve_issues(
     args: &LintArgs,
     cli: &config::CliOverrides,
 ) -> Result<Vec<Issue>> {
-    let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&args.ids, beads_dir, cli)?;
     let mut issues_by_input = std::collections::HashMap::new();
 
     for batch in routed_batches {

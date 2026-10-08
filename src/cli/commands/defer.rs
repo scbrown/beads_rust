@@ -106,7 +106,8 @@ pub fn execute_defer(
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, &beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&args.ids, &beads_dir, cli)?;
     let mut deferred_issues = Vec::new();
     let mut skipped_issues = Vec::new();
     let mut capacity_warnings = Vec::new();
@@ -409,7 +410,8 @@ pub fn execute_undefer(
     }
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let routed_batches = config::routing::group_issue_inputs_by_route(&args.ids, &beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&args.ids, &beads_dir, cli)?;
     let mut undeferred_issues = Vec::new();
     let mut skipped_issues = Vec::new();
     let mut capacity_warnings = Vec::new();

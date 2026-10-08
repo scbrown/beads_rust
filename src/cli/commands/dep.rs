@@ -86,7 +86,7 @@ fn execute_dep_add(
     ctx: &OutputContext,
     local_beads_dir: &Path,
 ) -> Result<()> {
-    validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on)?;
+    validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on, cli)?;
     let (mut storage_ctx, route_cli, auto_flush_external, _routed_write_lock) =
         open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
@@ -111,7 +111,7 @@ fn execute_dep_remove(
     ctx: &OutputContext,
     local_beads_dir: &Path,
 ) -> Result<()> {
-    validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on)?;
+    validate_dependency_target_route(local_beads_dir, &args.issue, &args.depends_on, cli)?;
     let (mut storage_ctx, route_cli, auto_flush_external, _routed_write_lock) =
         open_routed_storage_for_input(local_beads_dir, cli, &args.issue)?;
     let config_layer = storage_ctx.load_config(&route_cli)?;
@@ -182,7 +182,7 @@ fn execute_local_dep_list_with_storage_ctx(
     local_beads_dir: &Path,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<bool> {
-    if config::routing::resolve_route(&args.issue, local_beads_dir)?.is_external {
+    if config::routing::resolve_route_with_cli(&args.issue, local_beads_dir, cli)?.is_external {
         return Ok(false);
     }
 
@@ -246,7 +246,7 @@ fn execute_local_dep_tree_with_storage_ctx(
     local_beads_dir: &Path,
     storage_ctx: &config::OpenStorageResult,
 ) -> Result<bool> {
-    if config::routing::resolve_route(&args.issue, local_beads_dir)?.is_external {
+    if config::routing::resolve_route_with_cli(&args.issue, local_beads_dir, cli)?.is_external {
         return Ok(false);
     }
 
@@ -281,7 +281,7 @@ fn open_routed_storage_for_input(
     bool,
     RoutedWorkspaceWriteLock,
 )> {
-    let route = config::routing::resolve_route(issue_input, local_beads_dir)?;
+    let route = config::routing::resolve_route_with_cli(issue_input, local_beads_dir, cli)?;
     let mut route_cli = cli_for_routed_workspace(cli, route.is_external);
     let routed_write_lock = acquire_routed_workspace_write_lock(
         &route.beads_dir,
@@ -298,13 +298,15 @@ fn validate_dependency_target_route(
     local_beads_dir: &Path,
     issue_input: &str,
     depends_on_input: &str,
+    cli: &config::CliOverrides,
 ) -> Result<()> {
     if depends_on_input.starts_with("external:") {
         return Ok(());
     }
 
-    let issue_route = config::routing::resolve_route(issue_input, local_beads_dir)?;
-    let depends_on_route = config::routing::resolve_route(depends_on_input, local_beads_dir)?;
+    let issue_route = config::routing::resolve_route_with_cli(issue_input, local_beads_dir, cli)?;
+    let depends_on_route =
+        config::routing::resolve_route_with_cli(depends_on_input, local_beads_dir, cli)?;
 
     if issue_route.beads_dir == depends_on_route.beads_dir {
         return Ok(());

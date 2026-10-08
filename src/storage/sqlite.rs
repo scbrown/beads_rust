@@ -2704,7 +2704,12 @@ impl SqliteStorage {
         let Some(header_version) = checked_database_header_user_version(path)? else {
             return Ok(None);
         };
-        let wal = sqlite_wal_schema_preflight(path)?;
+        let Ok(wal) = sqlite_wal_schema_preflight(path) else {
+            // A linked alias is only an optimization. When its durable-input
+            // proof is unavailable, preserve the isolated reader's existing
+            // inspection/recovery behavior instead of adding a new refusal.
+            return Ok(None);
+        };
         let current = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         if wal.committed_user_version.unwrap_or(header_version) != current {
             return Ok(None);
@@ -31738,6 +31743,66 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_snapshot_declines_unclassifiable_wal_without_bypassing_receipts() {
+        for malformed_receipt in [false, true] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("source.db");
+            {
+                let storage = SqliteStorage::open(&path).unwrap();
+                if malformed_receipt {
+                    storage
+                        .conn
+                        .execute_with_params(
+                            "INSERT INTO metadata(key,value) VALUES(?,?)",
+                            &[
+                                SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                                SqliteValue::from("not a receipt"),
+                            ],
+                        )
+                        .unwrap();
+                }
+                storage
+                    .conn
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+            fs::write(
+                database_sidecar_path(&path, "-wal"),
+                b"synthetic orphan wal",
+            )
+            .unwrap();
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    root.path(),
+                    &path,
+                    Some(1_000),
+                )
+                .unwrap(),
+            );
+            authority.bind_database_inode_for_mutation().unwrap();
+            let before = directory_bytes_and_modes(root.path());
+            assert!(
+                SqliteStorage::try_linked_read_snapshot(&path, &authority)
+                    .unwrap()
+                    .is_none(),
+                "unclassifiable WAL must retain the isolated inspection path"
+            );
+            let inspected =
+                SqliteStorage::inspect_pending_sync_merge_under_authority(&path, &authority)
+                    .unwrap();
+            assert_eq!(inspected.permits_automatic_mutation(), !malformed_receipt);
+            if malformed_receipt {
+                assert!(matches!(
+                    inspected,
+                    PendingSyncMergeInspection::Malformed { .. }
+                ));
+            }
+            assert_eq!(before, directory_bytes_and_modes(root.path()));
+        }
     }
 
     #[test]

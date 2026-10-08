@@ -1412,6 +1412,9 @@ pub struct SqliteStorage {
     /// cleanup the files accumulate in `TMPDIR` (#299). `None` for persistent
     /// databases, which must never be deleted on drop.
     temp_db_path: Option<PathBuf>,
+    /// Exclusively-owned directory for a same-filesystem read alias. Dropped
+    /// only after the connection closes and its linked files are unlinked.
+    temp_db_dir: Option<tempfile::TempDir>,
     /// Tier 1 attribution to stamp onto the audit events of the NEXT mutation
     /// (issue #312, Layer 3 capture-only). Set via
     /// [`SqliteStorage::set_pending_event_attribution`] immediately before a
@@ -2468,6 +2471,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            temp_db_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -2532,6 +2536,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            temp_db_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -2608,20 +2613,27 @@ impl SqliteStorage {
         }
     }
 
-    /// Open a private byte snapshot of a database family for an observational
-    /// read while the caller holds the live family's write authority.
+    /// Open private reader coordination while holding the family's write authority.
     ///
-    /// FrankenSQLite's WAL reader updates the live `-shm` coordination file
-    /// even for `SQLITE_OPEN_READ_ONLY`.  Authority-gated mutation checks must
-    /// leave every live family member byte-identical, so copy the durable
-    /// database/WAL inputs to a scratch family and let the engine mutate only
-    /// scratch coordination sidecars.
+    /// FrankenSQLite updates `-shm` even for `SQLITE_OPEN_READ_ONLY`. Link stable
+    /// durable inputs into an exclusively owned same-filesystem directory and
+    /// keep reader sidecars there. The authority prevents concurrent writes;
+    /// exact-schema and rollback-journal preflights restrict this optimization
+    /// to observational opens. Unsupported cases retain the byte-copy path.
     fn open_current_read_only_snapshot_under_authority(
         path: &Path,
         authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
     ) -> Result<Option<Self>> {
         static SNAPSHOT_COUNTER: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
+        // With write authority the durable inputs cannot move during the read.
+        // A same-filesystem hardlink alias gives the reader the same bytes while
+        // keeping all path-derived coordination sidecars in an owned directory.
+        // Lock-free reconciliation above still needs a real byte copy.
+        #[cfg(unix)]
+        if let Some(storage) = Self::try_linked_read_snapshot(path, authority)? {
+            return Ok(Some(storage));
+        }
 
         let count = SNAPSHOT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snapshot_path = std::env::temp_dir().join(format!(
@@ -2681,6 +2693,129 @@ impl SqliteStorage {
                 Err(error)
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn try_linked_read_snapshot(
+        path: &Path,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<Option<Self>> {
+        authority.verify_database_authority()?;
+        let Some(header_version) = checked_database_header_user_version(path)? else {
+            return Ok(None);
+        };
+        let Ok(wal) = sqlite_wal_schema_preflight(path) else {
+            // A linked alias is only an optimization. When its durable-input
+            // proof is unavailable, preserve the isolated reader's existing
+            // inspection/recovery behavior instead of adding a new refusal.
+            return Ok(None);
+        };
+        let current = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
+        if wal.committed_user_version.unwrap_or(header_version) != current {
+            return Ok(None);
+        }
+        // Recovery is not a read: leave rollback-journal handling on the fully
+        // isolated copy path rather than sharing its durable inputs.
+        if StableSchemaSource::open_optional(
+            &database_sidecar_path(path, "-journal"),
+            "rollback journal",
+        )?
+        .is_some_and(|source| source.initial_len > 0)
+        {
+            return Ok(None);
+        }
+        let Some(parent) = path.parent() else {
+            return Ok(None);
+        };
+        Self::reap_linked_read_snapshots(parent, authority)?;
+        let prefix = format!(
+            ".br_read_snapshot_{}_{}_",
+            authority.authority_path_sha256(),
+            std::process::id()
+        );
+        let Ok(directory) = tempfile::Builder::new().prefix(&prefix).tempdir_in(parent) else {
+            return Ok(None);
+        };
+        let alias = directory.path().join("snapshot.db");
+        for suffix in ["", "-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
+            let source_path = database_sidecar_path(path, suffix);
+            let Some(source) = StableSchemaSource::open_optional(&source_path, "database input")?
+            else {
+                continue;
+            };
+            let destination = database_sidecar_path(&alias, suffix);
+            if std::fs::hard_link(&source_path, &destination).is_err() {
+                // Unsupported filesystem/permissions: retain the existing copy
+                // path. The exclusively-created directory owns all partial links.
+                return Ok(None);
+            }
+            source.verify_path(&destination, "linked database input")?;
+            source.verify_path(&source_path, "database input")?;
+            authority.verify_database_authority()?;
+        }
+        let Some(mut storage) = Self::open_current_read_only(&alias)? else {
+            return Ok(None);
+        };
+        authority.verify_database_authority()?;
+        storage.temp_db_path = Some(alias);
+        storage.temp_db_dir = Some(directory);
+        Ok(Some(storage))
+    }
+
+    #[cfg(unix)]
+    fn reap_linked_read_snapshots(
+        parent: &Path,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<()> {
+        // The authority digest scopes names to this database family. A reader
+        // of this family holds the same authority for its entire alias lifetime;
+        // other families and legacy names are never selected. Process existence
+        // is an additional conservative guard: reused and unknown PIDs stay.
+        authority.verify_database_authority()?;
+        let prefix = format!(".br_read_snapshot_{}_", authority.authority_path_sha256());
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((pid_text, suffix)) = rest.split_once('_') else {
+                continue;
+            };
+            let Ok(raw_pid) = pid_text.parse::<i32>() else {
+                continue;
+            };
+            if raw_pid <= 0
+                || raw_pid.to_string() != pid_text
+                || suffix.len() != 6
+                || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+                continue;
+            };
+            if rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH) {
+                // Success, EPERM and every uncertain error preserve the directory.
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            authority.verify_database_authority()?;
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(%error, "Could not remove a dead reader's owned aliases");
+            }
+        }
+        authority.verify_database_authority()
     }
 
     pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
@@ -2750,6 +2885,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            temp_db_dir: None,
             pending_event_attribution: None,
             opener_lease,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -2821,6 +2957,7 @@ impl SqliteStorage {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: Some(path.to_path_buf()),
+            temp_db_dir: None,
             pending_event_attribution: None,
             opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),
@@ -12066,7 +12203,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn id_exists(&self, id: &str) -> Result<bool> {
-        Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some())
+        if self.conn.in_transaction() {
+            return Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some());
+        }
+        // Autocommit preparation refreshes FrankenSQLite's whole MemDB image.
+        // A native read transaction keeps this point lookup proportional to
+        // the selected issue while retaining full row validation and errors.
+        self.with_read_transaction(|storage| {
+            Ok(Self::get_issue_from_conn(&storage.conn, id)?.is_some())
+        })
     }
 
     /// Find issue IDs with a title that exactly matches `title`.
@@ -20799,6 +20944,7 @@ impl Drop for SqliteStorage {
         if let Some(path) = self.temp_db_path.take() {
             remove_temp_db_files(&path);
         }
+        drop(self.temp_db_dir.take());
     }
 }
 
@@ -31550,6 +31696,297 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn linked_snapshot_reaper_preserves_live_unknown_and_foreign_paths() {
+        let root = TempDir::new().unwrap();
+        let db = root.path().join("source.db");
+        drop(SqliteStorage::open(&db).unwrap());
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                root.path(),
+                &db,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        authority.bind_database_inode_for_mutation().unwrap();
+        let pid_max: i32 = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let dead = pid_max.checked_add(1).unwrap();
+        let prefix = format!(".br_read_snapshot_{}_", authority.authority_path_sha256());
+        let dead_dir = root.path().join(format!("{prefix}{dead}_stale1"));
+        fs::create_dir(&dead_dir).unwrap();
+        fs::hard_link(&db, dead_dir.join("snapshot.db")).unwrap();
+        let live_dir = root
+            .path()
+            .join(format!("{prefix}{}_alive1", std::process::id()));
+        let unknown_dir = root.path().join(format!("{prefix}4294967295_unknow"));
+        let init_dir = root.path().join(format!("{prefix}1_alive2"));
+        let foreign_dir = root
+            .path()
+            .join(format!(".br_read_snapshot_other_family_{dead}_stale1"));
+        for path in [&live_dir, &unknown_dir, &init_dir, &foreign_dir] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("keep"), b"keep").unwrap();
+        }
+        let symlink = root.path().join(format!("{prefix}{dead}_symlin"));
+        std::os::unix::fs::symlink(&foreign_dir, &symlink).unwrap();
+        let before = fs::read(&db).unwrap();
+        SqliteStorage::reap_linked_read_snapshots(root.path(), &authority).unwrap();
+        assert!(!dead_dir.exists(), "dead reader aliases must be reclaimed");
+        assert_eq!(
+            fs::read(&db).unwrap(),
+            before,
+            "source inode must survive alias cleanup"
+        );
+        for path in [&live_dir, &unknown_dir, &init_dir, &foreign_dir] {
+            assert_eq!(fs::read(path.join("keep")).unwrap(), b"keep");
+        }
+        assert!(
+            fs::symlink_metadata(symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_snapshot_declines_unclassifiable_wal_without_bypassing_receipts() {
+        for malformed_receipt in [false, true] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("source.db");
+            {
+                let storage = SqliteStorage::open(&path).unwrap();
+                if malformed_receipt {
+                    storage
+                        .conn
+                        .execute_with_params(
+                            "INSERT INTO metadata(key,value) VALUES(?,?)",
+                            &[
+                                SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                                SqliteValue::from("not a receipt"),
+                            ],
+                        )
+                        .unwrap();
+                }
+                storage
+                    .conn
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+            fs::write(
+                database_sidecar_path(&path, "-wal"),
+                b"synthetic orphan wal",
+            )
+            .unwrap();
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    root.path(),
+                    &path,
+                    Some(1_000),
+                )
+                .unwrap(),
+            );
+            authority.bind_database_inode_for_mutation().unwrap();
+            let before = directory_bytes_and_modes(root.path());
+            assert!(
+                SqliteStorage::try_linked_read_snapshot(&path, &authority)
+                    .unwrap()
+                    .is_none(),
+                "unclassifiable WAL must retain the isolated inspection path"
+            );
+            let inspected =
+                SqliteStorage::inspect_pending_sync_merge_under_authority(&path, &authority)
+                    .unwrap();
+            assert_eq!(inspected.permits_automatic_mutation(), !malformed_receipt);
+            if malformed_receipt {
+                assert!(matches!(
+                    inspected,
+                    PendingSyncMergeInspection::Malformed { .. }
+                ));
+            }
+            assert_eq!(before, directory_bytes_and_modes(root.path()));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn linked_snapshot_reads_cold_wal_and_cleans_only_aliases() {
+        for checkpoint in [false, true] {
+            let root = TempDir::new().unwrap();
+            let source_dir = root.path().join("source");
+            let cold_dir = root.path().join("cold");
+            fs::create_dir(&source_dir).unwrap();
+            fs::create_dir(&cold_dir).unwrap();
+            let source_path = source_dir.join("source.db");
+            let path = cold_dir.join("source.db");
+            let original = SqliteStorage::open(&source_path).unwrap();
+            original
+                .conn
+                .execute("PRAGMA wal_autocheckpoint=0")
+                .unwrap();
+            original
+                .conn
+                .execute("INSERT INTO metadata(key,value) VALUES('cold_probe','committed')")
+                .unwrap();
+            if checkpoint {
+                original
+                    .conn
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+            for entry in fs::read_dir(&source_dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file()
+                    && entry.file_name().to_string_lossy().starts_with("source.db")
+                {
+                    fs::copy(entry.path(), cold_dir.join(entry.file_name())).unwrap();
+                }
+            }
+            drop(original);
+            if !checkpoint {
+                assert!(
+                    fs::metadata(database_sidecar_path(&path, "-wal"))
+                        .unwrap()
+                        .len()
+                        > 0,
+                    "cold WAL positive control"
+                );
+            }
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    &cold_dir,
+                    &path,
+                    Some(1_000),
+                )
+                .unwrap(),
+            );
+            authority.bind_database_inode_for_mutation().unwrap();
+            let snapshot = || {
+                fs::read_dir(&cold_dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|entry| {
+                        entry.is_file()
+                            && entry
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with("source.db")
+                    })
+                    .map(|entry| {
+                        (
+                            entry.file_name().unwrap().to_os_string(),
+                            (
+                                fs::read(&entry).unwrap(),
+                                fs::metadata(&entry).unwrap().modified().unwrap(),
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let before = snapshot();
+            let storage = SqliteStorage::try_linked_read_snapshot(&path, &authority)
+                .unwrap()
+                .expect("current cold family must use linked read path");
+            let alias_dir = storage.temp_db_dir.as_ref().unwrap().path().to_path_buf();
+            assert_eq!(
+                storage.get_metadata("cold_probe").unwrap().as_deref(),
+                Some("committed")
+            );
+            assert!(
+                alias_dir.join("snapshot.db-shm").exists(),
+                "private coordination control"
+            );
+            drop(storage);
+            assert_eq!(
+                before,
+                snapshot(),
+                "cold source family bytes or mtimes changed"
+            );
+            assert!(
+                !alias_dir.exists(),
+                "owned aliases must be removed on close"
+            );
+            assert!(path.exists(), "cleanup must preserve the source inode");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hardlink_read_snapshot_feasibility_with_writable_control() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("source.db");
+        let original = SqliteStorage::open(&path).unwrap();
+        original
+            .conn
+            .execute("PRAGMA wal_autocheckpoint=0")
+            .unwrap();
+        original
+            .conn
+            .execute("INSERT INTO metadata(key,value) VALUES('hardlink_probe','initial')")
+            .unwrap();
+        let snapshot = || {
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|entry| entry.is_file())
+                .map(|entry| {
+                    let metadata = std::fs::metadata(&entry).unwrap();
+                    (
+                        entry.file_name().unwrap().to_os_string(),
+                        (std::fs::read(&entry).unwrap(), metadata.modified().unwrap()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        let alias_dir = root.path().join("alias");
+        std::fs::create_dir(&alias_dir).unwrap();
+        let alias = alias_dir.join("source.db");
+        for suffix in ["", "-wal", "-journal", "-wal-cert", "-wal-cert-head"] {
+            let source = database_sidecar_path(&path, suffix);
+            if source.is_file() {
+                std::fs::hard_link(source, database_sidecar_path(&alias, suffix)).unwrap();
+            }
+        }
+        let read_only = SqliteStorage::open_current_read_only(&alias)
+            .unwrap()
+            .expect("linked current schema must open read-only");
+        assert_eq!(
+            read_only.get_metadata("hardlink_probe").unwrap().as_deref(),
+            Some("initial")
+        );
+        drop(read_only);
+        assert_eq!(
+            before,
+            snapshot(),
+            "read-only alias changed source bytes or mtimes"
+        );
+        assert!(
+            alias_dir.join("source.db-shm").exists(),
+            "reader coordination must stay beside the alias"
+        );
+
+        let writable = SqliteStorage::open(&alias).unwrap();
+        writable
+            .conn
+            .execute("UPDATE metadata SET value='writable-control' WHERE key='hardlink_probe'")
+            .unwrap();
+        drop(writable);
+        assert_ne!(
+            before,
+            snapshot(),
+            "negative control failed to detect a writable hardlink open"
+        );
+        drop(original);
+    }
+
+    #[test]
     fn open_current_read_only_is_observational_without_wal() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("readonly_observational.db");
@@ -33088,6 +33525,77 @@ mod tests {
         }
 
         assert!(max_rootpage >= 0, "diagnostic test completed");
+    }
+
+    #[test]
+    fn id_exists_is_exact_keeps_tombstones_and_propagates_query_errors() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-existing",
+            "Existence control",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+        assert!(storage.id_exists("bd-existing").unwrap());
+        for missing in ["bd-missing", "existing", "bd-existing' OR 1=1 --"] {
+            assert!(!storage.id_exists(missing).unwrap(), "{missing}");
+        }
+        storage
+            .conn
+            .execute("UPDATE issues SET status='tombstone' WHERE id='bd-existing'")
+            .unwrap();
+        assert_eq!(
+            storage.get_issue("bd-existing").unwrap().unwrap().status,
+            Status::Tombstone
+        );
+        assert!(storage.id_exists("bd-existing").unwrap());
+        storage.conn.close_in_place().unwrap();
+        assert!(storage.id_exists("bd-existing").is_err());
+    }
+
+    #[test]
+    fn id_exists_refuses_damaged_schema() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("DROP TABLE issues").unwrap();
+        storage
+            .conn
+            .execute("CREATE TABLE issues(id TEXT)")
+            .unwrap();
+        storage
+            .conn
+            .execute("INSERT INTO issues(id) VALUES('bd-duplicate'),('bd-duplicate')")
+            .unwrap();
+        assert!(storage.id_exists("bd-duplicate").is_err());
+    }
+
+    #[test]
+    fn id_exists_preserves_caller_transaction_and_rollback() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-owned",
+            "Owned transaction",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+        assert!(storage.id_exists("bd-owned").unwrap());
+        assert!(!storage.conn.in_transaction());
+        storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+        storage
+            .conn
+            .execute("UPDATE issues SET notes='uncommitted' WHERE id='bd-owned'")
+            .unwrap();
+        assert!(storage.id_exists("bd-owned").unwrap());
+        assert!(storage.conn.in_transaction());
+        storage.conn.execute("ROLLBACK").unwrap();
+        assert_eq!(storage.get_issue("bd-owned").unwrap().unwrap().notes, None);
     }
 
     #[test]
@@ -35127,6 +35635,7 @@ mod tests {
             write_authority: None,
             mutation_count: 0,
             temp_db_path: None,
+            temp_db_dir: None,
             pending_event_attribution: None,
             opener_lease: None,
             workflow_capacity_policy: crate::close_policy::CapacityPolicy::default(),

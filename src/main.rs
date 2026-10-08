@@ -39,6 +39,11 @@ fn main() {
     let output_ctx = OutputContext::from_args(&cli);
     let is_mutating = is_mutating_command(&cli.command);
     let command_supports_auto_import = should_auto_import(&cli.command);
+    #[cfg(feature = "mcp")]
+    let checkpoint_scope = (!matches!(cli.command, Commands::Serve(_)))
+        .then(beads_rust::storage::sqlite::DeferredCheckpointScope::start);
+    #[cfg(not(feature = "mcp"))]
+    let checkpoint_scope = Some(beads_rust::storage::sqlite::DeferredCheckpointScope::start());
 
     // Initialize logging
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
@@ -1132,6 +1137,9 @@ fn main() {
     // corrupts the exit code of a command that worked. Storage is dropped
     // first so `SqliteStorage::Drop` checkpoints the WAL (#270).
     drop(storage_result);
+    if let Some(scope) = checkpoint_scope {
+        scope.finish();
+    }
     drop(write_lock);
     beads_rust::shutdown::exit_process(0);
 }

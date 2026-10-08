@@ -479,6 +479,18 @@ executable. The maintained evidence consists of:
 
 ---
 
+## CLI exit checkpoint maintenance
+
+A mutated connection that finds another opener closes without the engine's
+implicit passive checkpoint. Its committed WAL remains durable; transaction
+rollback and runtime teardown still run. One-shot CLI commands retain the exact
+database-family writer capability until their own storage handles have closed.
+When the WAL exceeds 2 MiB, they attempt a checkpoint under the existing sole
+opener admission rule. A remaining foreign reader or changed database identity
+refuses maintenance. The threshold triggers an attempt, not a hard size limit
+while foreign readers remain. Library callers and the long-lived MCP server do
+not retain these deferred writer capabilities.
+
 ## Further Reading
 
 For technical details, see:

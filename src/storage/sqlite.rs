@@ -26,10 +26,12 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use fsqlite_error::FrankenError;
 use fsqlite_types::SqliteValue;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1441,6 +1443,67 @@ pub struct SqliteStorage {
     /// command layer immediately after success, so warnings cannot leak into
     /// an unrelated command.
     last_capacity_warnings: Vec<crate::close_policy::WorkflowCapacityWarning>,
+}
+
+type CheckpointAuthority = Arc<crate::sync::DatabaseFamilyWriteLock>;
+type DeferredCheckpointRequests = RefCell<Vec<CheckpointAuthority>>;
+
+thread_local! {
+    static CLI_DEFERRED_CHECKPOINTS: RefCell<Option<Weak<DeferredCheckpointRequests>>> =
+        const { RefCell::new(None) };
+}
+
+/// One-shot CLI checkpoint collection, retaining each mutated family's authority.
+///
+/// Library users and long-lived servers do not install this scope, so storage
+/// teardown cannot retain their writer locks after a request has returned.
+#[must_use]
+pub struct DeferredCheckpointScope {
+    requests: Rc<DeferredCheckpointRequests>,
+    previous: Option<Weak<DeferredCheckpointRequests>>,
+    active: bool,
+}
+
+impl DeferredCheckpointScope {
+    /// Collect peer-denied checkpoints until the CLI releases its storage handles.
+    pub fn start() -> Self {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let previous =
+            CLI_DEFERRED_CHECKPOINTS.with(|slot| slot.replace(Some(Rc::downgrade(&requests))));
+        Self {
+            requests,
+            previous,
+            active: true,
+        }
+    }
+
+    /// Attempt bounded WAL maintenance after readers close, before authority drops.
+    pub fn finish(mut self) {
+        self.restore_previous();
+        let requests = std::mem::take(&mut *self.requests.borrow_mut());
+        for authority in requests {
+            if let Err(error) =
+                SqliteStorage::finish_deferred_checkpoint(&authority, 2 * 1024 * 1024)
+            {
+                tracing::debug!(error = %error, "Deferred WAL checkpoint skipped");
+            }
+        }
+    }
+
+    fn restore_previous(&mut self) {
+        if self.active {
+            CLI_DEFERRED_CHECKPOINTS.with(|slot| {
+                slot.replace(self.previous.take());
+            });
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for DeferredCheckpointScope {
+    fn drop(&mut self) {
+        self.restore_previous();
+    }
 }
 
 /// Outcome of [`SqliteStorage::admit_checkpoint`].
@@ -3965,6 +4028,51 @@ impl SqliteStorage {
         } else if let Err(e) = self.verify_attached_database_authority() {
             tracing::warn!(error = %e, "Database authority changed during WAL checkpoint");
         }
+    }
+
+    fn defer_checkpoint_to_cli(&self) {
+        let Some(authority) = self.write_authority.as_ref() else {
+            return;
+        };
+        CLI_DEFERRED_CHECKPOINTS.with(|slot| {
+            let Some(requests) = slot.borrow().as_ref().and_then(Weak::upgrade) else {
+                return;
+            };
+            let mut requests = requests.borrow_mut();
+            if !requests.iter().any(|previous| {
+                previous.canonical_database_path() == authority.canonical_database_path()
+            }) {
+                requests.push(Arc::clone(authority));
+            }
+        });
+    }
+
+    fn finish_deferred_checkpoint(
+        authority: &CheckpointAuthority,
+        min_wal_bytes: u64,
+    ) -> Result<()> {
+        authority.verify_database_authority()?;
+        let path = authority.canonical_database_path();
+        let wal = database_sidecar_path(path, "-wal");
+        let metadata = match std::fs::symlink_metadata(&wal) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(BeadsError::Config(
+                "Deferred WAL checkpoint requires a regular WAL file".into(),
+            ));
+        }
+        if metadata.len() <= min_wal_bytes {
+            return Ok(());
+        }
+        let mut storage = Self::open_with_timeout_under_write_authority(path, Some(0), authority)?;
+        let result = storage.checkpoint_full();
+        // Admission may still find a foreign reader. Never let engine close
+        // bypass that refusal, including on a failed maintenance attempt.
+        storage.conn.close_without_checkpoint_best_effort_in_place();
+        result
     }
 
     /// Prove this process is the only opener of the persistent database
@@ -20919,6 +21027,7 @@ impl Drop for SqliteStorage {
         // opener; the exclusive opener hold is kept until the connection is
         // closed so no peer starts reading a WAL this teardown is resetting.
         let mut exit_hold = None;
+        let mut checkpoint_on_close = true;
         if self.mutation_count > 0 {
             match self.admit_checkpoint() {
                 CheckpointAdmission::Sole(hold) => {
@@ -20928,6 +21037,8 @@ impl Drop for SqliteStorage {
                     }
                 }
                 CheckpointAdmission::PeersPresent => {
+                    checkpoint_on_close = false;
+                    self.defer_checkpoint_to_cli();
                     tracing::debug!(
                         "Skipping exit WAL checkpoint: another process has the database open"
                     );
@@ -20935,7 +21046,14 @@ impl Drop for SqliteStorage {
             }
         }
         // Explicitly close the connection to avoid fsqlite drop_close warnings.
-        let _ = self.conn.close_in_place();
+        // The engine normally performs a passive checkpoint during close.
+        // Respect the same peer admission decision for that implicit path;
+        // committed WAL frames remain durable and are recovered on the next open.
+        let _ = if checkpoint_on_close {
+            self.conn.close_in_place()
+        } else {
+            self.conn.close_without_checkpoint_in_place()
+        };
         drop(exit_hold);
         // Ephemeral temp databases (open_memory) are unlinked here, after the
         // connection is closed, so the file and its WAL/SHM/journal sidecars are
@@ -36502,6 +36620,199 @@ mod tests {
             !readiness.blocked_cache_stale,
             "an older duplicate stale marker must not force the ready path to bypass the cache"
         );
+    }
+
+    fn checkpoint_scope_fixture(path: &Path) -> CheckpointAuthority {
+        let mut setup = SqliteStorage::open(path).unwrap();
+        let issue = make_issue(
+            "bd-scope",
+            "Scope control",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        setup.create_issue(&issue, "test").unwrap();
+        drop(setup);
+        Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                path.parent().unwrap(),
+                path,
+                Some(100),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn deferred_checkpoint_scope_retains_authority_and_drains_after_readers_close() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("scope.db");
+        let authority = checkpoint_scope_fixture(&path);
+        let scope = DeferredCheckpointScope::start();
+        let peer = SqliteStorage::open(&path).unwrap();
+        let mut writer =
+            SqliteStorage::open_with_timeout_under_write_authority(&path, Some(0), &authority)
+                .unwrap();
+        writer
+            .add_comment("bd-scope", "test", "Committed before deferred drain")
+            .unwrap();
+        drop(writer);
+        drop(authority);
+        assert!(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                temp.path(),
+                &path,
+                Some(0)
+            )
+            .is_err(),
+            "queued maintenance must retain the workspace and exact-family locks"
+        );
+        drop(peer);
+        let authority = Arc::clone(&scope.requests.borrow()[0]);
+        SqliteStorage::finish_deferred_checkpoint(&authority, 0).unwrap();
+        assert!(
+            fs::metadata(database_sidecar_path(&path, "-wal"))
+                .unwrap()
+                .len()
+                <= 32
+        );
+        drop(authority);
+        drop(scope);
+        let _released = crate::sync::blocking_database_family_write_lock_with_timeout(
+            temp.path(),
+            &path,
+            Some(0),
+        )
+        .unwrap();
+        let reader = SqliteStorage::open(&path).unwrap();
+        assert_eq!(
+            reader.get_comments("bd-scope").unwrap()[0].body,
+            "Committed before deferred drain"
+        );
+    }
+
+    #[test]
+    fn deferred_checkpoint_scope_refuses_a_remaining_peer_without_mutating_source() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("scope-peer.db");
+        let authority = checkpoint_scope_fixture(&path);
+        let scope = DeferredCheckpointScope::start();
+        let peer = SqliteStorage::open(&path).unwrap();
+        let mut writer =
+            SqliteStorage::open_with_timeout_under_write_authority(&path, Some(0), &authority)
+                .unwrap();
+        writer
+            .add_comment("bd-scope", "test", "Peer control")
+            .unwrap();
+        drop(writer);
+        let before = fs::read(&path).unwrap();
+        let error = SqliteStorage::finish_deferred_checkpoint(&authority, 0).unwrap_err();
+        assert!(error.to_string().contains("another br process"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(
+            fs::metadata(database_sidecar_path(&path, "-wal"))
+                .unwrap()
+                .len()
+                > 32
+        );
+        drop(peer);
+        drop(scope);
+        let reader = SqliteStorage::open(&path).unwrap();
+        assert_eq!(reader.get_comments("bd-scope").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn peer_close_without_cli_scope_does_not_retain_writer_authority() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("unscoped.db");
+        let authority = checkpoint_scope_fixture(&path);
+        let peer = SqliteStorage::open(&path).unwrap();
+        let mut writer =
+            SqliteStorage::open_with_timeout_under_write_authority(&path, Some(0), &authority)
+                .unwrap();
+        writer
+            .add_comment("bd-scope", "test", "Unscoped library control")
+            .unwrap();
+        drop(writer);
+        drop(authority);
+        let _released = crate::sync::blocking_database_family_write_lock_with_timeout(
+            temp.path(),
+            &path,
+            Some(0),
+        )
+        .unwrap();
+        drop(peer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_checkpoint_scope_refuses_a_replaced_database() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("replaced.db");
+        let authority = checkpoint_scope_fixture(&path);
+        let retained = temp.path().join("retained.db");
+        fs::rename(&path, &retained).unwrap();
+        fs::copy(&retained, &path).unwrap();
+        let before = directory_bytes_and_modes(temp.path());
+        assert!(SqliteStorage::finish_deferred_checkpoint(&authority, 0).is_err());
+        assert_eq!(directory_bytes_and_modes(temp.path()), before);
+    }
+
+    #[test]
+    fn drop_with_peer_preserves_committed_wal_and_rolls_back_open_transaction() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("peer-close.db");
+        let mut setup = SqliteStorage::open(&path).unwrap();
+        let issue = make_issue(
+            "bd-peer-close",
+            "Committed title",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        setup.create_issue(&issue, "test").unwrap();
+        drop(setup);
+
+        let peer = SqliteStorage::open(&path).unwrap();
+        let mut writer = SqliteStorage::open(&path).unwrap();
+        let comment = writer
+            .add_comment("bd-peer-close", "peer-author", "Committed comment")
+            .unwrap();
+        let before_close = fs::read(&path).unwrap();
+        let wal_path = database_sidecar_path(&path, "-wal");
+        assert!(fs::metadata(&wal_path).unwrap().len() > 32);
+        writer.conn.execute("BEGIN IMMEDIATE").unwrap();
+        writer
+            .conn
+            .execute("UPDATE issues SET title='Uncommitted title' WHERE id='bd-peer-close'")
+            .unwrap();
+        drop(writer);
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before_close,
+            "a peer-denied close must not fold WAL frames into the database"
+        );
+        assert!(fs::metadata(&wal_path).unwrap().len() > 32);
+        let reopened = SqliteStorage::open(&path).unwrap();
+        let comments = reopened.get_comments("bd-peer-close").unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, comment.id);
+        assert_eq!(comments[0].author, "peer-author");
+        assert_eq!(comments[0].body, "Committed comment");
+        assert_eq!(
+            reopened.get_issue("bd-peer-close").unwrap().unwrap().title,
+            "Committed title",
+            "close must roll back the active transaction while preserving the earlier commit"
+        );
+        drop(reopened);
+        drop(peer);
+        let reopened = SqliteStorage::open(&path).unwrap();
+        assert_eq!(reopened.get_comments("bd-peer-close").unwrap().len(), 1);
     }
 
     /// Regression: the Drop checkpoint heuristic from #270 fires only

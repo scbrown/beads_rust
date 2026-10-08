@@ -40,10 +40,11 @@ fn main() {
     let is_mutating = is_mutating_command(&cli.command);
     let command_supports_auto_import = should_auto_import(&cli.command);
     #[cfg(feature = "mcp")]
-    let checkpoint_scope = (!matches!(cli.command, Commands::Serve(_)))
+    let checkpoint_scope = (is_mutating && !matches!(cli.command, Commands::Serve(_)))
         .then(beads_rust::storage::sqlite::DeferredCheckpointScope::start);
     #[cfg(not(feature = "mcp"))]
-    let checkpoint_scope = Some(beads_rust::storage::sqlite::DeferredCheckpointScope::start());
+    let checkpoint_scope =
+        is_mutating.then(beads_rust::storage::sqlite::DeferredCheckpointScope::start);
 
     // Initialize logging
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {

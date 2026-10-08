@@ -2707,7 +2707,12 @@ impl SqliteStorage {
         let Some(header_version) = checked_database_header_user_version(path)? else {
             return Ok(None);
         };
-        let wal = sqlite_wal_schema_preflight(path)?;
+        let Ok(wal) = sqlite_wal_schema_preflight(path) else {
+            // A linked alias is only an optimization. When its durable-input
+            // proof is unavailable, preserve the isolated reader's existing
+            // inspection/recovery behavior instead of adding a new refusal.
+            return Ok(None);
+        };
         let current = u32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(0);
         if wal.committed_user_version.unwrap_or(header_version) != current {
             return Ok(None);
@@ -12200,7 +12205,15 @@ impl SqliteStorage {
     ///
     /// Returns an error if the database query fails.
     pub fn id_exists(&self, id: &str) -> Result<bool> {
-        Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some())
+        if self.conn.in_transaction() {
+            return Ok(Self::get_issue_from_conn(&self.conn, id)?.is_some());
+        }
+        // Autocommit preparation refreshes FrankenSQLite's whole MemDB image.
+        // A native read transaction keeps this point lookup proportional to
+        // the selected issue while retaining full row validation and errors.
+        self.with_read_transaction(|storage| {
+            Ok(Self::get_issue_from_conn(&storage.conn, id)?.is_some())
+        })
     }
 
     /// Find issue IDs with a title that exactly matches `title`.
@@ -31717,6 +31730,66 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn linked_snapshot_declines_unclassifiable_wal_without_bypassing_receipts() {
+        for malformed_receipt in [false, true] {
+            let root = TempDir::new().unwrap();
+            let path = root.path().join("source.db");
+            {
+                let storage = SqliteStorage::open(&path).unwrap();
+                if malformed_receipt {
+                    storage
+                        .conn
+                        .execute_with_params(
+                            "INSERT INTO metadata(key,value) VALUES(?,?)",
+                            &[
+                                SqliteValue::from(METADATA_SYNC_MERGE_PENDING),
+                                SqliteValue::from("not a receipt"),
+                            ],
+                        )
+                        .unwrap();
+                }
+                storage
+                    .conn
+                    .execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .unwrap();
+            }
+            fs::write(
+                database_sidecar_path(&path, "-wal"),
+                b"synthetic orphan wal",
+            )
+            .unwrap();
+            let authority = Arc::new(
+                crate::sync::blocking_database_family_write_lock_with_timeout(
+                    root.path(),
+                    &path,
+                    Some(1_000),
+                )
+                .unwrap(),
+            );
+            authority.bind_database_inode_for_mutation().unwrap();
+            let before = directory_bytes_and_modes(root.path());
+            assert!(
+                SqliteStorage::try_linked_read_snapshot(&path, &authority)
+                    .unwrap()
+                    .is_none(),
+                "unclassifiable WAL must retain the isolated inspection path"
+            );
+            let inspected =
+                SqliteStorage::inspect_pending_sync_merge_under_authority(&path, &authority)
+                    .unwrap();
+            assert_eq!(inspected.permits_automatic_mutation(), !malformed_receipt);
+            if malformed_receipt {
+                assert!(matches!(
+                    inspected,
+                    PendingSyncMergeInspection::Malformed { .. }
+                ));
+            }
+            assert_eq!(before, directory_bytes_and_modes(root.path()));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn linked_snapshot_reads_cold_wal_and_cleans_only_aliases() {
         for checkpoint in [false, true] {
             let root = TempDir::new().unwrap();
@@ -33427,6 +33500,77 @@ mod tests {
         }
 
         assert!(max_rootpage >= 0, "diagnostic test completed");
+    }
+
+    #[test]
+    fn id_exists_is_exact_keeps_tombstones_and_propagates_query_errors() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-existing",
+            "Existence control",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+        assert!(storage.id_exists("bd-existing").unwrap());
+        for missing in ["bd-missing", "existing", "bd-existing' OR 1=1 --"] {
+            assert!(!storage.id_exists(missing).unwrap(), "{missing}");
+        }
+        storage
+            .conn
+            .execute("UPDATE issues SET status='tombstone' WHERE id='bd-existing'")
+            .unwrap();
+        assert_eq!(
+            storage.get_issue("bd-existing").unwrap().unwrap().status,
+            Status::Tombstone
+        );
+        assert!(storage.id_exists("bd-existing").unwrap());
+        storage.conn.close_in_place().unwrap();
+        assert!(storage.id_exists("bd-existing").is_err());
+    }
+
+    #[test]
+    fn id_exists_refuses_damaged_schema() {
+        let storage = SqliteStorage::open_memory().unwrap();
+        storage.conn.execute("DROP TABLE issues").unwrap();
+        storage
+            .conn
+            .execute("CREATE TABLE issues(id TEXT)")
+            .unwrap();
+        storage
+            .conn
+            .execute("INSERT INTO issues(id) VALUES('bd-duplicate'),('bd-duplicate')")
+            .unwrap();
+        assert!(storage.id_exists("bd-duplicate").is_err());
+    }
+
+    #[test]
+    fn id_exists_preserves_caller_transaction_and_rollback() {
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        let issue = make_issue(
+            "bd-owned",
+            "Owned transaction",
+            Status::Open,
+            2,
+            None,
+            Utc::now(),
+            None,
+        );
+        storage.create_issue(&issue, "test").unwrap();
+        assert!(storage.id_exists("bd-owned").unwrap());
+        assert!(!storage.conn.in_transaction());
+        storage.conn.execute("BEGIN IMMEDIATE").unwrap();
+        storage
+            .conn
+            .execute("UPDATE issues SET notes='uncommitted' WHERE id='bd-owned'")
+            .unwrap();
+        assert!(storage.id_exists("bd-owned").unwrap());
+        assert!(storage.conn.in_transaction());
+        storage.conn.execute("ROLLBACK").unwrap();
+        assert_eq!(storage.get_issue("bd-owned").unwrap().unwrap().notes, None);
     }
 
     #[test]

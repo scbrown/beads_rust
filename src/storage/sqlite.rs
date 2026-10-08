@@ -2725,7 +2725,12 @@ impl SqliteStorage {
         let Some(parent) = path.parent() else {
             return Ok(None);
         };
-        let prefix = format!(".br_read_snapshot_{}_", std::process::id());
+        Self::reap_linked_read_snapshots(parent, authority)?;
+        let prefix = format!(
+            ".br_read_snapshot_{}_{}_",
+            authority.authority_path_sha256(),
+            std::process::id()
+        );
         let Ok(directory) = tempfile::Builder::new().prefix(&prefix).tempdir_in(parent) else {
             return Ok(None);
         };
@@ -2753,6 +2758,62 @@ impl SqliteStorage {
         storage.temp_db_path = Some(alias);
         storage.temp_db_dir = Some(directory);
         Ok(Some(storage))
+    }
+
+    #[cfg(unix)]
+    fn reap_linked_read_snapshots(
+        parent: &Path,
+        authority: &Arc<crate::sync::DatabaseFamilyWriteLock>,
+    ) -> Result<()> {
+        // The authority digest scopes names to this database family. A reader
+        // of this family holds the same authority for its entire alias lifetime;
+        // other families and legacy names are never selected. Process existence
+        // is an additional conservative guard: reused and unknown PIDs stay.
+        authority.verify_database_authority()?;
+        let prefix = format!(".br_read_snapshot_{}_", authority.authority_path_sha256());
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some((pid_text, suffix)) = rest.split_once('_') else {
+                continue;
+            };
+            let Ok(raw_pid) = pid_text.parse::<i32>() else {
+                continue;
+            };
+            if raw_pid <= 0
+                || raw_pid.to_string() != pid_text
+                || suffix.len() != 6
+                || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            let Some(pid) = rustix::process::Pid::from_raw(raw_pid) else {
+                continue;
+            };
+            if rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH) {
+                // Success, EPERM and every uncertain error preserve the directory.
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            authority.verify_database_authority()?;
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(%error, "Could not remove a dead reader's owned aliases");
+            }
+        }
+        authority.verify_database_authority()
     }
 
     pub(crate) fn fast_open_runtime_schema_is_compatible(&self) -> bool {
@@ -31594,6 +31655,64 @@ mod tests {
         drop(storage);
         let after = database_family_snapshot(db_path).unwrap();
         database_family_read_only_diffs(&before, &after)
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linked_snapshot_reaper_preserves_live_unknown_and_foreign_paths() {
+        let root = TempDir::new().unwrap();
+        let db = root.path().join("source.db");
+        drop(SqliteStorage::open(&db).unwrap());
+        let authority = Arc::new(
+            crate::sync::blocking_database_family_write_lock_with_timeout(
+                root.path(),
+                &db,
+                Some(1_000),
+            )
+            .unwrap(),
+        );
+        authority.bind_database_inode_for_mutation().unwrap();
+        let pid_max: i32 = fs::read_to_string("/proc/sys/kernel/pid_max")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let dead = pid_max.checked_add(1).unwrap();
+        let prefix = format!(".br_read_snapshot_{}_", authority.authority_path_sha256());
+        let dead_dir = root.path().join(format!("{prefix}{dead}_stale1"));
+        fs::create_dir(&dead_dir).unwrap();
+        fs::hard_link(&db, dead_dir.join("snapshot.db")).unwrap();
+        let live_dir = root
+            .path()
+            .join(format!("{prefix}{}_alive1", std::process::id()));
+        let unknown_dir = root.path().join(format!("{prefix}4294967295_unknow"));
+        let init_dir = root.path().join(format!("{prefix}1_alive2"));
+        let foreign_dir = root
+            .path()
+            .join(format!(".br_read_snapshot_other_family_{dead}_stale1"));
+        for path in [&live_dir, &unknown_dir, &init_dir, &foreign_dir] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("keep"), b"keep").unwrap();
+        }
+        let symlink = root.path().join(format!("{prefix}{dead}_symlin"));
+        std::os::unix::fs::symlink(&foreign_dir, &symlink).unwrap();
+        let before = fs::read(&db).unwrap();
+        SqliteStorage::reap_linked_read_snapshots(root.path(), &authority).unwrap();
+        assert!(!dead_dir.exists(), "dead reader aliases must be reclaimed");
+        assert_eq!(
+            fs::read(&db).unwrap(),
+            before,
+            "source inode must survive alias cleanup"
+        );
+        for path in [&live_dir, &unknown_dir, &init_dir, &foreign_dir] {
+            assert_eq!(fs::read(path.join("keep")).unwrap(), b"keep");
+        }
+        assert!(
+            fs::symlink_metadata(symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]

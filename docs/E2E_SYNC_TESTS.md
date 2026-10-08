@@ -465,6 +465,20 @@ Exit codes:
 - `2` — prerequisite missing (br binary, tmpdir)
 - `3` — tracing tool unavailable (strace/inotifywait/dtrace; harness falls back to polling)
 
+## Fresh-store automatic export
+
+`tests/e2e_fresh_store_flush.rs` creates metadata and an empty JSONL file without
+opening a database first. Its first create must publish that record immediately;
+the second create must preserve both rows. A separately held JSONL-family lock
+must still block creation and preserve the empty source. Unit tests also exercise
+full and incremental exports using one retained capability, and reject a
+capability belonging to another JSONL target.
+
+```bash
+cargo test --test e2e_fresh_store_flush
+cargo test --lib auto_flush
+```
+
 ## Related Documentation
 
 - [SYNC_SAFETY.md](SYNC_SAFETY.md) - Sync safety model and design

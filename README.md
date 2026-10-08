@@ -587,7 +587,7 @@ git commit -m "Fix: login timeout (br-a1b2c3)"
 | `--quiet` / `-q` | Suppress output |
 | `--verbose` / `-v` | Increase verbosity (-vv for debug) |
 | `--no-color` | Disable colored output |
-| `--db <path>` | Override database path |
+| `--db <path>` | Select a database and disable ID-prefix routing for this command |
 
 ---
 

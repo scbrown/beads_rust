@@ -362,7 +362,7 @@ fn execute_label_list_command(
     beads_dir: &Path,
 ) -> Result<()> {
     if let Some(input) = &args.issue {
-        let route = config::routing::resolve_route(input, beads_dir)?;
+        let route = config::routing::resolve_route_with_cli(input, beads_dir, cli)?;
         let mut route_cli = routed_cli_for_batch(cli, route.is_external);
         let routed_write_lock = acquire_routed_workspace_write_lock(
             &route.beads_dir,
@@ -390,7 +390,8 @@ fn prepare_label_routes(
     cli: &config::CliOverrides,
     beads_dir: &Path,
 ) -> Result<Vec<PreparedLabelRoute>> {
-    let routed_batches = config::routing::group_issue_inputs_by_route(issue_inputs, beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(issue_inputs, beads_dir, cli)?;
     let mut prepared_routes = Vec::new();
 
     for batch in routed_batches {

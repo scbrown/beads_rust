@@ -754,6 +754,212 @@ fn e2e_routing_update_external_issue_via_main_workspace() {
     assert_eq!(jsonl_issue["status"].as_str(), Some("in_progress"));
 }
 
+fn database_family_bytes(
+    beads_dir: &std::path::Path,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fs::read_dir(beads_dir)
+        .expect("read database directory")
+        .map(|entry| entry.expect("database entry").path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .starts_with("beads.db")
+        })
+        .map(|path| {
+            (
+                path.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned(),
+                fs::read(path).expect("read database family member"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_routing_explicit_db_confines_all_routed_commands() {
+    let _log = common::test_log("e2e_routing_explicit_db_confines_all_routed_commands");
+    for ancestor_route in [false, true] {
+        let town = BrWorkspace::new();
+        let external = BrWorkspace::new();
+        init_workspace(&external, "init_explicit_external");
+        fs::write(
+            external.root.join(".beads/config.yaml"),
+            "issue_prefix: ext\n",
+        )
+        .expect("external prefix");
+        let id = create_issue_and_get_id(&external, "Original target", "create_explicit_target");
+        let dependency =
+            create_issue_and_get_id(&external, "Dependency", "create_explicit_dependency");
+        let mut scratch = BrWorkspace::new();
+        scratch.root = town.root.join("scratch");
+        let scratch_beads = scratch.root.join(".beads");
+        fs::create_dir_all(&scratch_beads).expect("scratch directory");
+        for entry in fs::read_dir(external.root.join(".beads")).expect("source directory") {
+            let entry = entry.expect("source entry");
+            if entry.path().is_file() {
+                fs::copy(entry.path(), scratch_beads.join(entry.file_name()))
+                    .expect("copy fixture");
+            }
+        }
+        let route_workspace = if ancestor_route {
+            fs::create_dir_all(town.root.join("mayor")).expect("town marker directory");
+            fs::write(town.root.join("mayor/town.json"), "{}\n").expect("town marker");
+            fs::create_dir_all(town.root.join(".beads")).expect("town beads directory");
+            &town
+        } else {
+            &scratch
+        };
+        create_routes_file(
+            route_workspace,
+            &[("ext-", external.root.to_string_lossy().as_ref())],
+        );
+        let before = database_family_bytes(&external.root.join(".beads"));
+        assert!(
+            !before.is_empty(),
+            "positive control: target database exists"
+        );
+        let database = scratch_beads
+            .join("beads.db")
+            .to_string_lossy()
+            .into_owned();
+        let commands = [
+            vec!["show", &id],
+            vec!["update", &id, "--title", "Scratch-only title"],
+            vec!["comments", "add", &id, "Scratch-only comment"],
+            vec!["comments", "list", &id],
+            vec!["label", "add", &id, "scratch-only"],
+            vec!["label", "list", &id],
+            vec!["dep", "add", &id, &dependency],
+            vec!["dep", "list", &id],
+            vec!["dep", "tree", &id],
+            vec!["dep", "remove", &id, &dependency],
+            vec!["graph", &id],
+            vec!["audit", "log", &id],
+            vec!["lint", &id],
+            vec!["defer", &id, "--until", "+1h"],
+            vec!["undefer", &id],
+            vec!["close", &id, "--reason", "Fixture closed"],
+            vec!["reopen", &id],
+            vec!["label", "remove", &id, "scratch-only"],
+        ];
+        for (index, command) in commands.iter().enumerate() {
+            let mut args = vec!["--db", database.as_str(), "--json"];
+            args.extend(command.iter().copied());
+            let result = run_br(&scratch, args, &format!("explicit_command_{index}"));
+            assert!(
+                result.status.success(),
+                "{command:?} failed (ancestor={ancestor_route}): {}",
+                result.stderr
+            );
+            assert_eq!(
+                before,
+                database_family_bytes(&external.root.join(".beads")),
+                "{command:?} opened or modified a routed database despite explicit --db"
+            );
+        }
+        let local = run_br(
+            &scratch,
+            ["--db", &database, "show", &id, "--json"],
+            "explicit_local_result",
+        );
+        assert!(local.stdout.contains("Scratch-only title"));
+        let deleted = run_br(
+            &scratch,
+            ["--db", &database, "delete", &id, "--force", "--json"],
+            "explicit_delete",
+        );
+        assert!(
+            deleted.status.success(),
+            "delete failed: {}",
+            deleted.stderr
+        );
+        assert_eq!(before, database_family_bytes(&external.root.join(".beads")));
+        let remote = show_issue_json(&external, &id, "explicit_target_unchanged");
+        assert_eq!(remote[0]["title"], "Original target");
+        // Positive control: routing remains enabled without the override.
+        let routed = show_issue_json(&scratch, &id, "implicit_route_positive_control");
+        assert_eq!(routed[0]["title"], "Original target");
+    }
+}
+
+#[test]
+fn e2e_routing_explicit_db_missing_id_does_not_create_routed_database() {
+    let _log =
+        common::test_log("e2e_routing_explicit_db_missing_id_does_not_create_routed_database");
+    let local = BrWorkspace::new();
+    let target = BrWorkspace::new();
+    init_workspace(&local, "init_explicit_missing_local");
+    fs::create_dir_all(target.root.join(".beads")).expect("empty target directory");
+    create_routes_file(&local, &[("ext-", target.root.to_string_lossy().as_ref())]);
+    let database = local
+        .root
+        .join(".beads/beads.db")
+        .to_string_lossy()
+        .into_owned();
+    let result = run_br(
+        &local,
+        [
+            "--db",
+            &database,
+            "update",
+            "ext-missing",
+            "--title",
+            "Must stay local",
+        ],
+        "explicit_missing_id",
+    );
+    assert!(!result.status.success(), "missing local ID must fail");
+    assert!(
+        database_family_bytes(&target.root.join(".beads")).is_empty(),
+        "missing local ID must never initialize or migrate the routed target"
+    );
+}
+
+#[test]
+fn e2e_routing_explicit_db_missing_local_id_does_not_update_existing_remote_id() {
+    let _log = common::test_log(
+        "e2e_routing_explicit_db_missing_local_id_does_not_update_existing_remote_id",
+    );
+    let local = BrWorkspace::new();
+    let target = BrWorkspace::new();
+    init_workspace(&local, "init_missing_local");
+    init_workspace(&target, "init_existing_target");
+    configure_external_route(&local, &target);
+    let id = create_issue_and_get_id(&target, "Remote-only issue", "create_remote_only");
+    let before = database_family_bytes(&target.root.join(".beads"));
+    assert!(!before.is_empty());
+    let database = local
+        .root
+        .join(".beads/beads.db")
+        .to_string_lossy()
+        .into_owned();
+    let result = run_br(
+        &local,
+        [
+            "--db",
+            &database,
+            "update",
+            &id,
+            "--title",
+            "Must fail locally",
+        ],
+        "missing_local_existing_remote",
+    );
+    assert!(
+        !result.status.success(),
+        "remote existence must not rescue a missing local ID"
+    );
+    assert_eq!(before, database_family_bytes(&target.root.join(".beads")));
+    let routed = show_issue_json(&local, &id, "remote_only_positive_control");
+    assert_eq!(routed[0]["title"], "Remote-only issue");
+}
+
 #[test]
 fn e2e_routing_update_description_stdin_is_consumed_once_before_route_fanout() {
     let _log = common::test_log(
@@ -2496,8 +2702,10 @@ fn e2e_routing_update_external_issue_uses_metadata_database_path() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn e2e_routing_update_mixed_batches_preserve_local_db_override() {
-    let _log = common::test_log("e2e_routing_update_mixed_batches_preserve_local_db_override");
+fn e2e_routing_update_explicit_db_rejects_external_ids_before_mutating_local_issues() {
+    let _log = common::test_log(
+        "e2e_routing_update_explicit_db_rejects_external_ids_before_mutating_local_issues",
+    );
 
     let main_workspace = BrWorkspace::new();
     let external_workspace = BrWorkspace::new();
@@ -2597,6 +2805,7 @@ fn e2e_routing_update_mixed_batches_preserve_local_db_override() {
         .expect("local last issue id")
         .to_string();
 
+    let external_before = database_family_bytes(&external_workspace.root.join(".beads"));
     let update = run_br(
         &main_workspace,
         [
@@ -2612,13 +2821,54 @@ fn e2e_routing_update_mixed_batches_preserve_local_db_override() {
         ],
         "update_mixed_routed_override_db",
     );
-    assert!(update.status.success(), "update failed: {}", update.stderr);
-    let update_payload = extract_json_payload(&update.stdout);
+    assert!(
+        !update.status.success(),
+        "external ID must fail inside the explicit local DB"
+    );
+    assert_eq!(
+        external_before,
+        database_family_bytes(&external_workspace.root.join(".beads"))
+    );
+    let unchanged = run_br(
+        &main_workspace,
+        [
+            "--db",
+            local_db.to_str().unwrap(),
+            "show",
+            &local_first_id,
+            &local_last_id,
+            "--json",
+        ],
+        "local_issues_unchanged_after_missing_id",
+    );
+    assert!(unchanged.status.success());
+    let unchanged: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&unchanged.stdout)).expect("unchanged JSON");
+    assert!(unchanged.iter().all(|issue| issue["status"] == "open"));
+    let local_update = run_br(
+        &main_workspace,
+        [
+            "--db",
+            local_db.to_str().unwrap(),
+            "update",
+            &local_first_id,
+            &local_last_id,
+            "--status",
+            "in_progress",
+            "--json",
+        ],
+        "update_local_override_db_only",
+    );
+    assert!(
+        local_update.status.success(),
+        "local update failed: {}",
+        local_update.stderr
+    );
+    let update_payload = extract_json_payload(&local_update.stdout);
     let updated: Vec<Value> = serde_json::from_str(&update_payload).expect("update json");
-    assert_eq!(updated.len(), 3);
+    assert_eq!(updated.len(), 2);
     assert_eq!(updated[0]["id"].as_str(), Some(local_first_id.as_str()));
-    assert_eq!(updated[1]["id"].as_str(), Some(external_id.as_str()));
-    assert_eq!(updated[2]["id"].as_str(), Some(local_last_id.as_str()));
+    assert_eq!(updated[1]["id"].as_str(), Some(local_last_id.as_str()));
 
     let show_local = run_br(
         &main_workspace,
@@ -2680,10 +2930,7 @@ fn e2e_routing_update_mixed_batches_preserve_local_db_override() {
     let external_issue_details: Vec<Value> =
         serde_json::from_str(&extract_json_payload(&show_external.stdout))
             .expect("external show json");
-    assert_eq!(
-        external_issue_details[0]["status"].as_str(),
-        Some("in_progress")
-    );
+    assert_eq!(external_issue_details[0]["status"].as_str(), Some("open"));
 }
 
 #[test]
@@ -2961,8 +3208,9 @@ fn e2e_routing_update_text_preserves_requested_order_across_routes() {
 }
 
 #[test]
-fn e2e_routing_show_mixed_no_db_batches_preserve_local_db_override() {
-    let _log = common::test_log("e2e_routing_show_mixed_no_db_batches_preserve_local_db_override");
+#[allow(clippy::too_many_lines)]
+fn e2e_routing_show_explicit_db_also_confines_no_db_mode() {
+    let _log = common::test_log("e2e_routing_show_explicit_db_also_confines_no_db_mode");
 
     let main_workspace = BrWorkspace::new();
     let external_workspace = BrWorkspace::new();
@@ -3032,6 +3280,7 @@ fn e2e_routing_show_mixed_no_db_batches_preserve_local_db_override() {
         .expect("external issue id")
         .to_string();
 
+    let external_before = database_family_bytes(&external_workspace.root.join(".beads"));
     let show = run_br(
         &main_workspace,
         [
@@ -3045,15 +3294,48 @@ fn e2e_routing_show_mixed_no_db_batches_preserve_local_db_override() {
         ],
         "show_mixed_routed_override_jsonl",
     );
-    assert!(show.status.success(), "show failed: {}", show.stderr);
-    let shown: Vec<Value> =
-        serde_json::from_str(&extract_json_payload(&show.stdout)).expect("show json");
-    assert_eq!(shown.len(), 2);
     assert!(
-        shown
-            .iter()
-            .any(|issue| issue["id"].as_str() == Some(local_id.as_str()))
+        !show.status.success(),
+        "external ID must not route with an explicit DB in no-db mode"
     );
+    assert_eq!(
+        external_before,
+        database_family_bytes(&external_workspace.root.join(".beads"))
+    );
+    let local_show = run_br(
+        &main_workspace,
+        [
+            "--no-db",
+            "--db",
+            local_db.to_str().unwrap(),
+            "show",
+            &local_id,
+            "--json",
+        ],
+        "show_local_override_jsonl_only",
+    );
+    assert!(
+        local_show.status.success(),
+        "local show failed: {}",
+        local_show.stderr
+    );
+    let local_shown: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&local_show.stdout)).expect("local JSON");
+    assert_eq!(local_shown.len(), 1);
+    assert_eq!(local_shown[0]["id"].as_str(), Some(local_id.as_str()));
+    let routed_show = run_br(
+        &main_workspace,
+        ["--no-db", "show", &external_id, "--json"],
+        "show_external_jsonl_without_override",
+    );
+    assert!(
+        routed_show.status.success(),
+        "implicit routed show failed: {}",
+        routed_show.stderr
+    );
+    let shown: Vec<Value> =
+        serde_json::from_str(&extract_json_payload(&routed_show.stdout)).expect("show json");
+    assert_eq!(shown.len(), 1);
     assert!(
         shown
             .iter()

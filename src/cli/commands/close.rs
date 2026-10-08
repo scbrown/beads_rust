@@ -632,7 +632,8 @@ pub fn execute_with_args(
             "--suggest-next only works with a single issue ID",
         ));
     }
-    let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&target_inputs, &beads_dir, cli)?;
 
     let mut closed_issues = Vec::new();
     let mut skipped_issues = Vec::new();

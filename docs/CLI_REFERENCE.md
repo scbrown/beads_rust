@@ -70,7 +70,7 @@ These options apply to all commands:
 
 | Option | Description |
 |--------|-------------|
-| `--db <PATH>` | Database path (auto-discover `.beads/*.db` if not set) |
+| `--db <PATH>` | Select a database and disable ID-prefix routing (auto-discover if not set) |
 | `--actor <NAME>` | Actor name for audit trail |
 | `--json` | Output as JSON (machine-readable) |
 | `--no-daemon` | Force direct mode (no daemon) |
@@ -125,6 +125,9 @@ local database.
 
 Safety boundaries:
 
+- An explicit `--db` confines issue-ID operations to that database. Local and
+  ancestor routes are not read, and a missing ID fails locally instead of opening
+  a routed database. Without `--db`, prefix routing behaves as described above.
 - Routing never runs git, copies repositories, or performs network sync.
 - Routing is not real-time collaboration; each affected repository still needs
   its own normal `br sync --flush-only`/VCS commit flow.

@@ -330,7 +330,8 @@ pub fn execute(args: &UpdateArgs, cli: &config::CliOverrides, ctx: &OutputContex
         target_inputs.push(last_touched);
     }
 
-    let routed_batches = config::routing::group_issue_inputs_by_route(&target_inputs, &beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&target_inputs, &beads_dir, cli)?;
 
     let (updated_issues, render_items, ordered_resolved_ids, mut capacity_warnings) =
         if routed_batches.iter().any(|batch| batch.is_external) {

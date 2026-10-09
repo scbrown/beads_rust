@@ -483,14 +483,26 @@ executable. The maintained evidence consists of:
 
 A mutated connection that finds another opener closes without the engine's
 implicit passive checkpoint. Its committed WAL remains durable; transaction
-rollback and runtime teardown still run. Mutating one-shot CLI commands retain the exact
-database-family writer capability until their own storage handles have closed.
-When the WAL exceeds 2 MiB, they attempt a checkpoint under the existing sole
+rollback and runtime teardown still run. One-shot CLI commands in the ordinary
+automatic-export command class collect deferred checkpoint requests and retain
+the exact database-family writer capability until their own storage handles
+have closed. This class covers issue create/update/delete/close/reopen, quick
+capture, defer/undefer, dependency add/import/remove, label add/remove/rename,
+comment add, non-dry-run epic close-eligible, and orphan repair. Collection is
+based on the command class even when `--no-auto-flush` suppresses its export.
+
+Explicit `sync` and `doctor` operations, init, config/history maintenance,
+saved-query changes, gate/capacity reports, and audit writes do not collect these
+deferred requests. Neither do library callers or the long-lived MCP server.
+Read-only CLI startup imports release writer authority before rendering and do
+not collect deferred tickets.
+
+On normal successful CLI exit, after storage closes, a collected request whose
+WAL exceeds 2 MiB attempts a checkpoint under the existing sole
 opener admission rule. A remaining foreign reader or changed database identity
 refuses maintenance. The threshold triggers an attempt, not a hard size limit
-while foreign readers remain. Library callers and the long-lived MCP server do
-not retain these deferred writer capabilities. Read-only CLI startup imports
-release writer authority before rendering and do not collect deferred tickets.
+while foreign readers remain. This exit maintenance does not promise a
+checkpoint on command failure, interruption, or abrupt process termination.
 
 ## Further Reading
 

@@ -81,7 +81,14 @@ fn externally_held_jsonl_authority_blocks_fresh_create_without_publication() {
     let _held = blocking_jsonl_family_write_lock_with_timeout(&jsonl, Some(100)).unwrap();
     let blocked = create(temp.path(), "Must not publish");
     assert!(!blocked.status.success());
-    assert!(String::from_utf8_lossy(&blocked.stderr).contains("JSONL-family write lock"));
+    let diagnostic: Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(diagnostic["error"]["code"], "CONFIG_ERROR");
+    assert!(
+        diagnostic["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("JSONL-family write lock")
+    );
     assert_eq!(fs::read_to_string(&jsonl).unwrap(), "");
     assert!(!beads.join("beads.db").exists());
 }

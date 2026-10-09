@@ -39,6 +39,12 @@ fn main() {
     let output_ctx = OutputContext::from_args(&cli);
     let is_mutating = is_mutating_command(&cli.command);
     let command_supports_auto_import = should_auto_import(&cli.command);
+    #[cfg(feature = "mcp")]
+    let checkpoint_scope = (is_mutating && !matches!(cli.command, Commands::Serve(_)))
+        .then(beads_rust::storage::sqlite::DeferredCheckpointScope::start);
+    #[cfg(not(feature = "mcp"))]
+    let checkpoint_scope =
+        is_mutating.then(beads_rust::storage::sqlite::DeferredCheckpointScope::start);
 
     // Initialize logging
     if let Err(e) = init_logging(cli.verbose, cli.quiet, None) {
@@ -238,7 +244,7 @@ fn main() {
         no_db_jsonl_write,
         pending_merge_mutation_gate_required,
     );
-    let mut write_lock = if startup_database_authority_required && ctx.is_initialized() {
+    let write_lock = if startup_database_authority_required && ctx.is_initialized() {
         let lock_timeout = ctx.startup_write_lock_timeout(&cli.command);
         match ctx
             .beads_dir
@@ -458,6 +464,9 @@ fn main() {
     } else {
         write_lock
     };
+
+    #[cfg(not(feature = "mcp"))]
+    let mut write_lock = write_lock;
 
     // Phase 2: Open Storage (One-time)
     let mut storage_result = if should_preopen_storage {
@@ -1132,6 +1141,9 @@ fn main() {
     // corrupts the exit code of a command that worked. Storage is dropped
     // first so `SqliteStorage::Drop` checkpoints the WAL (#270).
     drop(storage_result);
+    if let Some(scope) = checkpoint_scope {
+        scope.finish();
+    }
     drop(write_lock);
     beads_rust::shutdown::exit_process(0);
 }

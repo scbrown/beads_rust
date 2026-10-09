@@ -4,7 +4,7 @@ use beads_rust::config;
 use beads_rust::logging::init_logging;
 use beads_rust::output::OutputContext;
 use beads_rust::sync::{
-    auto_flush, auto_import_if_stale, auto_import_probe, auto_import_probe_refreshing_witnesses,
+    auto_import_if_stale, auto_import_probe, auto_import_probe_refreshing_witnesses,
 };
 use beads_rust::{BeadsError, Result, StructuredError};
 use clap::{CommandFactory, Parser};
@@ -1090,16 +1090,7 @@ fn main() {
         };
 
         if let Some(_sync_lock) = sync_lock
-            && let Err(e) = auto_flush(
-                &mut res.storage,
-                &paths.beads_dir,
-                &paths.jsonl_path,
-                config::implicit_external_jsonl_allowed(
-                    &paths.beads_dir,
-                    &paths.db_path,
-                    &paths.jsonl_path,
-                ),
-            )
+            && let Err(e) = res.auto_flush_if_enabled()
         {
             commands::report_auto_flush_failure(
                 &output_ctx,

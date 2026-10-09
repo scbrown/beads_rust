@@ -1310,7 +1310,9 @@ fn format_issue_details(details: &IssueDetails, use_color: bool, wrap: bool) -> 
     }
 
     if let Some(defer) = &issue.defer_until {
-        let _ = writeln!(output, "Deferred until: {}", defer.format("%Y-%m-%d"));
+        // Deferrals are instants: hiding the hour makes a same-day hold look
+        // expired even though storage and JSON retain the full timestamp.
+        let _ = writeln!(output, "Deferred until: {}", defer.to_rfc3339());
     }
 
     if let Some(minutes) = issue.estimated_minutes
@@ -1681,6 +1683,7 @@ mod tests {
         info!("test_show_text_includes_dependencies_and_comments: starting");
         let mut issue = make_test_issue("bd-001", "Test Issue");
         issue.description = None;
+        issue.defer_until = Some(Utc.with_ymd_and_hms(2025, 1, 2, 23, 30, 0).unwrap());
         let details = IssueDetails {
             issue,
             labels: Vec::new(),
@@ -1706,6 +1709,7 @@ mod tests {
         };
         let output = format_issue_details(&details, false, false);
         assert!(output.contains("Dependencies:"));
+        assert!(output.contains("Deferred until: 2025-01-02T23:30:00+00:00"));
         assert!(output.contains("-> bd-002 (blocks) - Dep"));
         assert!(output.contains("Comments:"));
         assert!(output.contains("alice: Looks good"));

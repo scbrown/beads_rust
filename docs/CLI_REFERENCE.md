@@ -341,6 +341,10 @@ br list --json | jq '.issues[].id'
 
 Show detailed issue information.
 
+`Deferred until` includes the full RFC3339 timestamp and UTC offset. A same-day
+deferral therefore shows its recheck time; JSON and stored timestamps also
+retain that instant.
+
 ```bash
 br show [IDS]...
 ```

@@ -185,6 +185,12 @@ impl std::fmt::Debug for Connection {
 }
 
 impl Connection {
+    /// Whether the caller already owns an explicit transaction.
+    #[must_use]
+    pub fn in_transaction(&self) -> bool {
+        self.inner.in_transaction()
+    }
+
     /// Open (or create) a database at `path`.
     pub fn open(path: impl Into<String>) -> Result<Self, FrankenError> {
         let inner = drive(fsqlite::Connection::open(path))?;

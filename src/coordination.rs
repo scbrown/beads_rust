@@ -1133,6 +1133,7 @@ mod tests {
             thread_id: None,
         }];
         let comments = vec![Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 1,
             issue_id: "beads_rust-sc6u".to_string(),
             author: "TopazFox".to_string(),

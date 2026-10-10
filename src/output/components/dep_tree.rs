@@ -154,6 +154,7 @@ mod tests {
             ..Issue::default()
         };
         issue.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: "external:proj:\x07capability".to_string(),
             dep_type: DependencyType::Blocks,

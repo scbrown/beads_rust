@@ -659,6 +659,7 @@ mod tests {
     fn latest_comments_are_newest_first_and_bounded() {
         let comments = vec![
             Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 1,
                 issue_id: "bd-claim".to_string(),
                 author: "a".to_string(),
@@ -666,6 +667,7 @@ mod tests {
                 created_at: now() - Duration::hours(2),
             },
             Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 2,
                 issue_id: "bd-claim".to_string(),
                 author: "b".to_string(),

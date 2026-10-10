@@ -7280,6 +7280,7 @@ mod tests {
             .sync_dependencies_for_import(
                 &child.id,
                 &[Dependency {
+                    jsonl_extensions: std::collections::BTreeMap::new(),
                     issue_id: child.id.clone(),
                     depends_on_id: parent.id.clone(),
                     dep_type: DependencyType::Blocks,
@@ -7294,6 +7295,7 @@ mod tests {
             .sync_comments_for_import(
                 &parent.id,
                 &[Comment {
+                    jsonl_extensions: std::collections::BTreeMap::new(),
                     id: 0,
                     issue_id: parent.id.clone(),
                     author: "tester".to_string(),

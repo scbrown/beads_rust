@@ -791,6 +791,7 @@ fn generate_dependencies(
     targets
         .into_iter()
         .map(|target| Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue_id.to_string(),
             depends_on_id: synthetic_issue_id(target),
             dep_type: DependencyType::Blocks,
@@ -838,6 +839,7 @@ fn generate_comments(
     let comment_count = rng.random_range(1..=config.max_comments_per_issue);
     (0..comment_count)
         .map(|offset| Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: usize_to_i64(next_comment_id + offset + 1),
             issue_id: issue_id.to_string(),
             author: synthetic_agent_name(

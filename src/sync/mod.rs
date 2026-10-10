@@ -6168,13 +6168,13 @@ fn additive_database_witness(
     )?;
     let dependency_rows = additive_raw_rows(
         storage,
-        "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id \
+        "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id, jsonl_extensions \
          FROM dependencies \
          ORDER BY issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id",
     )?;
     let comment_rows = additive_raw_rows(
         storage,
-        "SELECT id, issue_id, author, text, created_at \
+        "SELECT id, issue_id, author, text, created_at, jsonl_extensions \
          FROM comments ORDER BY id, issue_id, author, text, created_at",
     )?;
     let event_rows = additive_raw_rows(
@@ -7502,6 +7502,7 @@ fn plan_additive_reconcile_in_snapshot(
                 issue_has_conflict = true;
             }
             let comment_for_validation = Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 1,
                 issue_id: issue.id.clone(),
                 author: comment.author.clone(),
@@ -7978,13 +7979,13 @@ fn plan_additive_reconcile_in_snapshot(
     )?;
     let mut expected_dependency_rows = additive_raw_rows(
         storage,
-        "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id \
+        "SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id, jsonl_extensions \
          FROM dependencies \
          ORDER BY issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id",
     )?;
     let mut expected_comment_rows = additive_raw_rows(
         storage,
-        "SELECT id, issue_id, author, text, created_at \
+        "SELECT id, issue_id, author, text, created_at, jsonl_extensions \
          FROM comments ORDER BY id, issue_id, author, text, created_at",
     )?;
     for mutation in mutations.iter().filter(|mutation| mutation.creates_issue()) {
@@ -8016,6 +8017,9 @@ fn plan_additive_reconcile_in_snapshot(
                     additive_sqlite_value_witness(SqliteValue::from(
                         dependency.thread_id.as_deref().unwrap_or(""),
                     )),
+                    additive_sqlite_value_witness(SqliteValue::from(serde_json::to_string(
+                        &dependency.jsonl_extensions,
+                    )?)),
                 ]);
             }
         }
@@ -8028,6 +8032,9 @@ fn plan_additive_reconcile_in_snapshot(
                 additive_sqlite_value_witness(SqliteValue::from(
                     comment.created_at.to_rfc3339().as_str(),
                 )),
+                additive_sqlite_value_witness(SqliteValue::from(serde_json::to_string(
+                    &comment.jsonl_extensions,
+                )?)),
             ]);
         }
     }
@@ -18036,6 +18043,7 @@ mod tests {
         let mut source = make_issue_at("bd-source", "Source", fixed_time(200));
         source.labels = vec!["search".to_string(), "correctness".to_string()];
         source.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: source.id.clone(),
             depends_on_id: target.id.clone(),
             dep_type: DependencyType::Blocks,
@@ -18045,6 +18053,7 @@ mod tests {
             thread_id: Some("bd-source".to_string()),
         }];
         source.comments = vec![Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 41,
             issue_id: source.id.clone(),
             author: "fixture".to_string(),
@@ -18341,6 +18350,7 @@ mod tests {
         let mut invalid = make_issue_at("bd-invalid", "Invalid", fixed_time(200));
         invalid.external_ref = Some("EXT-1".to_string());
         invalid.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: invalid.id.clone(),
             depends_on_id: "bd-missing".to_string(),
             dep_type: DependencyType::Blocks,
@@ -18350,6 +18360,7 @@ mod tests {
             thread_id: None,
         }];
         invalid.comments = vec![Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 9,
             issue_id: "bd-other".to_string(),
             author: "fixture".to_string(),
@@ -18406,6 +18417,7 @@ mod tests {
         let storage = SqliteStorage::open_memory().unwrap();
         let mut invalid = make_issue_at("bd-invalid-comment", "Invalid comment", fixed_time(200));
         let comment = Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 0,
             issue_id: invalid.id.clone(),
             author: String::new(),
@@ -18451,6 +18463,7 @@ mod tests {
         let mut first = make_issue_at("bd-cycle-a", "Cycle A", fixed_time(100));
         let mut second = make_issue_at("bd-cycle-b", "Cycle B", fixed_time(100));
         first.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: first.id.clone(),
             depends_on_id: second.id.clone(),
             dep_type: DependencyType::Blocks,
@@ -18460,6 +18473,7 @@ mod tests {
             thread_id: None,
         }];
         second.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: second.id.clone(),
             depends_on_id: first.id.clone(),
             dep_type: DependencyType::WaitsFor,
@@ -18490,6 +18504,7 @@ mod tests {
         let mut first_comment_owner = make_issue_at("bd-comment-a", "Comment A", fixed_time(100));
         let mut second_comment_owner = make_issue_at("bd-comment-b", "Comment B", fixed_time(100));
         first_comment_owner.comments = vec![Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 77,
             issue_id: first_comment_owner.id.clone(),
             author: "fixture".to_string(),
@@ -18498,6 +18513,7 @@ mod tests {
         }];
         second_comment_owner.comments = vec![
             Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 77,
                 issue_id: second_comment_owner.id.clone(),
                 author: "fixture".to_string(),
@@ -18505,6 +18521,7 @@ mod tests {
                 created_at: fixed_time(95),
             },
             Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 0,
                 issue_id: second_comment_owner.id.clone(),
                 author: "fixture".to_string(),
@@ -18553,6 +18570,7 @@ mod tests {
         let mut first = make_issue_at("bd-existing-cycle-a", "Cycle A", fixed_time(100));
         let mut second = make_issue_at("bd-existing-cycle-b", "Cycle B", fixed_time(100));
         first.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: first.id.clone(),
             depends_on_id: second.id.clone(),
             dep_type: DependencyType::Blocks,
@@ -18562,6 +18580,7 @@ mod tests {
             thread_id: None,
         }];
         second.dependencies = vec![Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: second.id.clone(),
             depends_on_id: first.id.clone(),
             dep_type: DependencyType::WaitsFor,
@@ -19925,6 +19944,7 @@ mod tests {
             id: "bd-final".to_string(),
             title: "Finalized".to_string(),
             comments: vec![Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 1,
                 issue_id: "bd-final".to_string(),
                 author: "br-sync".to_string(),
@@ -20881,6 +20901,7 @@ mod tests {
     fn test_normalize_issue_deduplicates_only_identical_comments() {
         let mut issue = make_test_issue("bd-comment-dedupe", "Comment recovery");
         let comment = crate::model::Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 42,
             issue_id: issue.id.clone(),
             author: "reporter".to_string(),
@@ -20923,6 +20944,7 @@ mod tests {
         issue.original_type = Some(String::new());
         issue.sender = Some(String::new());
         issue.dependencies.push(crate::model::Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: target.id.clone(),
             dep_type: crate::model::DependencyType::Blocks,
@@ -20976,6 +20998,7 @@ mod tests {
         let jsonl_path = temp_dir.path().join("issues.jsonl");
         let mut issue = make_test_issue("bd-comment-recovery", "Comment recovery");
         let comment = crate::model::Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 42,
             issue_id: issue.id.clone(),
             author: "reporter".to_string(),
@@ -21017,6 +21040,7 @@ mod tests {
             let mut first = make_test_issue("bd-comment-duplicate-a", "First owner");
             let mut second = make_test_issue("bd-comment-duplicate-b", "Second owner");
             first.comments.push(crate::model::Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 3_560,
                 issue_id: first.id.clone(),
                 author: "alice".to_string(),
@@ -21024,6 +21048,7 @@ mod tests {
                 created_at: first.created_at,
             });
             second.comments.push(crate::model::Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 3_560,
                 issue_id: second.id.clone(),
                 author: "alice".to_string(),
@@ -21107,6 +21132,7 @@ mod tests {
         let mut incoming_a = existing_a.clone();
         incoming_a.updated_at += chrono::Duration::minutes(1);
         incoming_a.comments = vec![crate::model::Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: stale_b_comment.id,
             issue_id: incoming_a.id.clone(),
             author: "alice".to_string(),
@@ -21117,6 +21143,7 @@ mod tests {
         let mut incoming_b = existing_b.clone();
         incoming_b.updated_at += chrono::Duration::minutes(1);
         incoming_b.comments = vec![crate::model::Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: stale_b_comment.id + 1,
             issue_id: incoming_b.id.clone(),
             author: stale_b_comment.author.clone(),
@@ -21230,6 +21257,7 @@ mod tests {
         let explicit_target = make_test_issue("bd-dep-explicit", "Explicit target");
         let mut dependent = make_test_issue("bd-dep-sparse", "Sparse dependent");
         dependent.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: dependent.id.clone(),
             depends_on_id: target.id.clone(),
             dep_type: DependencyType::Blocks,
@@ -21239,6 +21267,7 @@ mod tests {
             thread_id: None,
         });
         dependent.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: dependent.id.clone(),
             depends_on_id: explicit_target.id.clone(),
             dep_type: DependencyType::Related,
@@ -21437,6 +21466,7 @@ mod tests {
     fn test_normalize_issue_normalizes_legacy_standard_dependency_type_with_underscores() {
         let mut issue = make_test_issue("bd-001", "Legacy dependency");
         issue.dependencies.push(crate::model::Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: "bd-002".to_string(),
             dep_type: crate::model::DependencyType::Custom("parent_child".to_string()),
@@ -21458,6 +21488,7 @@ mod tests {
     fn test_normalize_issue_preserves_custom_dependency_type_with_underscores() {
         let mut issue = make_test_issue("bd-001", "Custom dependency");
         issue.dependencies.push(crate::model::Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: issue.id.clone(),
             depends_on_id: "bd-002".to_string(),
             dep_type: crate::model::DependencyType::Custom("review_needed".to_string()),
@@ -22698,6 +22729,7 @@ mod tests {
         let mut issue = make_test_issue("bd-1", "Ordering");
         issue.comments = vec![
             Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 9,
                 issue_id: issue.id.clone(),
                 author: "tester".to_string(),
@@ -22705,6 +22737,7 @@ mod tests {
                 created_at: timestamp,
             },
             Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: 2,
                 issue_id: issue.id.clone(),
                 author: "tester".to_string(),
@@ -24762,6 +24795,7 @@ mod tests {
         let mut issue = make_test_issue("oldp-cargo-license-spdx-ay8", "Renamed");
         issue.content_hash = Some(crate::util::content_hash(&issue));
         issue.dependencies.push(Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: "oldp-cargo-license-spdx-ay8".to_string(),
             depends_on_id: "oldp-oldp-central-build-inputs-3un".to_string(),
             dep_type: DependencyType::Blocks,
@@ -24771,6 +24805,7 @@ mod tests {
             thread_id: None,
         });
         issue.comments.push(Comment {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             id: 1,
             issue_id: "oldp-cargo-license-spdx-ay8".to_string(),
             author: "tester".to_string(),

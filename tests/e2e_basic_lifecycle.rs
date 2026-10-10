@@ -94,6 +94,7 @@ fn dotted_parent_child_dependency(
     now: chrono::DateTime<Utc>,
 ) -> Dependency {
     Dependency {
+        jsonl_extensions: std::collections::BTreeMap::new(),
         issue_id: issue_id.to_string(),
         depends_on_id: depends_on_id.to_string(),
         dep_type: DependencyType::ParentChild,
@@ -3309,6 +3310,7 @@ fn e2e_sync_flush_export_parallelism_preserves_jsonl_bytes() {
                 format!("lane-{:02}", index % 16),
             ];
             issue.comments.push(Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: i64::from(index) + 1,
                 issue_id: id,
                 author: format!("agent-{:03}", index % 64),

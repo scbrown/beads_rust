@@ -824,6 +824,7 @@ fn validate_mcp_title(title: &str) -> McpResult<()> {
 
 fn validate_mcp_comment(issue_id: &str, author: &str, body: &str) -> McpResult<()> {
     let comment = Comment {
+        jsonl_extensions: std::collections::BTreeMap::new(),
         id: 1,
         issue_id: issue_id.to_string(),
         author: author.to_string(),

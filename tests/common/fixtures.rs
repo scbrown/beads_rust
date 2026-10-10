@@ -127,6 +127,7 @@ impl IssueBuilder {
 
 pub fn dependency(from: &str, to: &str) -> Dependency {
     Dependency {
+        jsonl_extensions: std::collections::BTreeMap::new(),
         issue_id: from.to_string(),
         depends_on_id: to.to_string(),
         dep_type: DependencyType::Blocks,

@@ -394,6 +394,7 @@ prop_compose! {
             .into_iter()
             .enumerate()
             .map(|(index, body)| Comment {
+                jsonl_extensions: std::collections::BTreeMap::new(),
                 id: i64::try_from(index + 1).unwrap(),
                 issue_id: source_id.clone(),
                 author: comment_author.clone(),
@@ -402,6 +403,7 @@ prop_compose! {
             })
             .collect();
         let dependency = Dependency {
+            jsonl_extensions: std::collections::BTreeMap::new(),
             issue_id: source_id,
             depends_on_id: blocker_id,
             dep_type,

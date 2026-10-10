@@ -117,7 +117,8 @@ pub fn execute(
     ids.sort();
 
     let beads_dir = config::discover_beads_dir_with_cli(cli)?;
-    let routed_batches = config::routing::group_issue_inputs_by_route(&ids, &beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&ids, &beads_dir, cli)?;
     if routed_batches.iter().any(|batch| batch.is_external) {
         return execute_routed(args, cli, ctx, &beads_dir, routed_batches);
     }

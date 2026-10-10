@@ -78,7 +78,8 @@ fn execute_routed(
     preloaded_storage_ctx: Option<&config::OpenStorageResult>,
 ) -> Result<()> {
     let target_ids = requested_target_ids(args, beads_dir)?;
-    let routed_batches = config::routing::group_issue_inputs_by_route(&target_ids, beads_dir)?;
+    let routed_batches =
+        config::routing::group_issue_inputs_by_route_with_cli(&target_ids, beads_dir, cli)?;
     if !routed_batches.iter().any(|batch| batch.is_external) {
         return execute_inner(
             args,

@@ -18,7 +18,7 @@ use crate::sync::path::validate_sync_path_with_external;
 use crate::sync::{
     ExpectedJsonlSourceRef, ExportConfig, FreshDatabaseReplacementWitness, ImportConfig,
     ImportResult, JsonlSourceSnapshot, JsonlSourceStateWitness, JsonlTombstoneFilter,
-    PreservedIssue, auto_flush, blocking_database_family_write_lock_with_timeout,
+    PreservedIssue, auto_flush_with_authority, blocking_database_family_write_lock_with_timeout,
     capture_optional_jsonl_source, dirty_issues_missing_from_jsonl,
     export_to_jsonl_with_policy_expected_under_authority, finalize_export_under_authority,
     import_from_jsonl_snapshot, import_from_jsonl_snapshot_into_fresh_replacement,
@@ -4994,11 +4994,12 @@ impl OpenStorageResult {
             });
         }
 
-        auto_flush(
+        auto_flush_with_authority(
             &mut self.storage,
             &self.paths.beads_dir,
             &self.paths.jsonl_path,
             self.allow_external_jsonl,
+            self.jsonl_write_authority.as_deref(),
         )?;
         Ok(())
     }

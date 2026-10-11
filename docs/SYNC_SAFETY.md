@@ -504,6 +504,15 @@ refuses maintenance. The threshold triggers an attempt, not a hard size limit
 while foreign readers remain. This exit maintenance does not promise a
 checkpoint on command failure, interruption, or abrupt process termination.
 
+## Startup and automatic export authority
+
+When startup rebuilds a database from JSONL, it retains the JSONL-family write
+capability through command execution and automatic export. Full export,
+incremental export and finalization reuse that capability instead of acquiring a
+second lock descriptor. The capability is checked against the publication target;
+an unrelated target is refused. Callers without a retained capability acquire
+their own lock, and another writer's hold still blocks a fresh-store mutation.
+
 ## Further Reading
 
 For technical details, see:

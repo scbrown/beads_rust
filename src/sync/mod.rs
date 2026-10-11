@@ -12697,12 +12697,22 @@ fn try_incremental_auto_flush(
     beads_dir: &Path,
     jsonl_path: &Path,
     allow_external_jsonl: bool,
+    provided_authority: Option<&JsonlFamilyWriteLock>,
 ) -> Result<Option<AutoFlushResult>> {
     if !jsonl_path.exists() {
         return Ok(None);
     }
 
-    let jsonl_authority = blocking_jsonl_family_write_lock_with_timeout(jsonl_path, None)?;
+    let owned_authority = provided_authority
+        .is_none()
+        .then(|| blocking_jsonl_family_write_lock_with_timeout(jsonl_path, None))
+        .transpose()?;
+    let jsonl_authority = provided_authority
+        .or(owned_authority.as_ref())
+        .ok_or_else(|| BeadsError::SyncConflict {
+            message: "Incremental auto-flush has no JSONL authority".into(),
+        })?;
+    let _ = jsonl_authority.pinned_name_for_target(jsonl_path)?;
     jsonl_authority.verify_jsonl_authority()?;
     if !jsonl_path.is_file() {
         return Err(BeadsError::SyncConflict {
@@ -12746,7 +12756,7 @@ fn try_incremental_auto_flush(
         jsonl_path,
         &export_config,
         &changes,
-        &jsonl_authority,
+        jsonl_authority,
         &source_content_hash,
     )? {
         return Ok(Some(result));
@@ -12833,6 +12843,18 @@ pub fn auto_flush(
     jsonl_path: &Path,
     allow_external_jsonl: bool,
 ) -> Result<AutoFlushResult> {
+    auto_flush_with_authority(storage, beads_dir, jsonl_path, allow_external_jsonl, None)
+}
+
+/// Reuse startup's retained JSONL capability rather than locking a second descriptor.
+/// Existing callers without a retained capability still acquire their own lock.
+pub(crate) fn auto_flush_with_authority(
+    storage: &mut SqliteStorage,
+    beads_dir: &Path,
+    jsonl_path: &Path,
+    allow_external_jsonl: bool,
+    provided_authority: Option<&JsonlFamilyWriteLock>,
+) -> Result<AutoFlushResult> {
     // This guard is intentionally independent of CLI/MCP startup policy and
     // precedes the dirty/no-op probe. A clean database with a durable pending
     // saga is still not safe for an unrelated automatic exporter: even a
@@ -12886,7 +12908,13 @@ pub fn auto_flush(
     );
 
     if !needs_flush {
-        match try_incremental_auto_flush(storage, beads_dir, jsonl_path, allow_external_jsonl) {
+        match try_incremental_auto_flush(
+            storage,
+            beads_dir,
+            jsonl_path,
+            allow_external_jsonl,
+            provided_authority,
+        ) {
             Ok(Some(result)) => {
                 tracing::info!(
                     flushed = result.flushed,
@@ -12919,20 +12947,33 @@ pub fn auto_flush(
 
     // Perform export
     let expected_missing_jsonl = (!jsonl_exists).then_some(None);
-    let (export_result, _report) = export_to_jsonl_with_policy_expected(
+    let (export_result, _report) = export_to_jsonl_with_policy_expected_authority(
         storage,
         jsonl_path,
         &export_config,
         expected_missing_jsonl.as_ref(),
+        None,
+        provided_authority,
+        None,
     )?;
 
-    // Finalize export (clear dirty flags, update metadata)
-    finalize_export(
-        storage,
-        &export_result,
-        Some(&export_result.issue_hashes),
-        jsonl_path,
-    )?;
+    // Finalization must reuse the same retained capability too.
+    if let Some(authority) = provided_authority {
+        finalize_export_under_authority(
+            storage,
+            &export_result,
+            Some(&export_result.issue_hashes),
+            jsonl_path,
+            authority,
+        )?;
+    } else {
+        finalize_export(
+            storage,
+            &export_result,
+            Some(&export_result.issue_hashes),
+            jsonl_path,
+        )?;
+    }
 
     tracing::info!(
         exported = export_result.exported_count,
@@ -20624,6 +20665,97 @@ mod tests {
         let staleness = compute_staleness(&storage, &jsonl_path).unwrap();
         assert!(staleness.db_newer);
         assert!(!staleness.jsonl_exists);
+    }
+
+    #[test]
+    fn auto_flush_reuses_retained_authority_for_full_and_incremental_exports() {
+        let temp = TempDir::new().unwrap();
+        let beads_dir = temp.path().join(".beads");
+        fs::create_dir_all(&beads_dir).unwrap();
+        let jsonl_path = beads_dir.join("issues.jsonl");
+        fs::write(&jsonl_path, "").unwrap();
+        let authority =
+            blocking_jsonl_family_write_lock_with_timeout(&jsonl_path, Some(1)).unwrap();
+        let mut storage = SqliteStorage::open_memory().unwrap();
+        storage
+            .create_issue(&make_test_issue("bd-first", "First"), "tester")
+            .unwrap();
+        storage.set_metadata("needs_flush", "true").unwrap();
+        let first = auto_flush_with_authority(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            Some(&authority),
+        )
+        .unwrap();
+        assert!(first.flushed);
+        assert_eq!(first.exported_count, 1);
+        assert_eq!(storage.get_dirty_issue_metadata().unwrap().len(), 0);
+        assert!(
+            blocking_jsonl_family_write_lock_with_timeout(&jsonl_path, Some(1)).is_err(),
+            "publication must retain startup authority"
+        );
+        storage
+            .create_issue(&make_test_issue("bd-second", "Second"), "tester")
+            .unwrap();
+        let second = auto_flush_with_authority(
+            &mut storage,
+            &beads_dir,
+            &jsonl_path,
+            false,
+            Some(&authority),
+        )
+        .unwrap();
+        assert!(second.flushed);
+        let ids: Vec<String> = fs::read_to_string(&jsonl_path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(ids, vec!["bd-first", "bd-second"]);
+        assert_eq!(storage.get_dirty_issue_metadata().unwrap().len(), 0);
+        drop(authority);
+        assert!(blocking_jsonl_family_write_lock_with_timeout(&jsonl_path, Some(1)).is_ok());
+    }
+
+    #[test]
+    fn auto_flush_rejects_retained_authority_for_another_jsonl() {
+        for force_full in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let beads_dir = temp.path().join(".beads");
+            fs::create_dir_all(&beads_dir).unwrap();
+            let jsonl_path = beads_dir.join("issues.jsonl");
+            let other = beads_dir.join("other.jsonl");
+            fs::write(&jsonl_path, "").unwrap();
+            fs::write(&other, "other source").unwrap();
+            let authority = blocking_jsonl_family_write_lock_with_timeout(&other, Some(1)).unwrap();
+            let mut storage = SqliteStorage::open_memory().unwrap();
+            storage
+                .create_issue(&make_test_issue("bd-first", "First"), "tester")
+                .unwrap();
+            if force_full {
+                storage.set_metadata("needs_flush", "true").unwrap();
+            }
+            assert!(
+                auto_flush_with_authority(
+                    &mut storage,
+                    &beads_dir,
+                    &jsonl_path,
+                    false,
+                    Some(&authority)
+                )
+                .is_err()
+            );
+            assert_eq!(fs::read(&jsonl_path).unwrap(), b"");
+            assert_eq!(fs::read(&other).unwrap(), b"other source");
+            assert_eq!(storage.get_dirty_issue_metadata().unwrap().len(), 1);
+        }
     }
 
     #[test]

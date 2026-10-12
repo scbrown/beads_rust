@@ -294,6 +294,19 @@ impl Connection {
     pub fn close_in_place(&mut self) -> Result<(), FrankenError> {
         drive(self.inner.close_in_place())
     }
+
+    /// Close while preserving committed WAL frames for a later checkpoint.
+    ///
+    /// Transaction cleanup and runtime teardown still run. Callers use this
+    /// only when their checkpoint admission policy has found another opener.
+    pub(crate) fn close_without_checkpoint_in_place(&mut self) -> Result<(), FrankenError> {
+        drive(self.inner.close_without_checkpoint_in_place())
+    }
+
+    /// Complete best-effort teardown without introducing a checkpoint retry.
+    pub(crate) fn close_without_checkpoint_best_effort_in_place(&mut self) {
+        drive(self.inner.close_best_effort_in_place());
+    }
 }
 
 impl Drop for Connection {
